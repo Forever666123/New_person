@@ -200,6 +200,12 @@ class Rhythm:
             if chosen.engage_probability is not None
             else cfg.engage_probability
         )
+        # 飞去别的时区的第一天，起床时刻是按出发地算出来的。绝对时刻是对的，
+        # 但显示成出发地的时间会让日志和提示词读起来自相矛盾，统一换成当天所在的时区。
+        tz = self.tz_for(day)
+        wake = wake.astimezone(tz)
+        sleep_start = sleep_start.astimezone(tz)
+
         daily = DailyRhythm(
             day=day,
             period=period.name if period else "",

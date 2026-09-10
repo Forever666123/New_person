@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import statistics
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -194,3 +194,42 @@ def test_state_at_reports_sleeping_at_night(rhythm: Rhythm, persona: Persona, ho
             assert snap.until > snap.at
             assert snap.activity == 0.0
     assert hits >= 15
+
+
+def test_daylight_saving_does_not_break_anything(rhythm: Rhythm, persona: Persona) -> None:
+    """美国 11 月回拨（一点出现两次）、三月前拨（两点不存在）。
+
+    这两天正好可能落在春假附近，作息算错会让她凭空多睡或者少睡一小时。
+    """
+    for start in (date(2026, 10, 31), date(2027, 3, 13)):
+        for offset in range(3):
+            d = start + timedelta(days=offset)
+            daily = rhythm.for_day(d)
+            morning = rhythm.for_day(d + timedelta(days=1)).wake
+            hours = (morning - daily.sleep_start).total_seconds() / 3600
+            assert persona.rhythm.sleep.min_hours - 0.01 <= hours <= persona.rhythm.sleep.max_hours + 0.01
+
+
+def test_a_whole_year_never_raises(rhythm: Rhythm, persona: Persona, rng: random.Random) -> None:
+    """跑一整年，每隔六小时查一次，不能有任何一处炸掉。"""
+    t = datetime(2026, 9, 1, 12, tzinfo=persona.tz)
+    for _ in range(365 * 4):
+        snapshot = rhythm.state_at(t)
+        assert snapshot.until > snapshot.at
+        assert rhythm.next_glance_after(t, rng) > t
+        t += timedelta(hours=6)
+
+
+def test_times_are_shown_in_the_timezone_she_is_in(rhythm: Rhythm, persona: Persona) -> None:
+    """出门在外的那几天，起床入睡要按当地时间表示，否则日志读起来自相矛盾。"""
+    checked = 0
+    for i in range(400):
+        d = date(2026, 9, 1) + timedelta(days=i)
+        daily = rhythm.for_day(d)
+        if daily.trip is None:
+            continue
+        checked += 1
+        expected = str(rhythm.tz_for(d))
+        assert str(daily.wake.tzinfo) == expected
+        assert str(daily.sleep_start.tzinfo) == expected
+    assert checked > 0, "一整年都没出过门"
