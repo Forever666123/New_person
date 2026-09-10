@@ -187,6 +187,24 @@ def build_situation(
 # ---------------------------------------------------------------------------
 
 
+def _backlog_hint(unread: list[StoredMessage]) -> str:
+    """积压了好几条的时候，提醒她别逐条回应。
+
+    真人一觉醒来看到四条消息，不会挨个回"关于你第一条…关于你第二条…"，
+    而是挑要紧的说一句，剩下的带过去，或者干脆只接最后一条。
+    这是最容易露馅的地方之一：逐条应答是客服，不是朋友。
+    """
+    if len(unread) < 3:
+        return ""
+    span_hours = (unread[-1].created_at - unread[0].created_at).total_seconds() / 3600
+    if span_hours >= 1:
+        return (
+            "\n\n这几条是你一起看到的，不是一条条读的。"
+            "别逐条回应，挑最要紧的那条说一句就行，别的带过去或者干脆不提。"
+        )
+    return "\n\n他连着发的，当成一段话看，回一次就够了。"
+
+
 def build_reply_user(
     *,
     persona: Persona,
@@ -224,7 +242,9 @@ def build_reply_user(
     if recent:
         blocks.append(_section("最近的对话", format_messages(recent, persona)))
 
-    blocks.append(_section("他刚发的，你要回这些", format_unread(unread, persona)))
+    blocks.append(
+        _section("他刚发的，你要回这些", format_unread(unread, persona) + _backlog_hint(unread))
+    )
 
     if hints:
         blocks.append(_section("你的处境", "\n".join(f"- {h}" for h in hints)))

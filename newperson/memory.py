@@ -250,8 +250,10 @@ class Memory:
         attachments: list[dict[str, Any]] | None = None,
     ) -> int:
         await self.get_conversation(conversation_id)
+        # 用 OR IGNORE：消息已经真的发到对方手机上了，这里再因为主键冲突抛异常
+        # 会让整个回复任务失败重试，后面的日记、台账、跟进全部跳过。
         cur = await self.db.execute(
-            "INSERT INTO messages"
+            "INSERT OR IGNORE INTO messages"
             " (conversation_id, discord_message_id, author_kind, content, attachments_json, created_at)"
             " VALUES (?, ?, 'bot', ?, ?, ?)",
             (

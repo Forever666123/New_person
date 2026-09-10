@@ -792,3 +792,61 @@ async def test_an_hour_later_is_not_hot_anymore(tmp_path: Path, persona: Persona
     await send(app, "在吗", at=EVENING)
     jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
     assert "cold" in jobs[0].reason
+
+
+async def test_a_backlog_becomes_one_reply(tmp_path: Path, persona: Persona) -> None:
+    """他半夜连发四条，她醒来只回一次，不是四次。"""
+    from zoneinfo import ZoneInfo as _TZ
+
+    night = datetime(2026, 9, 10, 3, 13, tzinfo=_TZ("America/New_York"))
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="刚看到")])] * 5, now=night
+    )
+    assert app.rhythm.is_sleeping(night)
+
+    for i, minutes in enumerate([0, 109, 110, 190]):
+        t = night + timedelta(minutes=minutes)
+        clock.set(t)
+        await send(app, f"第{i + 1}条", at=t, msg_id=200 + i)
+        assert len(await memory.pending_jobs("reply", CONVERSATION_ID)) == 1
+
+    await drain(app, clock)
+    assert len(llm.calls) == 1, "积压的消息不该分成好几次回"
+    assert channel.texts == ["刚看到"]
+
+    prompt = llm.calls[0]["messages"][0]["content"]
+    for i in range(1, 5):
+        assert f"第{i}条" in prompt, "四条都要进上下文，她是一起看到的"
+
+
+async def test_a_backlog_tells_her_not_to_answer_line_by_line(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """逐条应答是客服，不是朋友。"""
+    from zoneinfo import ZoneInfo as _TZ
+
+    night = datetime(2026, 9, 10, 3, 13, tzinfo=_TZ("America/New_York"))
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])] * 3, now=night
+    )
+    for i, minutes in enumerate([0, 109, 190]):
+        t = night + timedelta(minutes=minutes)
+        clock.set(t)
+        await send(app, f"第{i + 1}条", at=t, msg_id=300 + i)
+    await drain(app, clock)
+    assert "别逐条回应" in llm.calls[0]["messages"][0]["content"]
+
+
+async def test_a_quick_burst_is_treated_as_one_thought(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他一分钟内连发三句，那是一段话，不是三件事。"""
+    app, _channel, llm, clock, _memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])] * 3
+    )
+    for i in range(3):
+        t = EVENING + timedelta(seconds=i * 20)
+        clock.set(t)
+        await send(app, f"第{i + 1}句", at=t, msg_id=400 + i)
+    await drain(app, clock)
+    assert "当成一段话看" in llm.calls[0]["messages"][0]["content"]

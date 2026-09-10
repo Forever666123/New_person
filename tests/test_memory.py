@@ -288,3 +288,12 @@ async def test_everything_survives_reopening(tmp_path: Path) -> None:
     assert len(await again.unread_messages(CONV)) == 1
     assert await again.recall_facts("owner", NOW, 45, 0.25) == ["他在悉尼"]
     await again.close()
+
+
+async def test_recording_her_own_message_never_blows_up(memory: Memory) -> None:
+    """她说的话已经发到对方手机上了，入库再抛异常会让整个任务失败重试，
+    后面的日记、台账、跟进全部跳过。"""
+    await memory.add_bot_message(CONV, "嗯", NOW, discord_message_id=999)
+    await memory.add_bot_message(CONV, "又一条", NOW + timedelta(minutes=1), discord_message_id=999)
+    conv = await memory.get_conversation(CONV)
+    assert conv.last_bot_message_at == NOW + timedelta(minutes=1)

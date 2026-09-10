@@ -36,8 +36,12 @@ def heat_of(
     hot_seconds: float,
     warm_seconds: float,
 ) -> Heat:
-    """按双方最后一次交流距今多久，判断这段对话还热不热。"""
-    stamps = [t for t in (last_user_at, last_bot_at) if t is not None]
+    """按双方最后一次交流距今多久，判断这段对话还热不热。
+
+    只看**已经发生**的交流。排在未来的回复不算数：它还没发出去，
+    算进来会得到负数间隔，反而被判成正在热聊。
+    """
+    stamps = [t for t in (last_user_at, last_bot_at) if t is not None and t <= now]
     if not stamps:
         return "cold"
     gap = (now - max(stamps)).total_seconds()

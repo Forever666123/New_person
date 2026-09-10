@@ -293,6 +293,8 @@ class Rhythm:
         等下次拿手机再说。只用每日常量的话，同一天里任何时刻都一样，
         那就是个写死的数字。
         """
+        if self.is_sleeping(dt):
+            return 0.0  # 睡着的时候压根不看手机，这个数字没有意义
         daily = self.daily_for(dt)
         activity = self.activity_at(dt)
         factor = 0.55 + 0.45 * min(activity / 0.7, 1.0)

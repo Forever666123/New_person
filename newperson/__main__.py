@@ -183,7 +183,9 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     print(f"{persona.name}　种子 {args.seed}　{args.days} 天")
     print("=" * 88)
 
-    last_exchange: datetime | None = None
+    exchanges: list[datetime] = []
+    """已经发生过的交流时刻。排在未来的回复不算，那还没发出去。"""
+    pending_reply_at: datetime | None = None
 
     for day_offset in range(args.days):
         day = rhythm.local_date(start + timedelta(days=day_offset))
@@ -200,33 +202,59 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         )
 
         for sent in _message_times(start + timedelta(days=day_offset), args.messages_per_day, rng):
-            features = extract_features([rng.choice(SAMPLE_MESSAGES)], persona)
-            heat = heat_of(
-                sent, last_exchange, None, persona.timing.hot_seconds, persona.timing.warm_seconds
-            )
-            decision = attention.plan_reply(sent, heat, features, sent, rng)
-            waited = (decision.reply_at - sent).total_seconds()
-
             snapshot = rhythm.state_at(sent)
-            there = ""
-            if owner_tz is not None:
-                there = f"（他 {sent.astimezone(owner_tz).strftime('%H:%M')}）"
+            there = f"（他 {sent.astimezone(owner_tz).strftime('%H:%M')}）" if owner_tz else ""
             state = {
                 "sleeping": "睡着",
                 "busy": snapshot.block_title or "忙",
                 "free": "有空",
                 "winding_down": "快睡了",
             }[snapshot.state]
+
+            # 已经排着一次回复了，这条并进去一起回，不会单独产生一次
+            if pending_reply_at is not None and pending_reply_at > sent:
+                heat = heat_of(
+                    sent, _last_before(exchanges, sent), None,
+                    persona.timing.hot_seconds, persona.timing.warm_seconds,
+                )
+                pending_reply_at = attention.merge_pending(pending_reply_at, sent, heat, rng)
+                print(
+                    f"    {sent.strftime('%H:%M')}{there} 他又发　她{state:<6}"
+                    f"　　　并进上面那次，一起回"
+                )
+                continue
+
+            features = extract_features([rng.choice(SAMPLE_MESSAGES)], persona)
+            heat = heat_of(
+                sent,
+                _last_before(exchanges, sent),
+                None,
+                persona.timing.hot_seconds,
+                persona.timing.warm_seconds,
+            )
+            decision = attention.plan_reply(sent, heat, features, sent, rng)
+            waited = (decision.reply_at - sent).total_seconds()
+
             engage = rhythm.engage_probability_at(sent)
+            engage_text = "　—　" if engage <= 0 else f"{engage:.0%}"
             print(
                 f"    {sent.strftime('%H:%M')}{there} 他发　她{state:<6}"
-                f"{heat_names[heat]:<5}当场回 {engage:.0%}　"
+                f"{heat_names[heat]:<5}当场回 {engage_text:<5}"
                 f"→ {decision.reply_at.strftime('%d日%H:%M')}（{_pretty(waited)}）"
             )
             if args.verbose:
                 print(f"        {decision.reason}")
-            last_exchange = decision.reply_at
+
+            exchanges.append(sent)
+            exchanges.append(decision.reply_at)
+            pending_reply_at = decision.reply_at
     return 0
+
+
+def _last_before(moments: list[datetime], cutoff: datetime) -> datetime | None:
+    """cutoff 之前最后一次交流。未来的不算。"""
+    past = [t for t in moments if t < cutoff]
+    return max(past) if past else None
 
 
 def _message_times(day_start: datetime, count: int, rng: random.Random) -> list[datetime]:
