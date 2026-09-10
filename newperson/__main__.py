@@ -201,7 +201,14 @@ def cmd_simulate(args: argparse.Namespace) -> int:
             f"{classes}　今天当场回的基准 {daily.engage_probability:.0%}"
         )
 
-        for sent in _message_times(start + timedelta(days=day_offset), args.messages_per_day, rng):
+        day_start = start + timedelta(days=day_offset)
+        day_end = day_start + timedelta(days=1)
+        sent = day_start + timedelta(minutes=rng.uniform(0, 200))
+        last_reply: datetime | None = None
+
+        for _ in range(args.messages_per_day):
+            if sent >= day_end:
+                break
             snapshot = rhythm.state_at(sent)
             there = f"（他 {sent.astimezone(owner_tz).strftime('%H:%M')}）" if owner_tz else ""
             state = {
@@ -222,6 +229,9 @@ def cmd_simulate(args: argparse.Namespace) -> int:
                     f"    {sent.strftime('%H:%M')}{there} 他又发　她{state:<6}"
                     f"　　　并进上面那次，一起回"
                 )
+                exchanges.append(sent)
+                last_reply = pending_reply_at
+                sent = _next_message_time(sent, last_reply, day_end, rng)
                 continue
 
             features = extract_features([rng.choice(SAMPLE_MESSAGES)], persona)
@@ -248,30 +258,38 @@ def cmd_simulate(args: argparse.Namespace) -> int:
             exchanges.append(sent)
             exchanges.append(decision.reply_at)
             pending_reply_at = decision.reply_at
+            last_reply = decision.reply_at
+            sent = _next_message_time(sent, last_reply, day_end, rng)
     return 0
+
+
+def _next_message_time(
+    prev_sent: datetime, last_reply: datetime | None, day_end: datetime, rng: random.Random
+) -> datetime:
+    """他下一条消息什么时候发。
+
+    真人的节奏是"她回了我就接着说"，不是在一天里均匀撒点。
+    均匀撒点的话每条消息都是隔了很久的孤立事件，
+    正在聊天时她回得多快这条路径永远测不到。
+    """
+    roll = rng.random()
+    if last_reply is not None and roll < 0.45:
+        # 她刚回完，他接着说
+        follow_up = last_reply + timedelta(minutes=rng.uniform(0.3, 5))
+        if follow_up < day_end:
+            return follow_up
+    if last_reply is not None and roll < 0.68:
+        # 过了一会儿又想起一件事
+        soon = last_reply + timedelta(minutes=rng.uniform(8, 40))
+        if soon < day_end:
+            return soon
+    return prev_sent + timedelta(minutes=rng.uniform(40, 260))
 
 
 def _last_before(moments: list[datetime], cutoff: datetime) -> datetime | None:
     """cutoff 之前最后一次交流。未来的不算。"""
     past = [t for t in moments if t < cutoff]
     return max(past) if past else None
-
-
-def _message_times(day_start: datetime, count: int, rng: random.Random) -> list[datetime]:
-    """一天里他发消息的时刻。
-
-    不是均匀撒点：真人聊天是成簇的，一次说好几句，然后隔很久再来一次。
-    均匀撒点的话每条消息都是"冷了"，看不到正在聊的时候她回得多快。
-    """
-    moments: list[datetime] = []
-    while len(moments) < count:
-        anchor = day_start + timedelta(hours=rng.uniform(0, 24))
-        burst = rng.choice([1, 1, 1, 2, 2, 3])
-        t = anchor
-        for _ in range(min(burst, count - len(moments))):
-            moments.append(t)
-            t += timedelta(minutes=rng.uniform(0.5, 9))
-    return sorted(moments)
 
 
 SAMPLE_MESSAGES = ["在吗", "今天上班好累", "我那个筛选器改完了", "你看这个", "睡了没", "急 帮我看下这个参数"]

@@ -351,6 +351,13 @@ class TimingConfig(BaseModel):
     中位数一分多钟，三五分钟才回也很常见。
     """
     hot_reply_sigma: float = 0.8
+    backlog_after_wake_hours: float = 3.0
+    """睡着时积压的消息，醒来之后最多拖多久。
+
+    人睡醒第一件事就是看手机，积压一晚上的东西不会再压到晚上。
+    没有这个上限的话，偶尔一次"先放着"叠上早上很低的活跃度，
+    能把一条凌晨的消息拖到下午。
+    """
 
 
 class MemoryConfig(BaseModel):

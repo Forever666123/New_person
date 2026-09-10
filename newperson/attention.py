@@ -187,9 +187,17 @@ class AttentionPolicy:
 
         # 看到了不一定当场处理。没空、在路上、懒得打字，就先放着，下次再说。
         # 概率跟着看手机那一刻的活跃度走，不是每天一个固定值。
+        # 例外：睡着时积压的消息，醒来那一眼基本都会处理。
+        # 人睡醒看到攒了一晚上的消息，不会说"待会儿再说"。
+        overnight = self.rhythm.is_sleeping(now)
         defers = 0
         max_defers = self.rhythm.config.max_defers
-        while defers < max_defers and rng.random() > self.rhythm.engage_probability_at(glance):
+        while defers < max_defers:
+            engage = self.rhythm.engage_probability_at(glance)
+            if overnight and defers == 0:
+                engage = 1 - (1 - engage) * 0.25
+            if rng.random() <= engage:
+                break
             nxt = self.rhythm.next_glance_after(glance + timedelta(seconds=1), rng)
             if nxt <= glance:
                 break
@@ -234,11 +242,23 @@ class AttentionPolicy:
     def _cap_total_delay(
         self, now: datetime, reply: datetime, notice: datetime, steps: list[str]
     ) -> datetime:
-        """封顶。睡觉推迟不算在内，那是合理的长延迟。"""
-        limit = timedelta(hours=self.persona.timing.max_delay_hours)
-        if reply - now <= limit or self.rhythm.is_sleeping(now):
+        """封顶。
+
+        睡觉推迟本身是合理的长延迟，不算在内，但**醒来之后**不能再拖很久：
+        人睡醒第一件事就是看手机，积压一晚上的东西不会再压到晚上。
+        早先这里写成"睡着时直接不封顶"，于是一次"先放着"叠上早上很低的活跃度，
+        能把一条凌晨的消息拖到下午六点。
+        """
+        if self.rhythm.is_sleeping(now):
+            wake = self.rhythm.next_wake_after(now)
+            cap = wake + timedelta(hours=self.persona.timing.backlog_after_wake_hours)
+            if reply > cap:
+                steps.append("睡醒之后不会再拖了")
+                return cap
             return reply
-        if reply - notice <= limit:
+
+        limit = timedelta(hours=self.persona.timing.max_delay_hours)
+        if reply - now <= limit or reply - notice <= limit:
             return reply
         steps.append(f"封顶到 {self.persona.timing.max_delay_hours} 小时")
         return notice + limit

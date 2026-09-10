@@ -254,3 +254,67 @@ def test_typing_takes_time_but_not_forever(policy: AttentionPolicy) -> None:
     assert 1.5 <= policy.typing_duration("嗯", rng) <= 40
     assert policy.typing_duration("字" * 500, rng) == pytest.approx(40, abs=0.1)
     assert policy.typing_duration("今天下雪了", rng) > policy.typing_duration("嗯", rng)
+
+
+def test_an_overnight_backlog_is_handled_soon_after_waking(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """睡着时积压的消息，醒来之后不会再拖到下午。
+
+    人睡醒第一件事就是看手机。早先这里完全不封顶，一次"先放着"
+    叠上早上很低的活跃度，能把一条凌晨的消息拖到晚上六点。
+    """
+    limit = persona.timing.backlog_after_wake_hours
+    checked = 0
+    for offset in range(40):
+        sent = evening(offset).replace(hour=4, minute=47)
+        if not rhythm.is_sleeping(sent):
+            continue
+        checked += 1
+        wake = rhythm.next_wake_after(sent)
+        for seed in range(12):
+            d = policy.plan_reply(
+                sent, "cold", extract_features(["在吗"], persona), sent, random.Random(seed)
+            )
+            gap = (d.reply_at - wake).total_seconds() / 3600
+            assert 0 <= gap <= limit + 0.01, f"起床后 {gap:.1f} 小时才回"
+    assert checked >= 20
+
+
+def test_she_usually_deals_with_the_backlog_on_the_first_look(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """攒了一晚上的消息，醒来那一眼基本都会处理，不会说"待会儿再说"。"""
+    sent = None
+    for offset in range(30):
+        candidate = evening(offset).replace(hour=4)
+        if rhythm.is_sleeping(candidate):
+            sent = candidate
+            break
+    assert sent is not None
+
+    deferred = sum(
+        1
+        for seed in range(200)
+        if policy.plan_reply(
+            sent, "cold", extract_features(["在吗"], persona), sent, random.Random(seed)
+        ).defers
+    )
+    assert deferred / 200 < 0.25, "醒来看到积压还老是先放着，不像人"
+
+
+def test_a_daytime_message_can_still_wait(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """白天收到的消息该能拖就拖，睡醒那个上限不该管到白天。"""
+    long_waits = 0
+    for offset in range(60):
+        now = evening(offset).replace(hour=14)
+        if rhythm.is_sleeping(now):
+            continue
+        d = policy.plan_reply(
+            now, "cold", extract_features(["在吗"], persona), now, random.Random(offset)
+        )
+        if (d.reply_at - now).total_seconds() > 3600:
+            long_waits += 1
+    assert long_waits > 0, "白天一次超过一小时的延迟都没有，反而不像人"

@@ -159,7 +159,7 @@ persona/
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q          # 261 个测试，不联网
+python -m pytest -q          # 264 个测试，不联网
 ruff check newperson tests
 ```
 
