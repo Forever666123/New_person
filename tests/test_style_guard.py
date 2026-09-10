@@ -131,3 +131,17 @@ def test_reaction_can_be_turned_off(persona: Persona) -> None:
     """完全不用 emoji 的人物，把 allow_reactions 关掉就一个都不会点。"""
     style = persona.style.model_copy(update={"allow_reactions": False})
     assert sg.filter_reaction("😂", style) is None
+
+
+def test_she_never_explains_where_she_was(persona: Persona) -> None:
+    """人设里写死了她不解释行踪。这几种说法都要拦下来。"""
+    for text in ("还在睡 没看到", "刚看到", "刚醒", "刚忙完", "才看到", "睡过头了"):
+        _, needs = sg.enforce(parts(text), persona.style, persona.boundaries)
+        assert needs, f"{text} 应该被拦下来"
+
+
+def test_talking_about_his_stuff_is_fine(persona: Persona) -> None:
+    """别把正常内容误伤了。"""
+    for text in ("soxl那个新闻出来跌了还是涨了", "止损设了没", "成本多少"):
+        _, needs = sg.enforce(parts(text), persona.style, persona.boundaries)
+        assert not needs, f"{text} 不该被拦"

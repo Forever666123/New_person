@@ -209,7 +209,7 @@ def test_a_long_gap_tells_her_not_to_apologise(policy: AttentionPolicy, persona:
     now = evening().replace(hour=4)
     assert rhythm.is_sleeping(now)
     d = policy.plan_reply(now, "cold", extract_features(["在吗"], persona), now, random.Random(1))
-    assert any("不要解释" in h for h in d.hints)
+    assert any("别解释" in h for h in d.hints)
 
 
 def test_deferred_messages_are_not_mentioned(policy: AttentionPolicy, persona: Persona) -> None:
@@ -318,3 +318,41 @@ def test_a_daytime_message_can_still_wait(
         if (d.reply_at - now).total_seconds() > 3600:
             long_waits += 1
     assert long_waits > 0, "白天一次超过一小时的延迟都没有，反而不像人"
+
+
+def test_the_hints_ignore_the_debug_speedup(persona: Persona, rhythm: Rhythm) -> None:
+    """DELAY_SCALE 是调试用的加速器，不该改变她说什么。
+
+    压缩之后"隔了六小时"会变成"隔了十几秒"，她就不知道自己该不该
+    提这段时间的事了，于是冒出"还在睡 没看到"这种解释行踪的话。
+    """
+    real = AttentionPolicy(persona, rhythm, delay_scale=1.0)
+    fast = AttentionPolicy(persona, rhythm, delay_scale=0.01)
+    now = evening().replace(hour=4)
+    if not rhythm.is_sleeping(now):
+        now = next(
+            evening(d).replace(hour=4) for d in range(14) if rhythm.is_sleeping(evening(d).replace(hour=4))
+        )
+    features = extract_features(["在吗"], persona)
+    a = real.plan_reply(now, "cold", features, now, random.Random(5))
+    b = fast.plan_reply(now, "cold", features, now, random.Random(5))
+    assert a.hints == b.hints
+    assert any("别解释" in h for h in b.hints)
+
+
+def test_even_a_short_gap_says_do_not_explain(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """隔十几分钟回来也不该解释去哪了，不用等到隔了一个半小时。"""
+    found = False
+    for offset in range(30):
+        now = evening(offset).replace(hour=21)
+        if rhythm.is_sleeping(now):
+            continue
+        d = policy.plan_reply(
+            now, "cold", extract_features(["在吗"], persona), now, random.Random(offset)
+        )
+        if (d.reply_at - now).total_seconds() / 60 > 10:
+            assert any("别解释" in h for h in d.hints)
+            found = True
+    assert found

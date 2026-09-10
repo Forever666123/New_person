@@ -522,7 +522,7 @@ async def test_a_model_failure_does_not_swallow_the_message(
     整批消息就永远回不出去了。这个测试守着这件事。
     """
     app, channel, llm, clock, memory = await build(
-        tmp_path, persona, [None, ReplyPlan(parts=[ReplyPart(text="刚看到")])]
+        tmp_path, persona, [None, ReplyPlan(parts=[ReplyPart(text="那个参数你调了没")])]
     )
     await send(app, "帮我看下这个", at=EVENING)
 
@@ -531,7 +531,7 @@ async def test_a_model_failure_does_not_swallow_the_message(
     assert await memory.unread_messages(CONVERSATION_ID), "失败之后消息不能被标成已读"
 
     await drain(app, clock, hops=4)
-    assert channel.texts == ["刚看到"]
+    assert channel.texts == ["那个参数你调了没"]
 
 
 async def test_delivery_resumes_without_calling_the_model_again(
@@ -800,7 +800,7 @@ async def test_a_backlog_becomes_one_reply(tmp_path: Path, persona: Persona) -> 
 
     night = datetime(2026, 9, 10, 3, 13, tzinfo=_TZ("America/New_York"))
     app, channel, llm, clock, memory = await build(
-        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="刚看到")])] * 5, now=night
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="那个参数你调了没")])] * 5, now=night
     )
     assert app.rhythm.is_sleeping(night)
 
@@ -812,7 +812,7 @@ async def test_a_backlog_becomes_one_reply(tmp_path: Path, persona: Persona) -> 
 
     await drain(app, clock)
     assert len(llm.calls) == 1, "积压的消息不该分成好几次回"
-    assert channel.texts == ["刚看到"]
+    assert channel.texts == ["那个参数你调了没"]
 
     prompt = llm.calls[0]["messages"][0]["content"]
     for i in range(1, 5):

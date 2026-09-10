@@ -156,6 +156,10 @@ class AttentionPolicy:
         reply = self._cap_total_delay(now, reply, notice, steps)
         notice = min(notice, reply)
 
+        # 先按真实时长算处境提示，再缩放。
+        # DELAY_SCALE 是调试用的加速器，不该改变她说什么：
+        # 压缩之后"隔了六小时"变成"隔了十几秒"，她就不知道自己该不该提这件事了。
+        hints = self._context_hints(reply, now, snapshot, defers, fatigue)
         notice, reply = self._scale(now, notice, reply)
         return TimingDecision(
             notice_at=notice,
@@ -163,7 +167,7 @@ class AttentionPolicy:
             reason="；".join(steps),
             defers=defers,
             quick_before_sleep=quick_before_sleep,
-            hints=self._context_hints(reply, now, snapshot, defers, fatigue),
+            hints=hints,
         )
 
     def _plan_notice(
@@ -283,10 +287,11 @@ class AttentionPolicy:
         """给模型的处境提示。这些会进上下文，不会直接发出去。"""
         hints: list[str] = []
         waited = (reply - now).total_seconds() / 60
-        if waited > 90:
+        if waited > 10:
             hints.append(
                 f"他这条消息是 {self._pretty(waited * 60)} 前发的。"
-                "不要解释你去哪了，不要道歉，直接接着说。"
+                "**别解释这段时间你在干嘛**：不说在睡觉、不说刚看到、"
+                "不说抱歉、不交代去哪了。直接接着他的话说。"
             )
         if defers:
             hints.append("你其实早看到了，只是当时没回。别提这件事。")
