@@ -88,6 +88,8 @@ class ReplyRequest:
     photos: list[Photo]
     images: list[tuple[str, bytes]] = field(default_factory=list)
     """对方发来的图片 ``[(media_type, 原始字节)]``，让她真的看得到。"""
+    must_reply: bool = False
+    """他问了问题或者说了件具体的事。这种不能不回。"""
 
 
 @dataclass
@@ -186,7 +188,13 @@ class Brain:
         ) / 1_000_000
 
         log.info(
-            "[brain] %s in=%d cached=%d out=%d 约 $%.4f", purpose, inp, cached, out, cost
+            "[brain] %s in=%d cached=%d 写缓存=%d out=%d 约 $%.4f",
+            purpose,
+            inp,
+            cached,
+            written,
+            out,
+            cost,
         )
         if self.memory is not None:
             await self.memory.record_usage(
@@ -295,6 +303,25 @@ class Brain:
         )
         if plan is None:
             return None
+
+        # 他问了问题、或者在说一件具体的事，模型却给了空。
+        # 小模型在 effort 低的时候很容易走这条省事的路，但那不是"话少"，是不理人。
+        if req.must_reply and not plan.parts and not plan.reaction:
+            log.info("[brain] 他问了具体的事，这条不能不回，重来一次")
+            nudge = (
+                f"{prompt}\n\n"
+                "你刚才给的是空的。他问了你问题，或者跟你说了一件具体的事，"
+                "这种不能不回。你可以只回一句，但要接住他说的那件事。"
+            )
+            second = await self._call(
+                ReplyPlan,
+                self._with_images(nudge, req.images),
+                purpose="reply-nudge",
+                today=today,
+            )
+            if second is not None and (second.parts or second.reaction):
+                plan = second
+
         return await self._polish(plan, prompt, req.images, today)
 
     async def _polish(

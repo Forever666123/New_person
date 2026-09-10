@@ -221,7 +221,16 @@ class LifeEngine:
 
         # 先问"今天她到底会不会开口"。少了这一步，每种主动各自掷骰子，
         # 合起来就变成几乎每天都要找你说话，那很黏人。
-        if self.rng.random() > cfg.day_probability * decay * chattiness:
+        threshold = cfg.day_probability * decay * chattiness
+        if self.rng.random() > threshold:
+            log.info(
+                '[life] 今天不打算主动开口。命中概率 %.0f%%（基准 %.0f%%，'
+                '他没回过 %d 次，chattiness %.1f）',
+                threshold * 100,
+                cfg.day_probability * 100,
+                conv.unanswered_initiations,
+                chattiness,
+            )
             return []
 
         now = self.clock.now()

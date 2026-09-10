@@ -374,3 +374,48 @@ async def test_replies_stay_on_the_main_model(
     )
     await brain.generate_reply(reply_request(), TODAY)
     assert client.messages.calls[0]["model"] == "claude-sonnet-5"
+
+
+async def test_a_real_question_is_never_left_unanswered(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """她话少是给得少，不是不理人。
+
+    小模型在低 effort 下很容易走"这条不回"这条省事的路，
+    但对方问了具体的事还沉默，那不是人设，那是坏了。
+    """
+    empty = ReplyPlan(parts=[])
+    good = ReplyPlan(parts=[ReplyPart(text="止损设了没")])
+    client = fake_client(empty, good)
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(must_reply=True), TODAY)
+    assert [p.text for p in got.parts] == ["止损设了没"]
+    assert len(client.messages.calls) == 2
+
+
+async def test_small_talk_can_still_go_unanswered(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """"晚安"这种不需要接的话，不回是对的，不该硬逼她说点什么。"""
+    client = fake_client(ReplyPlan(parts=[]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(must_reply=False), TODAY)
+    assert got.parts == []
+    assert len(client.messages.calls) == 1
+
+
+async def test_a_reaction_counts_as_answering(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """只点个表情也是回应，不用再逼一次。"""
+    client = fake_client(ReplyPlan(parts=[], reaction="👀"))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    await brain.generate_reply(reply_request(must_reply=True), TODAY)
+    assert len(client.messages.calls) == 1
+
+
+def test_the_output_rules_say_when_silence_is_ok(persona: Persona) -> None:
+    """规范要写清楚什么时候可以不回，不能只说"可以是空的"。"""
+    text = build_system(persona)
+    assert "必须回" in text
+    assert "只影响你说话的语气" in text, "状态不该被模型当成不回的理由"

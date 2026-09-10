@@ -339,6 +339,7 @@ class App:
             payload={
                 "hints": decision.hints,
                 "mode": features.mode,
+                "is_question": features.is_question,
                 # 回到他说话的那个地方，不是默认频道
                 "channel_id": channel_id,
             },
@@ -507,6 +508,8 @@ class App:
 
         mode_name = job.payload.get("mode")
         mode = next((m for m in self.persona.modes if m.name == mode_name), None)
+        # 他问了问题、或者聊到交易这类他上心的事，这种不能不回
+        must_reply = bool(job.payload.get("is_question") or mode_name)
         ledger = await self.memory.ledger(mode.ledger_kind) if mode and mode.include_ledger else []
 
         images = []
@@ -530,6 +533,7 @@ class App:
                 hints=list(job.payload.get("hints", [])),
                 photos=await self._photo_shortlist(now),
                 images=images,
+                must_reply=must_reply,
             ),
             self.rhythm.local_date(now),
         )

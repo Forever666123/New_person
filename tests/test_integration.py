@@ -850,3 +850,42 @@ async def test_a_quick_burst_is_treated_as_one_thought(
         await send(app, f"第{i + 1}句", at=t, msg_id=400 + i)
     await drain(app, clock)
     assert "当成一段话看" in llm.calls[0]["messages"][0]["content"]
+
+
+async def test_a_trading_question_gets_an_answer_end_to_end(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他说他买了什么、亏了多少、有点慌，这种她不会不回。"""
+    app, channel, llm, clock, _memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[]), ReplyPlan(parts=[ReplyPart(text="成本 124.5 你止损设哪")])],
+    )
+    await send(
+        app,
+        "我前几天买了1万块钱soxl 成本124.5 现在120了 有点焦虑",
+        at=EVENING,
+    )
+    await drain(app, clock)
+    assert channel.texts == ["成本 124.5 你止损设哪"]
+    assert len(llm.calls) == 2, "第一次给了空，应该逼它重来一次"
+
+
+async def test_a_plain_question_also_gets_an_answer(
+    tmp_path: Path, persona: Persona
+) -> None:
+    app, channel, llm, _clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[]), ReplyPlan(parts=[ReplyPart(text="还没")])]
+    )
+    await send(app, "你吃饭了吗", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert jobs[0].payload["is_question"] is True
+
+
+async def test_good_night_can_go_unanswered(tmp_path: Path, persona: Persona) -> None:
+    """不是所有消息都得回。晚安这种接不接都行。"""
+    app, channel, llm, clock, _memory = await build(tmp_path, persona, [ReplyPlan(parts=[])])
+    await send(app, "睡了 晚安", at=EVENING)
+    await drain(app, clock)
+    assert channel.sent == []
+    assert len(llm.calls) == 1, "闲聊不该被逼着重来"
