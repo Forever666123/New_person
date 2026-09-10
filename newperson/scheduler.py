@@ -189,13 +189,31 @@ class Scheduler:
     # -- 主循环 -------------------------------------------------------------
 
     async def run_forever(self) -> None:
-        """算出下一个任务什么时候到期，睡到那时候，或者被新任务唤醒。"""
+        """算出下一个任务什么时候到期，睡到那时候，或者被新任务唤醒。
+
+        单个任务失败已经在 :meth:`_run_job` 里兜住了。这里再兜一层，
+        是因为循环本身出意外（比如数据库暂时读不了）不能让她从此彻底不说话，
+        那种故障没有任何征兆，你只会觉得她再也不理你了。
+        """
         await self.recover()
         while not self._stopped:
-            await self.run_due_once()
+            try:
+                await self.run_due_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("[job] 调度循环出意外，歇一分钟再来")
+                await self.clock.sleep(60)
+                continue
             if self._stopped:
                 break
-            await self._wait_for_next()
+            try:
+                await self._wait_for_next()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("[job] 等待下一个任务时出意外")
+                await self.clock.sleep(60)
 
     async def _wait_for_next(self) -> None:
         next_at = await self.memory.next_job_run_at()

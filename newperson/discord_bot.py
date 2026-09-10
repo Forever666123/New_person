@@ -94,6 +94,8 @@ class App:
         self.rng = rng
         self.client: discord.Client | None = None
         self._channel: Any = None
+        self._tasks: set[asyncio.Task] = set()
+        """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
 
     # -- 启动 ---------------------------------------------------------------
 
@@ -108,12 +110,37 @@ class App:
         self.scheduler.register("memory_update", self.handle_memory_update_job)
 
         await self.scheduler.recover()
+        self._prune_downloads()
         await self.life.schedule_next_day_plan()
         if not self.rhythm.is_sleeping(self.clock.now()):
             await self.life.ensure_today_plan(CONVERSATION_ID)
 
-        asyncio.create_task(self.scheduler.run_forever())  # noqa: RUF006
+        self.spawn(self.scheduler.run_forever())
         log.info("[app] %s 上线了", self.persona.name)
+
+    def spawn(self, coro) -> asyncio.Task:
+        """起一个后台循环，并留住引用。"""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _prune_downloads(self, keep_days: float = 14) -> None:
+        """他发过的图片下载在本地，久了会把磁盘撑满。模型早就看过了，留两周够了。"""
+        folder = self.settings.downloads_dir
+        if not folder.exists():
+            return
+        cutoff = self.clock.now().timestamp() - keep_days * 86400
+        removed = 0
+        for path in folder.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:  # 删不掉就算了，不值得为这个崩
+                continue
+        if removed:
+            log.info("[app] 清掉 %d 张过期的图片", removed)
 
     async def resolve_channel(self) -> Any:
         """她说话的地方。默认私聊 Owner，也可以指定一个频道。"""

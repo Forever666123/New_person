@@ -167,3 +167,38 @@ async def test_run_forever_stops_cleanly(parts) -> None:
     await asyncio.wait_for(done.wait(), timeout=2)
     sched.stop()
     await asyncio.wait_for(task, timeout=2)
+
+
+async def test_the_loop_survives_a_database_hiccup(parts) -> None:
+    """循环本身出意外不能让她从此彻底不说话。
+
+    那种故障没有任何征兆，你只会觉得她再也不理你了，比崩溃还难查。
+    """
+    memory, clock, sched = parts
+    calls = []
+
+    async def handler(job: Job) -> None:
+        calls.append(job.id)
+
+    sched.register("reply", handler)
+    await sched.schedule("reply", NOW, conversation_id="owner")
+
+    boom = [True]
+    original = memory.due_jobs
+
+    async def flaky(*args, **kwargs):
+        if boom[0]:
+            boom[0] = False
+            raise RuntimeError("数据库这会儿读不了")
+        return await original(*args, **kwargs)
+
+    memory.due_jobs = flaky
+    task = asyncio.create_task(sched.run_forever())
+    for _ in range(100):
+        # 真的等一小会儿：aiosqlite 在工作线程里跑，光 yield 事件循环推不动它
+        await asyncio.sleep(0.01)
+        if calls:
+            break
+    sched.stop()
+    await asyncio.wait_for(task, timeout=2)
+    assert calls, "第一次出意外之后循环就死了"
