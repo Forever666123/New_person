@@ -212,7 +212,61 @@ async def test_the_last_error_is_recorded_for_the_owner(
     )
     brain = Brain(fake_client(error), settings(tmp_path), persona, memory)
     await brain.generate_reply(reply_request(), TODAY)
-    assert await memory.kv_get("last_api_error") == "500"
+    recorded = await memory.kv_get("last_api_error")
+    assert recorded and "500" in recorded
+    # 带时间戳：不带的话你分不出这是三周前的一次抖动还是刚刚密钥失效
+    stamp, _, _detail = recorded.partition("\t")
+    assert datetime.fromisoformat(stamp)
+
+
+async def test_every_common_failure_is_visible_to_the_owner(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """限流、连不上、被拒——三种最常见的失败都要留痕。
+
+    她的正常状态就包含长时间不说话，所以"接口挂了"和"她不想聊"在外面看
+    完全一样。原来只有 APIStatusError 和兜底那两条写了 last_api_error，
+    而这三种恰恰是最常见的：出事时 `!np status` 干干净净，
+    你只会觉得她今天特别安静。
+    """
+    request = httpx.Request("POST", "http://x")
+    failures = [
+        anthropic.RateLimitError(
+            "slow down", response=httpx.Response(429, request=request), body=None
+        ),
+        anthropic.APIConnectionError(request=request),
+    ]
+    for failure in failures:
+        await memory.kv_delete("last_api_error")
+        brain = Brain(fake_client(failure), settings(tmp_path), persona, memory)
+        await brain.generate_reply(reply_request(), TODAY)
+        assert await memory.kv_get("last_api_error"), f"{type(failure).__name__} 没留下痕迹"
+
+    # 被拒
+    class Refusing(FakeMessages):
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(parsed_output=None, usage=usage(), stop_reason="refusal")
+
+    await memory.kv_delete("last_api_error")
+    brain = Brain(SimpleNamespace(messages=Refusing([])), settings(tmp_path), persona, memory)
+    await brain.generate_reply(reply_request(), TODAY)
+    assert await memory.kv_get("last_api_error"), "被拒也要留痕"
+
+
+async def test_a_success_clears_the_old_error(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """接口恢复了就把旧报错清掉。
+
+    不清的话三周前的一次网络抖动会一直挂在 status 上，
+    跟"此刻密钥失效了"长得一模一样。
+    """
+    await memory.kv_set("last_api_error", "2026-01-01T00:00:00+00:00\t很久以前的事")
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    await brain.generate_reply(reply_request(), TODAY)
+    assert await memory.kv_get("last_api_error") is None
 
 
 # -- 花钱的上限 --------------------------------------------------------------

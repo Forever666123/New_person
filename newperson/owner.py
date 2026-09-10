@@ -29,6 +29,7 @@ PREFIX = "!np"
 HELP = """\
 `!np status` 她现在什么状态，有什么排着队，今天花了多少钱，上次备份是什么时候
 `!np now` 让排着的那条回复立刻发
+`!np retry` 把重试到放弃的任务放回队列
 `!np pause` / `!np resume` 暂停。暂停时她不回也不主动，但消息照常记着
 `!np away 出差 [天数]` / `!np back` 请假。这期间她话少，只保留最低限度的主动
 `!np chatty 0.5` 主动消息的频率倍率，0 到 2
@@ -46,6 +47,7 @@ class OwnerContext:
     life: LifeEngine
     conversation_id: str
     now: datetime
+    max_calls_per_day: int = 0
 
 
 def is_command(text: str) -> bool:
@@ -61,6 +63,7 @@ async def handle(text: str, ctx: OwnerContext) -> str:
     handlers = {
         "status": _status,
         "now": _now,
+        "retry": _retry,
         "pause": _pause,
         "resume": _resume,
         "away": _away,
@@ -106,6 +109,16 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
     if unread:
         lines.append(f"未读 {len(unread)} 条，最早一条 {unread[0].created_at.strftime('%m-%d %H:%M')}")
 
+    # 重试用尽的任务会变成 failed，而 pending_jobs 只查 pending，
+    # 于是它从所有你看得见的地方消失：消息还挂在未读里、她永远不会回，
+    # 而 status 一片安静。这是"她坏了"和"她没说话"最难分的一种。
+    failed = await ctx.memory.failed_jobs(ctx.conversation_id)
+    if failed:
+        lines.append(f"**有 {len(failed)} 个任务重试到放弃了**（她不会自己再试）：")
+        for job in failed[:4]:
+            lines.append(f"　{job.kind} 排在 {job.run_at.strftime('%m-%d %H:%M')}　{job.reason}")
+        lines.append("　`!np retry` 让她重新试一次")
+
     jobs = await ctx.memory.pending_jobs(conversation_id=ctx.conversation_id)
     jobs += [j for j in await ctx.memory.pending_jobs() if j.conversation_id is None]
     if jobs:
@@ -123,7 +136,14 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
         lines.append("**发不出去**：你需要和机器人在同一个服务器里，并允许服务器成员私信")
 
     used = await ctx.memory.usage_for(ctx.now.date())
-    lines.append(f"今天调了 {used.get('calls', 0)} 次模型，约 ${used.get('estimated_usd', 0):.2f}")
+    calls = used.get("calls", 0)
+    cap = ctx.max_calls_per_day
+    line = f"今天调了 {calls} 次模型（上限 {cap}），约 ${used.get('estimated_usd', 0):.2f}"
+    if cap and calls >= cap:
+        # 打满之后她会把回复推到明天，这是设计好的降级，但不说的话
+        # 你只会觉得她今天忽然不理人了。
+        line += "　**已经打满，今天她不会再回了**"
+    lines.append(line)
 
     # 备份停了是不会有任何症状的，直到你需要它那天。所以放在你每天都看的这里。
     last_backup = backup_mod.last_backup_at(ctx.memory.db_path)
@@ -137,7 +157,14 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
             lines.append(f"上次备份 {hours:.0f} 小时前")
 
     if err := await ctx.memory.kv_get("last_api_error"):
-        lines.append(f"最近一次接口出错：{err}")
+        stamp, _, detail = err.partition("\t")
+        try:
+            when = datetime.fromisoformat(stamp)
+            hours = (ctx.now - when).total_seconds() / 3600
+            ago = f"{hours * 60:.0f} 分钟前" if hours < 2 else f"{hours:.0f} 小时前"
+            lines.append(f"接口出错（{ago}）：{detail or stamp}")
+        except ValueError:
+            lines.append(f"最近一次接口出错：{err}")
     if await ctx.memory.kv_get("paused"):
         lines.append("**已暂停**")
     if note := await ctx.memory.kv_get("away_note"):
@@ -155,6 +182,17 @@ async def _now(_args: list[str], ctx: OwnerContext) -> str:
     for job in jobs:
         await ctx.scheduler.reschedule(job.id or 0, ctx.now)
     return f"催了 {len(jobs)} 条，马上发"
+
+
+async def _retry(_args: list[str], ctx: OwnerContext) -> str:
+    """把重试到放弃的任务放回队列。
+
+    接口挂过一阵子之后，那几条消息就永远躺在未读里了——她不会自己再试。
+    """
+    count = await ctx.memory.revive_failed_jobs(ctx.conversation_id, ctx.now)
+    if not count:
+        return "没有失败的任务"
+    return f"{count} 个任务放回队列了，她会重新试一次"
 
 
 async def _pause(_args: list[str], ctx: OwnerContext) -> str:

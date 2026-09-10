@@ -121,7 +121,6 @@ class App:
         if self._started:
             log.info("[app] 网关重连了，沿用已有的状态")
             return
-        self._started = True
         await self.memory.open()
         self.scheduler.register("reply", self.handle_reply_job)
         self.scheduler.register("proactive", self.handle_proactive_job)
@@ -140,6 +139,13 @@ class App:
         # 所以排在 ensure_today_plan 后面。
         await self.life.ensure_opener(CONVERSATION_ID, plan)
 
+        # **标记要放在这儿，不能放在开头。**
+        # 放开头的话，中间任何一步抛异常（数据库打不开、日程生成炸了）
+        # 都会留下一个"已启动"的半残进程：discord.py 吞掉 on_ready 的异常继续跑，
+        # 网关连着、头像亮着、消息也收得到并入库，但调度循环从来没起来——
+        # 她永远不回你，而重连时 _started 已经是真，直接早返回，永远修不好。
+        # 唯一的症状就是她不说话，而那正是她的正常状态。
+        self._started = True
         self.spawn(self.scheduler.run_forever(), "scheduler")
 
         now = self.clock.now()
@@ -273,6 +279,7 @@ class App:
                     scheduler=self.scheduler,
                     life=self.life,
                     conversation_id=CONVERSATION_ID,
+                    max_calls_per_day=self.settings.max_calls_per_day,
                     now=self.clock.now(),
                 ),
             )
@@ -611,6 +618,11 @@ class App:
             raise
 
         await self._record_sent(result, now)
+        if result.sent_texts or result.photo_sent:
+            # 发得出去就把"发不出去"这个判断收回来。
+            # 不收的话，一次 403（你临时退了共同服务器、关了私信）之后
+            # 她就永远只回话、再也不主动了——而回复照常，你根本不会发现。
+            await self._mark_deliverable(True)
         await self._after_reply(plan, now, sent_any=bool(result.sent_texts))
 
         if result.interrupted:
@@ -681,6 +693,13 @@ class App:
         )
 
     # -- 主动消息 -----------------------------------------------------------
+
+    async def _mark_deliverable(self, ok: bool) -> None:
+        """记下"现在发不发得出去"。只在状态真的变了时写库。"""
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        if conv.deliverable != ok:
+            await self.memory.update_conversation(CONVERSATION_ID, deliverable=ok)
+            log.info("[delivery] 发送通道恢复了" if ok else "[delivery] 发不出去了")
 
     async def handle_proactive_job(self, job: Job) -> None:
         now = self.clock.now()

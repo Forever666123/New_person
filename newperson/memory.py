@@ -842,6 +842,41 @@ class Memory:
         )
         return parse_dt(row["t"]) if row and row["t"] else None
 
+    async def failed_jobs(self, conversation_id: str | None = None) -> list[Job]:
+        """重试到放弃的任务。
+
+        ``pending_jobs`` 只查 pending，所以这些从所有 owner 看得见的地方消失了：
+        消息还挂在未读里，她永远不会回，而 ``!np status`` 一片安静。
+        """
+        if conversation_id is None:
+            rows = await self._fetch_all(
+                "SELECT * FROM jobs WHERE status = 'failed' ORDER BY run_at"
+            )
+        else:
+            rows = await self._fetch_all(
+                "SELECT * FROM jobs WHERE status = 'failed' AND conversation_id = ?"
+                " ORDER BY run_at",
+                (conversation_id,),
+            )
+        return [self._row_to_job(r) for r in rows]
+
+    async def revive_failed_jobs(self, conversation_id: str | None, now: datetime) -> int:
+        """把失败的任务放回队列，重试次数清零。"""
+        if conversation_id is None:
+            cur = await self.db.execute(
+                "UPDATE jobs SET status = 'pending', attempts = 0, lease_until = NULL,"
+                " run_at = ? WHERE status = 'failed'",
+                (now.isoformat(),),
+            )
+        else:
+            cur = await self.db.execute(
+                "UPDATE jobs SET status = 'pending', attempts = 0, lease_until = NULL,"
+                " run_at = ? WHERE status = 'failed' AND conversation_id = ?",
+                (now.isoformat(), conversation_id),
+            )
+        await self.db.commit()
+        return cur.rowcount or 0
+
     async def release_dedupe_key(self, job_id: int) -> None:
         """把这一行的去重键让出来。
 

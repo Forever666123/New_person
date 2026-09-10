@@ -15,7 +15,7 @@ from __future__ import annotations
 import base64
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, TypeVar
 
 import anthropic
@@ -235,18 +235,25 @@ class Brain:
         if chosen in EFFORT_SUPPORTED:
             kwargs["output_config"] = {"effort": self.settings.effort}
 
+        # **每一条失败路径都要留痕。** 她的正常状态就包含长时间不说话，
+        # 所以"接口挂了"和"她这会儿不想聊"在外面看完全一样。
+        # 原来只有 APIStatusError 和兜底那两条写了 last_api_error，
+        # 而限流、连不上、被拒恰恰是最常见的三种——那三种发生时
+        # `!np status` 干干净净，你只会觉得她今天特别安静。
         try:
             response = await self.client.messages.parse(**kwargs)
-        except anthropic.RateLimitError:
+        except anthropic.RateLimitError as exc:
             log.warning("[brain] %s 撞到限流，稍后重试", purpose)
+            await self._note_error(f"限流（429）：{str(exc)[:80]}")
             return None
         except anthropic.APIStatusError as exc:
             level = log.warning if exc.status_code >= 500 else log.error
             level("[brain] %s 接口返回 %s：%s", purpose, exc.status_code, exc)
-            await self._note_error(f"{exc.status_code}")
+            await self._note_error(f"接口返回 {exc.status_code}")
             return None
         except anthropic.APIConnectionError as exc:
             log.warning("[brain] %s 连不上：%s", purpose, exc)
+            await self._note_error(f"连不上接口：{str(exc)[:80]}")
             return None
         except Exception as exc:  # noqa: BLE001 - 兜底，人物不能因为一次调用崩掉
             log.exception("[brain] %s 出了意外：%s", purpose, exc)
@@ -257,13 +264,33 @@ class Brain:
 
         if getattr(response, "stop_reason", None) == "refusal":
             log.warning("[brain] %s 被拒了，这次就当没回", purpose)
+            await self._note_error("模型拒绝回答")
             return None
 
-        return getattr(response, "parsed_output", None)
+        parsed = getattr(response, "parsed_output", None)
+        if parsed is None:
+            log.warning("[brain] %s 没解析出结构化结果", purpose)
+            await self._note_error("返回的内容解析不出来")
+            return None
+        # 走到这里说明接口是通的，把旧的报错清掉——
+        # 不清的话三周前的一次抖动会一直挂在 status 上，
+        # 和"此刻密钥失效了"长得一模一样。
+        await self._clear_error()
+        return parsed
 
     async def _note_error(self, detail: str) -> None:
+        """记下最近一次接口出错，**带时间**。
+
+        不带时间的话，`!np status` 上那行报错没有断代信息：
+        你分不出它是三周前的一次网络抖动，还是刚刚密钥失效了。
+        """
         if self.memory is not None:
-            await self.memory.kv_set("last_api_error", detail)
+            stamp = datetime.now(UTC).isoformat(timespec="seconds")
+            await self.memory.kv_set("last_api_error", f"{stamp}\t{detail}")
+
+    async def _clear_error(self) -> None:
+        if self.memory is not None:
+            await self.memory.kv_delete("last_api_error")
 
     # -- 各类请求 -----------------------------------------------------------
 

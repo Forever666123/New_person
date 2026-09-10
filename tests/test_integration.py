@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -951,3 +952,48 @@ async def test_an_empty_ledger_says_how_to_fill_it(tmp_path: Path, persona: Pers
         now=EVENING,
     )
     assert "还没记下" in await owner_cmds.handle("!np ledger", ctx)
+
+
+async def test_a_half_started_process_does_not_pretend_to_be_running(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """启动中途炸了，就不能留下一个"已启动"的标记。
+
+    留下的话会变成最难查的一种故障：discord.py 吞掉 on_ready 的异常继续跑，
+    网关连着、头像亮着、消息也收得到并入库，但调度循环从来没起来——
+    她永远不回你。而重连时 _started 已经是真，直接早返回，永远修不好。
+    唯一的症状就是她不说话，而那正是她的正常状态。
+    """
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    app._started = False
+    app._tasks.clear()
+
+    async def boom() -> None:
+        raise OSError("数据库打不开")
+
+    app.memory.open = boom
+    for _ in range(3):
+        with contextlib.suppress(OSError):
+            await app.start(app.client)
+        assert app._started is False, "半途失败之后不能标成已启动"
+
+
+async def test_being_able_to_send_again_clears_the_undeliverable_flag(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """发得出去就把"发不出去"收回来。
+
+    一次 403（你临时退了共同服务器、或者关了服务器成员私信）之后，
+    deliverable 会被置成 False 而**永远回不来**：回复照常发（那条路不看这个标记），
+    主动消息全部静默跳过。于是她从此只回话、再也不主动，而你根本不会发现。
+    """
+    app, _channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    await memory.update_conversation(CONVERSATION_ID, deliverable=False)
+
+    await send(app, "在忙吗", at=EVENING)
+    await drain(app, clock)
+
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.deliverable is True, "已经发出去了，这个标记该收回来"
