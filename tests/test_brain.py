@@ -495,3 +495,43 @@ def test_the_output_rules_say_when_silence_is_ok(persona: Persona) -> None:
     text = build_system(persona)
     assert "必须回" in text
     assert "只影响你说话的语气" in text, "状态不该被模型当成不回的理由"
+
+
+def test_log_timestamps_follow_her_timezone_not_the_servers() -> None:
+    """启动时那句"日志里的时间都是她那边的时间"必须是真的。
+
+    原来它是假的：格式化器用服务器本地时间（VPS 上通常是 UTC），
+    而日志正文里的任务时刻是她那边的时间。于是一行里两个时区：
+
+        16:07:57 INFO [job] 排上 proactive#2 09-10 13:48 opener
+
+    看上去像是把任务排到了三个小时前。排查"她怎么不说话"的时候，
+    这种时间戳会把人直接带到沟里去。
+    """
+    import logging
+    import re
+    from datetime import UTC, datetime
+    from io import StringIO
+    from zoneinfo import ZoneInfo
+
+    from newperson.__main__ import setup_logging
+
+    boston = ZoneInfo("America/New_York")
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    try:
+        root.handlers.clear()
+        setup_logging("INFO", boston)
+        stream = StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(root.handlers[0].formatter)
+        root.handlers = [handler]
+        logging.getLogger("t").info("测试")
+    finally:
+        root.handlers = saved
+
+    stamp = re.match(r"(\d\d-\d\d \d\d:\d\d)", stream.getvalue())
+    assert stamp, f"时间戳格式不对：{stream.getvalue()!r}"
+    assert stamp.group(1) == datetime.now(boston).strftime("%m-%d %H:%M")
+    # 波士顿跟 UTC 从来不是同一个偏移，所以这条能真的分辨出用的是哪个时区
+    assert stamp.group(1) != datetime.now(UTC).strftime("%m-%d %H:%M")

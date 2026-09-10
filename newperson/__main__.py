@@ -20,7 +20,8 @@ import os
 import random
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .attention import AttentionPolicy, extract_features, heat_of
@@ -32,12 +33,29 @@ from .rhythm import Rhythm
 OK, WARN, BAD = "✓", "!", "✗"
 
 
-def setup_logging(level: str) -> None:
+def setup_logging(level: str, tz: tzinfo | None = None) -> None:
+    """日志时间戳跟她走，不跟服务器走。
+
+    启动时那句"日志里的时间都是她那边的时间"原来是假的：格式化器用的是
+    服务器本地时间（VPS 上通常是 UTC）。于是日志长这样——
+
+        16:07:57 INFO [job] 排上 proactive#2 09-10 13:48 opener
+
+    行首 16:07 是 UTC，行尾 13:48 是波士顿时间，看上去像是排到了三小时前。
+    排查一个"她怎么不说话"的问题时，这种时间戳会把人直接带到沟里去。
+    """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%m-%d %H:%M:%S",
     )
+    if tz is not None:
+        def converter(timestamp: float | None) -> time.struct_time:
+            return datetime.fromtimestamp(timestamp or 0, tz).timetuple()
+
+        for handler in logging.getLogger().handlers:
+            if handler.formatter is not None:
+                handler.formatter.converter = converter
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -551,7 +569,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if loaded is None:
         return 1
     settings, persona = loaded
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, persona.tz)
 
     missing = settings.missing_required()
     if missing:
