@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+data/
+.env
+persona/persona.yaml
+persona/photos/*
+!persona/photos/index.example.yaml
+!persona/photos/.gitkeep
+generated/

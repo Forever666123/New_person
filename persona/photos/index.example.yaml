@@ -1,0 +1,23 @@
+# 照片库索引示例。复制为 persona/photos/index.yaml，把图片放进 persona/photos/ 目录。
+# 人物"发照片"时会按 tags 在这里挑一张没发过的。
+# - id: 唯一标识
+# - file: 相对于本目录的文件名
+# - tags: 标签（模型会用 food / coffee / sunset / cat / selfie / street / work / gym / home 这类英文词）
+# - caption: 给模型看的描述，让它知道图里有什么，方便配文
+# - taken_hint: 什么时候/在哪拍的，帮助模型保持口径一致
+photos:
+  - id: lunch-001
+    file: lunch-001.jpg
+    tags: [food, lunch, noodles]
+    caption: 一碗牛肉面，公司楼下那家。
+    taken_hint: 工作日中午
+  - id: sunset-001
+    file: sunset-001.jpg
+    tags: [sunset, sky, street]
+    caption: 下班路上拍的晚霞。
+    taken_hint: 傍晚下班路上
+  - id: cat-001
+    file: cat-001.jpg
+    tags: [cat, home, pet]
+    caption: 家里的猫趴在沙发上。
+    taken_hint: 晚上在家
