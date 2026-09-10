@@ -84,6 +84,13 @@ def test_clean_reply_passes_through(persona: Persona) -> None:
     assert [p.text for p in fixed] == ["嗯", "什么时候的事"]
 
 
-def test_reactions_are_off_for_her(persona: Persona) -> None:
-    """她不用 emoji，表情反应也一并关掉。"""
-    assert sg.filter_reaction("😂", persona.style) is None
+def test_reaction_is_allowed_but_optional(persona: Persona) -> None:
+    """她极少点表情反应，但这条路是通的。频率由提示词控制，不在这里一刀切。"""
+    assert sg.filter_reaction("😂", persona.style) == "😂"
+    assert sg.filter_reaction(None, persona.style) is None
+
+
+def test_reaction_can_be_turned_off(persona: Persona) -> None:
+    """完全不用 emoji 的人物，把 allow_reactions 关掉就一个都不会点。"""
+    style = persona.style.model_copy(update={"allow_reactions": False})
+    assert sg.filter_reaction("😂", style) is None

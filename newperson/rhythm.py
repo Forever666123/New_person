@@ -3,9 +3,14 @@
 核心想法：真人的作息有中心倾向，但没有精确规律。所以这里
 **不存在**"每天 23:30 睡觉"这样的常量。每一天会：
 
-1. 按 ``rhythm.variants`` 的权重抽一个当日变体（普通 / 熬夜 / 忙 / 消失 …）。
+0. 先确定这一天处在哪个**阶段**。阶段跨好几天（考试周、赶 project、刚放假），
+   因为真人的忙是成片的，不是每天独立掷骰子。
+1. 在阶段之上按 ``rhythm.variants`` 的权重抽一个**当日变体**（普通 / 熬夜 / 早起 / 累 …）。
 2. 从分布里采样这一晚的入睡和起床时刻。
 3. 按 ``probability`` 决定今天每节课是不是真的去了。
+
+所以"她今天一直没回"通常是几件事叠在一起：这周本来就忙、昨晚熬到很晚、
+他刚好在她睡着的时候发的。没有哪个开关叫"今天不理人"。
 
 抽签用的是 ``(persona.seed, 日期)`` 派生的随机数，所以同一天反复查询结果一致，
 重启进程也一致，但不同的日子互不相关。
@@ -25,10 +30,13 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .models import ClassInstance, DailyRhythm, RhythmSnapshot
-from .persona import DayVariant, RhythmConfig, hhmm_to_minutes
+from .persona import DayVariant, LifePhase, RhythmConfig, hhmm_to_minutes
 
 _SEARCH_LIMIT = 400
 """向前搜索的最大步数，防止配置写错时死循环。"""
+
+_PHASE_EPOCH = date(2025, 1, 1)
+"""阶段序列的推演起点。改它等于把人物的整条时间线重排。"""
 
 
 class Rhythm:
@@ -37,6 +45,7 @@ class Rhythm:
         self.tz = tz
         self.seed = seed
         self._cache: dict[date, DailyRhythm] = {}
+        self._phase_spans: list[tuple[int, int, LifePhase]] = []
 
     # -- 抽签 ---------------------------------------------------------------
 
@@ -44,63 +53,107 @@ class Rhythm:
         """同一天永远得到同一个随机序列。"""
         return random.Random(self.seed * 1_000_003 + day.toordinal())
 
+    def _weighted_choice(self, items, rng: random.Random):
+        """按 weight 抽一个。"""
+        total = sum(i.weight for i in items)
+        roll = rng.uniform(0, total)
+        acc = 0.0
+        for item in items:
+            acc += item.weight
+            if roll <= acc:
+                return item
+        return items[-1]
+
+    def phase_for(self, day: date) -> LifePhase:
+        """这一天处在哪个阶段。阶段序列从 ``_PHASE_EPOCH`` 起确定性推演。"""
+        phases = self.config.phases
+        if not phases:
+            return LifePhase(name="平常")
+        if day < _PHASE_EPOCH:
+            return phases[0]
+
+        target = (day - _PHASE_EPOCH).days
+        if self._phase_spans and self._phase_spans[-1][1] > target:
+            for start, end, phase in self._phase_spans:
+                if start <= target < end:
+                    return phase
+
+        cursor = self._phase_spans[-1][1] if self._phase_spans else 0
+        while cursor <= target and len(self._phase_spans) < 100_000:
+            rng = random.Random(self.seed * 7_919 + cursor)
+            phase = self._weighted_choice(phases, rng)
+            length = rng.randint(phase.min_days, max(phase.min_days, phase.max_days))
+            self._phase_spans.append((cursor, cursor + length, phase))
+            cursor += length
+        return self._phase_spans[-1][2]
+
     def _at(self, day: date, minutes: float) -> datetime:
         """把"当天第 N 分钟"变成带时区的时刻，允许跨日。"""
         base = datetime.combine(day, time(0, 0), tzinfo=self.tz)
         return base + timedelta(minutes=minutes)
 
-    def for_day(self, day: date) -> DailyRhythm:
-        """返回这一天抽出来的作息。结果会缓存。"""
-        cached = self._cache.get(day)
-        if cached is not None:
-            return cached
+    def _raw_night(self, day: date) -> tuple[datetime, datetime, DayVariant, LifePhase]:
+        """只用这一天自己的随机数采样，不看邻近的日子。
 
+        返回 ``(今早起床, 今晚入睡, 当日变体, 阶段)``。跨天的睡眠时长校正在
+        :meth:`for_day` 里做，那里才同时知道昨晚和今早。
+        """
         rng = self._rng_for(day)
         cfg = self.config
+        phase = self.phase_for(day)
+        chosen = self._weighted_choice(cfg.variants, rng) if cfg.variants else DayVariant(name="普通")
 
-        # 1. 当日变体
-        variants = cfg.variants
-        if variants:
-            total = sum(v.weight for v in variants)
-            roll = rng.uniform(0, total)
-            acc = 0.0
-            chosen = variants[-1]
-            for v in variants:
-                acc += v.weight
-                if roll <= acc:
-                    chosen = v
-                    break
-        else:  # 没配变体就等于每天都一样
-            chosen = DayVariant(name="普通")
-
-        # 2. 这一晚的入睡与起床
-        sleep_median = hhmm_to_minutes(cfg.sleep.start_median)
         wake_median = hhmm_to_minutes(cfg.sleep.wake_median)
+        sleep_median = hhmm_to_minutes(cfg.sleep.start_median)
         # 入睡时刻若早于起床时刻（如 01:20 < 08:40），说明是躺到了次日凌晨
         sleep_offset = sleep_median + (24 * 60 if sleep_median < wake_median else 0)
 
+        wake_minutes = (
+            wake_median + rng.gauss(0, cfg.sleep.wake_sigma_minutes) + chosen.wake_shift_hours * 60
+        )
         sleep_minutes = (
             sleep_offset
             + rng.gauss(0, cfg.sleep.start_sigma_minutes)
             + chosen.sleep_start_shift_hours * 60
         )
-        wake_minutes = (
-            24 * 60
-            + wake_median
-            + rng.gauss(0, cfg.sleep.wake_sigma_minutes)
-            + chosen.wake_shift_hours * 60
+        return self._at(day, wake_minutes), self._at(day, sleep_minutes), chosen, phase
+
+    def for_day(self, day: date) -> DailyRhythm:
+        """返回这一天抽出来的作息：今早几点起、今晚几点睡、今天什么状态。
+
+        当日变体影响的是**当天**：抽到"熬夜"就是今晚睡得晚，抽到"早起"就是今天早上起得早。
+        """
+        cached = self._cache.get(day)
+        if cached is not None:
+            return cached
+
+        cfg = self.config
+        wake, sleep_start, chosen, phase = self._raw_night(day)
+
+        # 起床时刻不能和昨晚的入睡时刻各管各的，否则会抽出"四点睡七点起"这种。
+        # 真人睡得晚就起得晚，但也不是全跟着走：有课有闹钟，生物钟会把人拉回来。
+        # 所以在"跟着昨晚走"和"跟着生物钟走"之间做加权混合。只回溯一天，不递归。
+        prev_sleep_start = self._raw_night(day - timedelta(days=1))[1]
+        target_sleep = timedelta(
+            minutes=(hhmm_to_minutes(cfg.sleep.wake_median) - hhmm_to_minutes(cfg.sleep.start_median))
+            % (24 * 60)
         )
+        follow = prev_sleep_start + target_sleep
+        w = cfg.sleep_follow_weight
+        wake = follow + (wake - follow) * (1 - w)
 
-        # 睡眠时长夹到合理范围内
-        duration = wake_minutes - sleep_minutes
-        low, high = cfg.sleep.min_hours * 60, cfg.sleep.max_hours * 60
-        if duration < low:
-            wake_minutes = sleep_minutes + low
-        elif duration > high:
-            wake_minutes = sleep_minutes + high
+        low = timedelta(hours=cfg.sleep.min_hours)
+        high = timedelta(hours=cfg.sleep.max_hours)
+        if wake - prev_sleep_start < low:
+            wake = prev_sleep_start + low
+        elif wake - prev_sleep_start > high:
+            wake = prev_sleep_start + high
 
-        # 3. 今天真的去了的课
+        # 入睡不能早于起床，至少醒着待一会儿
+        sleep_start = max(sleep_start, wake + timedelta(hours=2))
+
         classes: list[ClassInstance] = []
+        rng = random.Random(self.seed * 1_000_003 + day.toordinal() + 17)
         for block in cfg.classes:
             if day.weekday() not in block.days:
                 continue
@@ -114,18 +167,21 @@ class Rhythm:
                 )
             )
 
+        engage = (
+            chosen.engage_probability
+            if chosen.engage_probability is not None
+            else cfg.engage_probability
+        )
         daily = DailyRhythm(
             day=day,
+            phase=phase.name,
+            phase_note=phase.note,
             variant=chosen.name,
             variant_note=chosen.note,
-            night_sleep_start=self._at(day, sleep_minutes),
-            night_sleep_end=self._at(day, wake_minutes),
-            activity_multiplier=chosen.activity_multiplier,
-            reply_probability=(
-                chosen.reply_probability
-                if chosen.reply_probability is not None
-                else cfg.reply_probability
-            ),
+            wake=wake,
+            sleep_start=sleep_start,
+            activity_multiplier=chosen.activity_multiplier * phase.activity_multiplier,
+            engage_probability=max(0.05, min(1.0, engage * phase.engage_multiplier)),
             classes=classes,
         )
         self._cache[day] = daily
@@ -134,8 +190,8 @@ class Rhythm:
     # -- 查询 ---------------------------------------------------------------
 
     def wake_of(self, day: date) -> datetime:
-        """``day`` 这一天的起床时刻（由前一晚那一觉决定）。"""
-        return self.for_day(day - timedelta(days=1)).night_sleep_end
+        """``day`` 这一天早上的起床时刻。"""
+        return self.for_day(day).wake
 
     def logical_day(self, dt: datetime) -> date:
         """凌晨还没睡的时间算作前一天。用来取当日变体。"""
@@ -148,10 +204,11 @@ class Rhythm:
     def sleep_window_containing(self, dt: datetime) -> tuple[datetime, datetime] | None:
         """若 dt 处于某一觉之中，返回 ``(入睡, 起床)``；否则 None。"""
         d = dt.astimezone(self.tz).date()
-        for offset in (-1, 0):
-            daily = self.for_day(d + timedelta(days=offset))
-            if daily.night_sleep_start <= dt < daily.night_sleep_end:
-                return daily.night_sleep_start, daily.night_sleep_end
+        for offset in (-1, 0, 1):
+            start = self.for_day(d + timedelta(days=offset)).sleep_start
+            end = self.for_day(d + timedelta(days=offset + 1)).wake
+            if start <= dt < end:
+                return start, end
         return None
 
     def is_sleeping(self, dt: datetime) -> bool:
@@ -185,18 +242,18 @@ class Rhythm:
             return window[1]
         d = dt.astimezone(self.tz).date()
         for offset in range(0, _SEARCH_LIMIT):
-            daily = self.for_day(d + timedelta(days=offset))
-            if daily.night_sleep_end > dt:
-                return daily.night_sleep_end
+            wake = self.for_day(d + timedelta(days=offset)).wake
+            if wake > dt:
+                return wake
         raise RuntimeError("找不到下一次起床时间，检查 rhythm.sleep 配置")
 
     def next_sleep_after(self, dt: datetime) -> datetime:
         """dt 之后的下一次入睡。"""
         d = dt.astimezone(self.tz).date()
         for offset in range(-1, _SEARCH_LIMIT):
-            daily = self.for_day(d + timedelta(days=offset))
-            if daily.night_sleep_start > dt:
-                return daily.night_sleep_start
+            start = self.for_day(d + timedelta(days=offset)).sleep_start
+            if start > dt:
+                return start
         raise RuntimeError("找不到下一次入睡时间，检查 rhythm.sleep 配置")
 
     def state_at(self, dt: datetime) -> RhythmSnapshot:
@@ -215,8 +272,9 @@ class Rhythm:
                 next_wake=next_wake,
                 next_sleep=next_sleep,
                 activity=0.0,
+                phase=daily.phase,
                 variant=daily.variant,
-                variant_note=daily.variant_note,
+                mood_notes=daily.mood_notes,
             )
 
         block = self.class_containing(dt)
@@ -228,8 +286,9 @@ class Rhythm:
                 next_wake=next_wake,
                 next_sleep=next_sleep,
                 activity=activity,
+                phase=daily.phase,
                 variant=daily.variant,
-                variant_note=daily.variant_note,
+                mood_notes=daily.mood_notes,
                 block_title=block.title,
             )
 
@@ -244,8 +303,9 @@ class Rhythm:
             next_wake=next_wake,
             next_sleep=next_sleep,
             activity=activity,
+            phase=daily.phase,
             variant=daily.variant,
-            variant_note=daily.variant_note,
+            mood_notes=daily.mood_notes,
         )
 
     # -- 看手机 -------------------------------------------------------------

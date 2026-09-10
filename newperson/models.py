@@ -31,15 +31,22 @@ class DailyRhythm(BaseModel):
     """某一天抽签抽出来的作息。同一天同一 seed 抽出来的结果永远相同。"""
 
     day: date
-    variant: str
+    phase: str = "平常"
+    phase_note: str = ""
+    variant: str = ""
     variant_note: str = ""
-    night_sleep_start: datetime
-    """这一天结束时入睡的时刻（通常落在次日凌晨）。"""
-    night_sleep_end: datetime
-    """这一觉的起床时刻。"""
+    wake: datetime
+    """这一天早上起床的时刻。"""
+    sleep_start: datetime
+    """这一天晚上入睡的时刻（通常落在次日凌晨）。"""
     activity_multiplier: float = 1.0
-    reply_probability: float = 0.9
+    engage_probability: float = 0.85
     classes: list[ClassInstance] = Field(default_factory=list)
+
+    @property
+    def mood_notes(self) -> list[str]:
+        """今天注入上下文的心态提示，阶段在前，当日变体在后。"""
+        return [n for n in (self.phase_note, self.variant_note) if n]
 
 
 class RhythmSnapshot(BaseModel):
@@ -53,8 +60,9 @@ class RhythmSnapshot(BaseModel):
     next_sleep: datetime
     activity: float
     """此刻"会看手机"的活跃度，0 到 1。"""
+    phase: str = ""
     variant: str = ""
-    variant_note: str = ""
+    mood_notes: list[str] = Field(default_factory=list)
     block_title: str | None = None
     """当前 busy 区间的标题，非 busy 时为 None。"""
 

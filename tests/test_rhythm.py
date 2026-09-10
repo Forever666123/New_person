@@ -32,7 +32,7 @@ def test_different_seed_gives_a_different_life(persona: Persona) -> None:
     a = Rhythm(persona.rhythm, persona.tz, persona.seed)
     b = Rhythm(persona.rhythm, persona.tz, persona.seed + 1)
     day = days(persona)[0]
-    assert a.for_day(day).night_sleep_start != b.for_day(day).night_sleep_start
+    assert a.for_day(day).sleep_start != b.for_day(day).sleep_start
 
 
 def test_wake_times_are_spread_out(rhythm: Rhythm, persona: Persona) -> None:
@@ -43,13 +43,63 @@ def test_wake_times_are_spread_out(rhythm: Rhythm, persona: Persona) -> None:
 
 def test_sleep_duration_stays_sane(rhythm: Rhythm, persona: Persona) -> None:
     for d in days(persona):
-        daily = rhythm.for_day(d)
-        hours = (daily.night_sleep_end - daily.night_sleep_start).total_seconds() / 3600
+        night = rhythm.for_day(d).sleep_start
+        morning = rhythm.for_day(d + timedelta(days=1)).wake
+        hours = (morning - night).total_seconds() / 3600
         assert persona.rhythm.sleep.min_hours - 0.01 <= hours <= persona.rhythm.sleep.max_hours + 0.01
 
 
+def test_late_night_means_late_morning(rhythm: Rhythm, persona: Persona) -> None:
+    """睡得晚就起得晚。独立采样会抽出"四点睡七点起"，那不像人。"""
+    pairs = []
+    for d in days(persona, 120):
+        night = rhythm.for_day(d).sleep_start
+        morning = rhythm.for_day(d + timedelta(days=1)).wake
+        pairs.append((night.timestamp(), morning.timestamp()))
+    slept = [a for a, _ in pairs]
+    woke = [b for _, b in pairs]
+    assert statistics.correlation(slept, woke) > 0.5
+
+
+def test_a_phase_lasts_several_days(rhythm: Rhythm, persona: Persona) -> None:
+    """阶段要成片，不能一天一换，否则"忙"就没有意义了。"""
+    names = [rhythm.for_day(d).phase for d in days(persona, 120)]
+    runs, current = [], 1
+    for a, b in zip(names, names[1:], strict=False):
+        if a == b:
+            current += 1
+        else:
+            runs.append(current)
+            current = 1
+    runs.append(current)
+    assert statistics.fmean(runs) >= 4, f"阶段平均只持续 {statistics.fmean(runs):.1f} 天"
+
+
+def test_every_phase_shows_up(rhythm: Rhythm, persona: Persona) -> None:
+    seen = {rhythm.for_day(d).phase for d in days(persona, 400)}
+    assert seen == {p.name for p in persona.rhythm.phases}
+
+
+def test_a_busy_phase_lowers_activity(rhythm: Rhythm, persona: Persona) -> None:
+    """赶 due 的那几天，看手机的活跃度整体要低下来。"""
+    busy = [rhythm.for_day(d) for d in days(persona, 300) if rhythm.for_day(d).phase == "赶due"]
+    calm = [rhythm.for_day(d) for d in days(persona, 300) if rhythm.for_day(d).phase == "平常"]
+    assert busy and calm
+    assert statistics.fmean(d.activity_multiplier for d in busy) < statistics.fmean(
+        d.activity_multiplier for d in calm
+    )
+
+
+def test_no_single_day_shuts_her_off_entirely(rhythm: Rhythm, persona: Persona) -> None:
+    """没有"今天完全不理人"这种开关。最差的日子也还是会看手机。"""
+    for d in days(persona, 300):
+        daily = rhythm.for_day(d)
+        assert daily.activity_multiplier > 0.1
+        assert daily.engage_probability > 0.1
+
+
 def test_all_variants_show_up(rhythm: Rhythm, persona: Persona) -> None:
-    seen = {rhythm.for_day(d).variant for d in days(persona, 200)}
+    seen = {rhythm.for_day(d).variant for d in days(persona, 300)}
     configured = {v.name for v in persona.rhythm.variants}
     assert seen == configured, f"没抽到的变体：{configured - seen}"
 
@@ -72,7 +122,8 @@ def test_sleep_windows_do_not_overlap(rhythm: Rhythm, persona: Persona) -> None:
     """相邻两觉不能重叠，否则 next_wake 之类会算错。"""
     ds = days(persona)
     for a, b in zip(ds, ds[1:], strict=False):
-        assert rhythm.for_day(a).night_sleep_end <= rhythm.for_day(b).night_sleep_start
+        assert rhythm.for_day(a).sleep_start < rhythm.for_day(b).wake
+        assert rhythm.for_day(b).wake < rhythm.for_day(b).sleep_start
 
 
 def test_activity_is_zero_while_asleep(rhythm: Rhythm, persona: Persona) -> None:

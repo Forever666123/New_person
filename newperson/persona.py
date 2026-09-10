@@ -120,6 +120,23 @@ class ClassBlock(BaseModel):
         return v
 
 
+class LifePhase(BaseModel):
+    """跨天的阶段。忙是成片的，不是每天独立掷骰子。
+
+    考试周、赶 project、刚放假，这些会连续影响好几天。阶段之上再叠加当日变体，
+    所以"她今天一直没回"往往是"这周本来就忙 + 昨晚熬夜 + 他刚好在她睡觉时发的"三件事撞在一起，
+    而不是某个开关被打开了。
+    """
+
+    name: str
+    weight: float = 1.0
+    min_days: int = 3
+    max_days: int = 8
+    activity_multiplier: float = 1.0
+    engage_multiplier: float = 1.0
+    note: str = ""
+
+
 class DayVariant(BaseModel):
     """当日变体。每天按 ``weight`` 抽一个，用来打破规律。"""
 
@@ -128,24 +145,37 @@ class DayVariant(BaseModel):
     sleep_start_shift_hours: float = 0.0
     wake_shift_hours: float = 0.0
     activity_multiplier: float = 1.0
-    reply_probability: float | None = None
-    """看到消息后真的回复的概率；None 表示用 rhythm.reply_probability。"""
+    engage_probability: float | None = None
+    """看到消息后当场处理的概率；None 表示用 rhythm.engage_probability。"""
     note: str = ""
     """一句话注入当天的上下文，比如"你今天不太想说话"。不会直接发给对方。"""
 
 
 class RhythmConfig(BaseModel):
+    phases: list[LifePhase] = Field(default_factory=list)
+    """跨天的阶段序列。为空则一直是"平常"。"""
     sleep: SleepDistribution = Field(default_factory=SleepDistribution)
     activity: ActivityCurve = Field(default_factory=ActivityCurve)
     class_activity: float = 0.15
     """上课时段的默认活跃度（偷偷回一句的程度）。"""
     classes: list[ClassBlock] = Field(default_factory=list)
     variants: list[DayVariant] = Field(default_factory=list)
+    sleep_follow_weight: float = 0.65
+    """起床时刻有多跟着昨晚的入睡走。0 是完全按生物钟，1 是完全跟着昨晚。
+
+    真人介于两者之间：熬夜会起得晚，但有课有闹钟，不会一路睡到下午。
+    """
     base_glance_minutes: float = 8.0
     """活跃度为 1 时，两次看手机的间隔中位数。实际间隔 = base / activity。"""
     glance_sigma: float = 0.6
-    reply_probability: float = 0.9
-    """看到了之后真的回的概率。剩下的就是"看到了没回"。"""
+    engage_probability: float = 0.85
+    """看到消息之后当场处理的概率。
+
+    没中不代表这条消息被丢掉，而是**先放着**，等下一次看手机再说。
+    这就是"看到了但当时没空回"，延迟自然被拉长到几小时，而不是石沉大海。
+    """
+    max_defers: int = 3
+    """最多先放着几次。到了上限就必须处理，免得消息永远不被回。"""
     winding_down_minutes: float = 60.0
     """距离入睡还有多久算"准备睡了"。"""
     min_activity_to_glance: float = 0.02
