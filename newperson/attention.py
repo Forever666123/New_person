@@ -182,9 +182,10 @@ class AttentionPolicy:
             glance = min(glance, now + timedelta(seconds=self._lognormal(4 * 60, 0.8, rng)))
 
         # 看到了不一定当场处理。没空、在路上、懒得打字，就先放着，下次再说。
+        # 概率跟着看手机那一刻的活跃度走，不是每天一个固定值。
         defers = 0
         max_defers = self.rhythm.config.max_defers
-        while defers < max_defers and rng.random() > daily.engage_probability:
+        while defers < max_defers and rng.random() > self.rhythm.engage_probability_at(glance):
             nxt = self.rhythm.next_glance_after(glance + timedelta(seconds=1), rng)
             if nxt <= glance:
                 break

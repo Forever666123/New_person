@@ -758,3 +758,37 @@ async def test_reconnecting_does_not_start_everything_twice(
     before = len(app._tasks)
     await app.start(app.client)
     assert len(app._tasks) == before
+
+
+async def test_heat_looks_at_the_conversation_before_this_message(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """热度问的是"这批消息到来之前"对话有多热。
+
+    早先用会话表上的 last_user_message_at，但那个字段在消息入库时
+    已经被刚收到的这条更新过了，间隔永远是 0 秒，于是**每一条消息
+    都被判成正在热聊，她永远秒回**。整个项目最核心的目标就这么没了。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [ReplyPlan(parts=[])])
+    await send(app, "在吗", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert "cold" in jobs[0].reason, f"三天没说话还判成热聊：{jobs[0].reason}"
+
+
+async def test_replying_right_after_her_counts_as_hot(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她刚说完他马上接话，那时候手机确实还在手上。"""
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [ReplyPlan(parts=[])])
+    await memory.add_bot_message(CONVERSATION_ID, "刚说的", EVENING - timedelta(seconds=40))
+    await send(app, "对了还有件事", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert "hot" in jobs[0].reason
+
+
+async def test_an_hour_later_is_not_hot_anymore(tmp_path: Path, persona: Persona) -> None:
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [ReplyPlan(parts=[])])
+    await memory.add_bot_message(CONVERSATION_ID, "刚说的", EVENING - timedelta(hours=2))
+    await send(app, "在吗", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert "cold" in jobs[0].reason

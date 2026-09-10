@@ -160,7 +160,12 @@ def _check_online(settings: Settings) -> int:
 
 
 def cmd_simulate(args: argparse.Namespace) -> int:
-    """不联网，只跑作息和时机，看她什么时候回。调参数的时候用这个。"""
+    """不联网，只跑作息和时机，看她什么时候回。调参数的时候用这个。
+
+    这里会**模拟一整段对话**，而不是把每条消息当成孤立事件：
+    真人聊天是成簇的，他连发两句、她回了之后他马上接话，
+    这些时候手机还在手上，跟隔了半天冒出来一句完全不是一回事。
+    """
     loaded = load_all(args)
     if loaded is None:
         return 1
@@ -171,11 +176,14 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     attention = AttentionPolicy(persona, rhythm)
     rng = random.Random(args.seed)
 
-    start = datetime.now(tz=persona.tz).replace(hour=9, minute=0, second=0, microsecond=0)
+    start = datetime.now(tz=persona.tz).replace(hour=0, minute=0, second=0, microsecond=0)
     owner_tz = persona.owner_tz
+    heat_names = {"hot": "在聊", "warm": "刚聊过", "cold": "冷了"}
 
     print(f"{persona.name}　种子 {args.seed}　{args.days} 天")
-    print("=" * 82)
+    print("=" * 88)
+
+    last_exchange: datetime | None = None
 
     for day_offset in range(args.days):
         day = rhythm.local_date(start + timedelta(days=day_offset))
@@ -188,36 +196,54 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         )
         print(
             f"  {daily.wake.strftime('%H:%M')} 起　{daily.sleep_start.strftime('%H:%M')} 睡　"
-            f"{classes}　当场回的概率 {daily.engage_probability:.0%}"
+            f"{classes}　今天当场回的基准 {daily.engage_probability:.0%}"
         )
 
-        for _ in range(args.messages_per_day):
-            hour = rng.uniform(0, 24)
-            sent = start + timedelta(days=day_offset, hours=hour - 9)
-            snapshot = rhythm.state_at(sent)
+        for sent in _message_times(start + timedelta(days=day_offset), args.messages_per_day, rng):
             features = extract_features([rng.choice(SAMPLE_MESSAGES)], persona)
             heat = heat_of(
-                sent, None, None, persona.timing.hot_seconds, persona.timing.warm_seconds
+                sent, last_exchange, None, persona.timing.hot_seconds, persona.timing.warm_seconds
             )
             decision = attention.plan_reply(sent, heat, features, sent, rng)
             waited = (decision.reply_at - sent).total_seconds()
 
+            snapshot = rhythm.state_at(sent)
             there = ""
             if owner_tz is not None:
-                there = f"（他那边 {sent.astimezone(owner_tz).strftime('%H:%M')}）"
+                there = f"（他 {sent.astimezone(owner_tz).strftime('%H:%M')}）"
             state = {
                 "sleeping": "睡着",
                 "busy": snapshot.block_title or "忙",
                 "free": "有空",
                 "winding_down": "快睡了",
             }[snapshot.state]
+            engage = rhythm.engage_probability_at(sent)
             print(
-                f"    {sent.strftime('%H:%M')}{there} 他发消息　她{state}　"
-                f"→ {decision.reply_at.strftime('%d日%H:%M')} 回（等了 {_pretty(waited)}）"
+                f"    {sent.strftime('%H:%M')}{there} 他发　她{state:<6}"
+                f"{heat_names[heat]:<5}当场回 {engage:.0%}　"
+                f"→ {decision.reply_at.strftime('%d日%H:%M')}（{_pretty(waited)}）"
             )
             if args.verbose:
                 print(f"        {decision.reason}")
+            last_exchange = decision.reply_at
     return 0
+
+
+def _message_times(day_start: datetime, count: int, rng: random.Random) -> list[datetime]:
+    """一天里他发消息的时刻。
+
+    不是均匀撒点：真人聊天是成簇的，一次说好几句，然后隔很久再来一次。
+    均匀撒点的话每条消息都是"冷了"，看不到正在聊的时候她回得多快。
+    """
+    moments: list[datetime] = []
+    while len(moments) < count:
+        anchor = day_start + timedelta(hours=rng.uniform(0, 24))
+        burst = rng.choice([1, 1, 1, 2, 2, 3])
+        t = anchor
+        for _ in range(min(burst, count - len(moments))):
+            moments.append(t)
+            t += timedelta(minutes=rng.uniform(0.5, 9))
+    return sorted(moments)
 
 
 SAMPLE_MESSAGES = ["在吗", "今天上班好累", "我那个筛选器改完了", "你看这个", "睡了没", "急 帮我看下这个参数"]

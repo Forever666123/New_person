@@ -313,6 +313,22 @@ class Memory:
         )
         return int(row["n"]) if row else 0
 
+    async def last_exchange_before(
+        self, conversation_id: str, before_id: int
+    ) -> datetime | None:
+        """在这条消息之前，双方最后一次说话是什么时候。
+
+        热度问的是"这批消息到来之前对话有多热"。不能拿会话表上的
+        ``last_user_message_at``：那个字段在消息入库时就被刚收到的这条更新了，
+        算出来的间隔永远是 0 秒，于是永远判定成正在热聊，她就永远秒回。
+        """
+        row = await self._fetch_one(
+            "SELECT created_at FROM messages WHERE conversation_id = ? AND id < ?"
+            " AND deleted = 0 ORDER BY id DESC LIMIT 1",
+            (conversation_id, before_id),
+        )
+        return parse_dt(row["created_at"]) if row else None
+
     async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
         """把一批消息放回未读。
 

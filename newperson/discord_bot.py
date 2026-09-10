@@ -261,10 +261,14 @@ class App:
         if not unread:
             return
 
+        # 热度看的是这批消息**到来之前**对话有多热。
+        # 用会话表上的 last_user_message_at 是错的：那个字段已经被刚收到的
+        # 这条消息更新过了，间隔永远是 0，于是永远判成热聊，她就永远秒回。
+        prior = await self.memory.last_exchange_before(CONVERSATION_ID, unread[0].id)
         heat = heat_of(
-            now,
-            conv.last_user_message_at,
-            conv.last_bot_message_at,
+            unread[0].created_at,
+            prior,
+            None,
             self.persona.timing.hot_seconds,
             self.persona.timing.warm_seconds,
         )

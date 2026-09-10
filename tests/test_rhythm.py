@@ -233,3 +233,53 @@ def test_times_are_shown_in_the_timezone_she_is_in(rhythm: Rhythm, persona: Pers
         assert str(daily.wake.tzinfo) == expected
         assert str(daily.sleep_start.tzinfo) == expected
     assert checked > 0, "一整年都没出过门"
+
+
+def test_engaging_varies_within_a_single_day(rhythm: Rhythm, persona: Persona) -> None:
+    """"当场回的概率"不能是每天一个写死的数字。
+
+    上课时偷瞄一眼、刚醒还躺着、快睡着了，这些时候看到了更容易先放着。
+    """
+    day = date(2026, 10, 13)
+    values = set()
+    for hour in range(24):
+        t = datetime.combine(day, datetime.min.time(), persona.tz).replace(hour=hour)
+        if rhythm.is_sleeping(t):
+            continue
+        values.add(round(rhythm.engage_probability_at(t), 2))
+    assert len(values) >= 3, f"一整天只有 {values} 这几个值，等于写死了"
+
+
+def test_being_busy_makes_her_more_likely_to_leave_it(
+    rhythm: Rhythm, persona: Persona
+) -> None:
+    """上课的时候看到了更可能先放着，晚上有空就当场回了。"""
+    for offset in range(30):
+        day = date(2026, 10, 13) + timedelta(days=offset)
+        daily = rhythm.for_day(day)
+        if not daily.classes:
+            continue
+        in_class = daily.classes[0].start + timedelta(minutes=20)
+        evening = datetime.combine(day, datetime.min.time(), persona.tz).replace(hour=21)
+        if rhythm.is_sleeping(evening) or rhythm.class_containing(evening):
+            continue
+        assert rhythm.engage_probability_at(in_class) < rhythm.engage_probability_at(evening)
+        return
+    pytest.fail("三十天里没找到一天既有课又有空闲的晚上")
+
+
+def test_a_bad_mood_lowers_it_all_day(rhythm: Rhythm, persona: Persona) -> None:
+    """心情差那天，任何时刻的概率都比普通日子低。"""
+    bad = good = None
+    for offset in range(300):
+        day = date(2026, 10, 13) + timedelta(days=offset)
+        daily = rhythm.for_day(day)
+        noon = datetime.combine(day, datetime.min.time(), persona.tz).replace(hour=21)
+        if rhythm.is_sleeping(noon):
+            continue
+        if daily.variant == "心情差" and bad is None:
+            bad = rhythm.engage_probability_at(noon)
+        elif daily.variant == "普通" and good is None:
+            good = rhythm.engage_probability_at(noon)
+    assert bad is not None and good is not None
+    assert bad < good

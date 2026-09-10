@@ -285,6 +285,19 @@ class Rhythm:
         )
         return max(0.0, min(1.0, base * daily.activity_multiplier))
 
+    def engage_probability_at(self, dt: datetime) -> float:
+        """此刻看到消息会当场处理的概率。
+
+        当日的基准值（心情、阶段、学期决定）之上，再跟着**此刻的活跃度**走：
+        上课时偷瞄一眼、刚醒还躺着、快睡着了，这些时候看到了更容易先放着，
+        等下次拿手机再说。只用每日常量的话，同一天里任何时刻都一样，
+        那就是个写死的数字。
+        """
+        daily = self.daily_for(dt)
+        activity = self.activity_at(dt)
+        factor = 0.55 + 0.45 * min(activity / 0.7, 1.0)
+        return max(0.05, min(1.0, daily.engage_probability * factor))
+
     def next_wake_after(self, dt: datetime) -> datetime:
         """dt 之后的下一次起床；若 dt 正在睡，就是这一觉的起床时刻。"""
         window = self.sleep_window_containing(dt)
