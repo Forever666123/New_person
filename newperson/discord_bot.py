@@ -152,6 +152,14 @@ class App:
         log.info(
             "[app] 日志里的时间都是她那边的时间（%s）", self.persona.timezone
         )
+        # **打绝对路径。** DB_PATH 默认是相对的（data/newperson.db），
+        # 相对谁取决于进程的工作目录——systemd 不写 WorkingDirectory 时是 /，
+        # 于是她会在 /data/ 下面开一个全新的空库，而你在仓库里怎么看都看不出问题：
+        # 她不记得任何事，备份备的是空的，日志里一切正常。
+        # 真出过一次：同一个 opener 任务在两次启动里都拿到了 id 2，
+        # 而 jobs 表是 AUTOINCREMENT，同一个库里 id 绝不会重复——
+        # 那是两个库。写一行绝对路径，这种事一眼就能看出来。
+        log.info("[app] 记忆在 %s", Path(self.settings.db_path).resolve())
         if self.settings.force_awake:
             log.warning("[app] DEBUG_FORCE_AWAKE 开着，她不会睡觉。看完效果记得关掉")
         if self.settings.delay_scale != 1.0:
