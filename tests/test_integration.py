@@ -602,3 +602,52 @@ async def test_the_state_line_matches_the_day_plan(tmp_path: Path, persona: Pers
     situation = llm.calls[0]["messages"][0]["content"].split("## ")[1]
     assert "在图书馆赶 project" in situation
     assert "你现在有空" not in situation
+
+
+async def test_an_emoji_survives_all_the_way_out(tmp_path: Path, persona: Persona) -> None:
+    """年轻人不可能一个 emoji 都不用。偶尔一个要能真的发出去。"""
+    app, channel, _llm, clock, _mem = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="笑死 😂")])]
+    )
+    await send(app, "我今天把咖啡打翻在键盘上了", at=EVENING)
+    await drain(app, clock)
+    assert channel.texts == ["笑死 😂"]
+
+
+async def test_she_can_just_react_without_speaking(tmp_path: Path, persona: Persona) -> None:
+    """只点个表情不说话，那也是一种回应。"""
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[], reaction="👀")]
+    )
+    await send(app, "你看这个", at=EVENING)
+    await drain(app, clock)
+    assert channel.sent == []
+    assert await memory.unread_messages(CONVERSATION_ID) == [], "点了反应也算处理过了"
+
+
+async def test_a_whole_english_paragraph_gets_rewritten(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她夹英文词，但不会整段说英文。"""
+    bad = ReplyPlan(parts=[ReplyPart(text="i think you should really stop trading this week")])
+    good = ReplyPlan(parts=[ReplyPart(text="这周先别做了")])
+    app, channel, llm, clock, _mem = await build(tmp_path, persona, [bad, good])
+    await send(app, "我又亏了", at=EVENING)
+    await drain(app, clock)
+    assert channel.texts == ["这周先别做了"]
+    assert len(llm.calls) == 2
+
+
+async def test_photo_placeholder_without_a_photo_is_cleaned_up(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """照片库是空的时候，占位符不能原样发出去。"""
+    app, channel, _llm, clock, _mem = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="外面这样 {photo}"), ReplyPart(text="冷死了")])],
+    )
+    await send(app, "波士顿下雪了吗", at=EVENING)
+    await drain(app, clock)
+    assert all("{photo}" not in t for t in channel.texts)
+    assert "冷死了" in channel.texts
