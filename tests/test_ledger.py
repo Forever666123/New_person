@@ -200,7 +200,7 @@ async def test_an_old_database_gets_the_new_column(tmp_path: Path) -> None:
     try:
         kept = await memory.ledger("trading")
         assert len(kept) == 1, "迁移把旧数据弄丢了"
-        assert kept[0][1].claim == "旧账"
+        assert kept[0][2].claim == "旧账"
         cur = await memory.db.execute("PRAGMA table_info(ledger)")
         names = {row[1] for row in await cur.fetchall()}
         assert "asked_at" in names
@@ -352,3 +352,88 @@ def test_check_warns_when_a_category_would_be_silently_dead(persona: Persona) ->
 
     persona.proactive.kinds = [k for k in persona.proactive.kinds if k.name != "ledger_check"]
     assert any("ledger_check" in m for _, m in validate_persona(persona))
+
+
+async def test_she_stops_asking_once_he_answers(tmp_path: Path, persona: Persona) -> None:
+    """他给了下文，那件事就翻篇了——这才是"不像 AI"的关键。
+
+    在这之前，让一条承诺消失的唯一办法是"问够两次"或者"太老了"，
+    两个都是机械的上限，跟他说了什么毫无关系。
+    她问"回测跑完了吗"，他答"跑完了"，然后过几天她又问一遍——
+    问了、答了、又问一遍，这是最像机器人的一幕。
+    """
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="project", claim="回测这周跑完")], now - timedelta(days=6)
+        )
+        due = await life.due_ledger_entry(now)
+        assert due is not None
+        entry_id = due[0]
+        await memory.mark_ledger_asked(entry_id, now)
+
+        # 他回答了
+        assert await memory.resolve_ledger([entry_id]) == 1
+
+        # 从此不再问，不管过多久
+        for days in (1, 7, 30, 90):
+            assert await life.due_ledger_entry(now + timedelta(days=days)) is None
+        # 也不再出现在"还没听到下文"里
+        assert await memory.open_questions(now + timedelta(days=1)) == []
+    finally:
+        await memory.close()
+
+
+async def test_what_she_asked_comes_back_even_when_the_answer_has_no_keywords(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他回一句"跑完了"，那句话里一个触发词都没有。
+
+    话题模式匹配不上 → 台账不进上下文 → 她没有任何办法把这件事记成翻篇。
+    所以"她问过、还没听到下文的"这一段跟模式无关，永远带着。
+    """
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        assert persona.mode_for("跑完了") is None, "这条测试的前提是这句话匹配不上任何模式"
+
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="project", claim="回测这周跑完")], now - timedelta(days=6)
+        )
+        due = await life.due_ledger_entry(now)
+        assert due is not None
+        await memory.mark_ledger_asked(due[0], now)
+
+        pending = await memory.open_questions(now)
+        assert [p[2].claim for p in pending] == ["回测这周跑完"]
+        assert pending[0][0] == due[0], "编号要对得上，她才引用得了"
+    finally:
+        await memory.close()
+
+
+async def test_an_answer_from_long_ago_is_not_still_pending(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """问过很久都没下文的，就别一直挂在上下文里占地方了。"""
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="sleep", claim="十二点前睡")], now - timedelta(days=40)
+        )
+        due = await life.due_ledger_entry(now)
+        assert due is not None
+        await memory.mark_ledger_asked(due[0], now - timedelta(days=30))
+        assert await memory.open_questions(now) == []
+    finally:
+        await memory.close()
+
+
+def test_the_output_rules_tell_her_how_to_close_something(persona: Persona) -> None:
+    """稳定层要说清楚"他给了下文就放进 resolved_ledger_ids"。
+
+    字段加了但没人告诉她怎么用，等于没加——这正是六类台账刚犯过的错。
+    """
+    from newperson.prompts import build_system
+
+    rules = build_system(persona)
+    assert "resolved_ledger_ids" in rules
+    assert "没做" in rules, "要说清楚'没做'也算有下文，否则只有做到了才会翻篇"

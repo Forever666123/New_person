@@ -135,7 +135,7 @@ async def test_ledger_keeps_what_he_said(memory: Memory) -> None:
         [LedgerEntry(claim="这次一定设止损", reason="上次亏怕了", committed_to="记进日志")], NOW
     )
     got = await memory.ledger("trading")
-    assert got[0][1].claim == "这次一定设止损"
+    assert got[0][2].claim == "这次一定设止损"
 
 
 # -- 任务：崩溃恢复 ----------------------------------------------------------

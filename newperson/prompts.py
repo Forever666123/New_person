@@ -94,6 +94,9 @@ _OUTPUT_RULES = """
   `kind` 从这几个里挑一个：trading（仓位、止损、回测）、study（课业、考试、deadline）、
   shift（便利店排班）、project（他在写的东西）、english（英语练习）、sleep（作息）。
   都不沾边就不用记。
+- `resolved_ledger_ids` 放那些他这次给了下文的条目编号（上下文里的 `#12` 那个数）。
+  做了、没做、改主意了、不打算做了——**都算有下文**，都要放进去。
+  放进去之后你就不会再问它了。他没提到的条目别放。
 - `inner_note` 是你自己的状态，一句话，进你的日记，不会发给他。
 
 上下文里会告诉你此刻在干什么（在上课、刚醒、准备睡了）。
@@ -144,12 +147,12 @@ def format_photos(photos: list[Photo]) -> str:
     return "\n".join(lines)
 
 
-def format_ledger(entries: list[tuple[datetime, LedgerEntry]]) -> str:
+def format_ledger(entries: list[tuple[int, datetime, LedgerEntry]]) -> str:
     if not entries:
         return ""
     lines = []
-    for at, entry in entries:
-        line = f"- {at.strftime('%m-%d')} 他说：{entry.claim}"
+    for entry_id, at, entry in entries:
+        line = f"- [#{entry_id}] {at.strftime('%m-%d')} 他说：{entry.claim}"
         if entry.reason:
             line += f"（理由：{entry.reason}）"
         if entry.committed_to:
@@ -227,6 +230,7 @@ def build_reply_user(
     self_facts: list[str],
     ledger: list[tuple[datetime, LedgerEntry]],
     ledger_topic: str = "",
+    open_questions: list[tuple[int, datetime, LedgerEntry]] | None = None,
     mode_instruction: str,
     recent: list[StoredMessage],
     unread: list[StoredMessage],
@@ -244,6 +248,15 @@ def build_reply_user(
         blocks.append(
             _section(
                 "你自己说过的（别前后矛盾）", "\n".join(f"- {f}" for f in self_facts)
+            )
+        )
+    open_text = format_ledger(open_questions or [])
+    if open_text:
+        blocks.append(
+            _section(
+                "你问过他、还没听到下文的",
+                f"{open_text}\n他这次要是提到了其中哪一条（做了、没做、改主意了都算），"
+                "把编号放进 resolved_ledger_ids，别再追着问。",
             )
         )
     ledger_text = format_ledger(ledger)

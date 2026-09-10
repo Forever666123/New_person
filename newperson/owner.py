@@ -216,7 +216,7 @@ async def _ledger(args: list[str], ctx: OwnerContext) -> str:
         )
 
     lines = [f"**她记着这些**（{kind}，最近 {len(entries)} 条）"]
-    for at, entry in entries:
+    for _entry_id, at, entry in entries:
         line = f"`{at.strftime('%m-%d')}` {entry.claim}"
         if entry.reason:
             line += f"\n　　理由：{entry.reason}"

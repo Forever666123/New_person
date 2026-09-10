@@ -548,6 +548,9 @@ class App:
                 self_facts=self_facts,
                 ledger=ledger,
                 ledger_topic=mode.ledger_topic if mode else "",
+                # 跟话题模式无关，永远带着：他回"跑完了"的时候那句话里
+                # 通常一个触发词都没有，模式匹配不上，她就没办法把这件事记成翻篇。
+                open_questions=await self.memory.open_questions(now),
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
                 unread=unread,
@@ -649,6 +652,10 @@ class App:
             await self.memory.add_diary_note(day, plan.inner_note, now)
         if plan.ledger_entries:
             await self.memory.add_ledger_entries(plan.ledger_entries, now)
+        if plan.resolved_ledger_ids:
+            closed = await self.memory.resolve_ledger(plan.resolved_ledger_ids)
+            if closed:
+                log.info("[ledger] 他给了下文，%d 条翻篇了", closed)
         if plan.follow_up:
             await self.life.schedule_follow_up(
                 CONVERSATION_ID, plan.follow_up.delay_minutes, plan.follow_up.note

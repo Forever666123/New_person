@@ -263,7 +263,7 @@ async def test_the_ledger_records_what_he_said(tmp_path: Path, persona: Persona)
     app, _channel, _llm, clock, memory = await build(tmp_path, persona, [plan])
     await send(app, "我又加仓了", at=EVENING)
     await drain(app, clock)
-    assert (await memory.ledger("trading"))[0][1].claim == "这次一定设止损"
+    assert (await memory.ledger("trading"))[0][2].claim == "这次一定设止损"
 
 
 async def test_a_follow_up_is_scheduled(tmp_path: Path, persona: Persona) -> None:

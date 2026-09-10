@@ -80,7 +80,7 @@ class ReplyRequest:
     summary: str
     owner_facts: list[str]
     self_facts: list[str]
-    ledger: list[tuple[datetime, LedgerEntry]]
+    ledger: list[tuple[int, datetime, LedgerEntry]]
     mode_instruction: str
     recent: list[StoredMessage]
     unread: list[StoredMessage]
@@ -92,6 +92,8 @@ class ReplyRequest:
     """他问了问题或者说了件具体的事。这种不能不回。"""
     ledger_topic: str = ""
     """台账那一段的小标题，跟着话题类别走。"""
+    open_questions: list[tuple[int, datetime, LedgerEntry]] = field(default_factory=list)
+    """她问过、还没听到下文的那几条。跟话题模式无关，永远带着。"""
 
 
 @dataclass
@@ -295,6 +297,7 @@ class Brain:
             self_facts=req.self_facts,
             ledger=req.ledger,
             ledger_topic=req.ledger_topic,
+            open_questions=req.open_questions,
             mode_instruction=req.mode_instruction,
             recent=req.recent,
             unread=req.unread,

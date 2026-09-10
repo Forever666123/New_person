@@ -259,6 +259,13 @@ class ReplyPlan(BaseModel):
     ledger_entries: list[LedgerEntry] = Field(
         default_factory=list, description="从对方这次说的话里记下来的、以后要拿来对质的陈述。"
     )
+    resolved_ledger_ids: list[int] = Field(
+        default_factory=list,
+        description=(
+            "他这次给了下文的台账条目编号（上下文里 [#12] 的那个数）。"
+            "做了、没做、改主意了都算。放进来之后就不会再追问它。"
+        ),
+    )
     inner_note: str = Field(default="", description="一句话记下你此刻的状态，进你的日记，不发给对方。")
 
 

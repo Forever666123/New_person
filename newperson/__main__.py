@@ -463,7 +463,7 @@ def cmd_ledger(args: argparse.Namespace) -> int:
                 print("还没记下什么。跟她聊到仓位、止损、回测这些的时候她才会记。")
                 return 0
             print(f"她记着这些（{args.kind}，{len(entries)} 条，最近的在前）\n")
-            for at, entry in entries:
+            for _entry_id, at, entry in entries:
                 print(f"{at.strftime('%Y-%m-%d %H:%M')}  {entry.claim}")
                 if entry.reason:
                     print(f"{'':20}理由：{entry.reason}")

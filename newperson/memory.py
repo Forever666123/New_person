@@ -615,7 +615,54 @@ class Memory:
         )
         await self.db.commit()
 
-    async def ledger(self, kind: str, limit: int = 25) -> list[tuple[datetime, LedgerEntry]]:
+    async def open_questions(
+        self, now: datetime, within_days: float = 7.0, limit: int = 5
+    ) -> list[tuple[int, datetime, LedgerEntry]]:
+        """她问过、但还没听到下文的那几条。
+
+        **这是让她"听得见回答"的关键。** 她问一句"回测跑完了吗"，他回"跑完了"——
+        那句回答里多半一个触发词都没有，于是模式匹配不上，台账根本不进上下文，
+        她就没有任何办法把这件事记成已了结。下次周期一到，她又问一遍。
+        问了、答了、又问一遍，这是最像机器人的一幕。
+        """
+        since = (now - timedelta(days=within_days)).isoformat()
+        rows = await self._fetch_all(
+            "SELECT * FROM ledger WHERE resolved = 0 AND asked_at IS NOT NULL"
+            " AND asked_at >= ? ORDER BY asked_at DESC LIMIT ?",
+            (since, limit),
+        )
+        return [
+            (
+                int(r["id"]),
+                datetime.fromisoformat(r["created_at"]),
+                LedgerEntry(
+                    kind=r["kind"], claim=r["claim"], reason=r["reason"],
+                    committed_to=r["committed_to"],
+                ),
+            )
+            for r in rows
+        ]
+
+    async def resolve_ledger(self, entry_ids: list[int]) -> int:
+        """他给了下文，这几条就翻篇了。
+
+        没有这条路的话，唯一让条目消失的方式就是"问够次数"或者"太老了"——
+        两个都是机械的上限，跟他说了什么完全无关。
+        """
+        wanted = [int(i) for i in entry_ids if i]
+        if not wanted:
+            return 0
+        marks = ",".join("?" for _ in wanted)
+        cur = await self.db.execute(
+            f"UPDATE ledger SET resolved = 1 WHERE id IN ({marks}) AND resolved = 0",  # noqa: S608
+            wanted,
+        )
+        await self.db.commit()
+        return cur.rowcount or 0
+
+    async def ledger(
+        self, kind: str, limit: int = 25
+    ) -> list[tuple[int, datetime, LedgerEntry]]:
         """他之前说过的话，按时间倒序。她拿这个指出前后矛盾。"""
         rows = await self._fetch_all(
             "SELECT * FROM ledger WHERE kind = ? AND resolved = 0 ORDER BY id DESC LIMIT ?",
@@ -623,6 +670,7 @@ class Memory:
         )
         return [
             (
+                int(r["id"]),
                 datetime.fromisoformat(r["created_at"]),
                 LedgerEntry(
                     kind=r["kind"],
