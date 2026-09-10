@@ -382,10 +382,30 @@ class Brain:
         plan = await self._call(ProactivePlan, prompt, purpose="proactive", today=today)
         if plan is None or not plan.send:
             return plan
-        plan.parts, _ = style_guard.enforce(
+
+        # 原来这里只做机械修剪，把"要重写"的那部分直接扔了——
+        # 于是回复有两道关（修剪 + 重写一次），主动消息只有一道。
+        # 恰恰主动消息才是她开口说的第一句：没有你刚说的话垫着，
+        # 上下文最少，最容易滑到寒暄上去。第一次上线那句尤其如此。
+        fixed, needs_rewrite = style_guard.enforce(
             plan.parts, self.persona.style, self.persona.boundaries
         )
-        return plan
+        if not needs_rewrite:
+            plan.parts = fixed
+            return plan
+
+        log.info("[brain] 主动消息风格不过关，重写一次：%s", [v.kind for v in needs_rewrite])
+        retry_prompt = f"{prompt}\n\n{style_guard.describe_for_rewrite(needs_rewrite)}"
+        again = await self._call(ProactivePlan, retry_prompt, purpose="proactive", today=today)
+        if again is None or not again.send:
+            # 重写没出来就用机械修剪那版。为这个卡住不如少说一句，
+            # 但已经想说的话不该因为重写失败就整个丢掉。
+            plan.parts = fixed
+            return plan
+        again.parts, _ = style_guard.enforce(
+            again.parts, self.persona.style, self.persona.boundaries
+        )
+        return again
 
     async def generate_day_plan(self, req: DayPlanRequest, today: date) -> DayPlan | None:
         prompt = build_day_plan_user(

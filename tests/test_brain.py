@@ -311,6 +311,82 @@ async def test_she_can_decide_not_to_say_anything(
     assert got.send is False
 
 
+def proactive_request(**kw) -> ProactiveRequest:
+    base = {
+        "situation": "",
+        "trigger_note": "随口说一句自己的事",
+        "summary": "",
+        "owner_facts": [],
+        "self_facts": [],
+        "recent": [],
+        "hours_since_last_exchange": 30.0,
+        "unanswered_initiations": 0,
+        "photos": [],
+    }
+    base.update(kw)
+    return ProactiveRequest(**base)
+
+
+async def test_a_greeting_in_a_proactive_message_gets_rewritten(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """主动消息也要过重写那一关，不是只做机械修剪。
+
+    这条最要紧的场景是第一次上线那句开场：她说的第一句话，
+    上下文是空的（没有摘要、没有事实、没有最近的对话），
+    模型手里没有别的东西可抓，最容易滑到寒暄上去。
+    而寒暄是他们认识一年之后最不该出现的东西。
+
+    回复一直有两道关（机械修剪 + 重写一次），主动消息原来只有一道，
+    要重写的那部分被直接丢掉了。
+    """
+    client = fake_client(
+        ProactivePlan(send=True, parts=[ReplyPart(text="在吗，好久没聊了")]),
+        ProactivePlan(send=True, parts=[ReplyPart(text="今天雪大到地铁都停了")]),
+    )
+    brain = Brain(client, settings(tmp_path), persona, memory)
+
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+
+    assert len(client.messages.calls) == 2, "带寒暄的那版应该被打回去重写"
+    assert got.parts[0].text == "今天雪大到地铁都停了"
+
+
+async def test_a_clean_proactive_message_does_not_cost_a_second_call(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """没问题就不要多花一次钱。重写只在真的违规时发生。"""
+    client = fake_client(
+        ProactivePlan(send=True, parts=[ReplyPart(text="图书馆一个位置都没有")])
+    )
+    brain = Brain(client, settings(tmp_path), persona, memory)
+
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+
+    assert len(client.messages.calls) == 1
+    assert got.parts[0].text == "图书馆一个位置都没有"
+
+
+async def test_a_failed_rewrite_still_sends_the_trimmed_version(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """重写没出来的话，用机械修剪那版发出去。
+
+    为一次重写失败就整句丢掉不值得——她本来是有话想说的。
+    """
+    client = fake_client(
+        ProactivePlan(send=True, parts=[ReplyPart(text="在吗")]),
+        None,
+    )
+    brain = Brain(client, settings(tmp_path), persona, memory)
+
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+
+    assert got is not None
+    assert got.send is True
+    assert got.parts
+
+
 async def test_haiku_does_not_get_an_effort_parameter(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:

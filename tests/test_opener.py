@@ -135,19 +135,68 @@ async def test_it_does_not_fire_the_moment_the_container_starts(
         await memory.close()
 
 
-async def test_it_never_lands_while_she_is_asleep(tmp_path: Path, persona: Persona) -> None:
-    """半夜把机器装起来，开场要等到她醒着。
+def moment_engine(persona: Persona) -> LifeEngine:
+    """只为了打 _opener_moment：它是纯函数，不碰数据库。
 
-    抽了很多个起始时刻，因为作息本身是抽签出来的——
-    写死"凌晨四点她在睡"那种测试，换个种子就假了。
+    直接构造省掉每次建库的开销，于是同一条测试能跑几千个样本——
+    而"几千个样本"正是抓住这个 bug 所必需的。
     """
-    for hour in range(0, 24, 2):
-        now = datetime(2026, 9, 14, hour, 0, tzinfo=persona.tz)
+    calendar = AcademicCalendar(persona.academic, persona.seed)
+    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    return LifeEngine(persona, rhythm, calendar, None, None, None, None, random.Random(0))
+
+
+def test_the_opener_never_lands_in_her_sleep_at_any_start_time(persona: Persona) -> None:
+    """整天每半小时 × 每个时刻二十个种子，一次都不能排进睡眠里。
+
+    这条要密集采样才有意义。原来那版按两小时一档、一个种子，
+    正好跳过了 01:30 —— 而那个时刻的兜底分支有约四分之一的种子
+    会把开场排到她睡着的时候。三个种子也不够：漏检率还有四成。
+
+    为什么这么较真：开场只有一次机会。真到了那一刻她在睡，
+    handle_proactive_job 直接返回，任务标记 done，
+    kv 标记加上全局唯一的 dedupe_key 让它再也排不上——**这一句就永远没有了**。
+    """
+    life = moment_engine(persona)
+    cfg = persona.proactive.opener
+    bad = []
+    for hour in range(24):
+        for minute in (0, 30):
+            for seed in range(20):
+                life.rng = random.Random(seed * 101 + hour * 7 + minute)
+                now = datetime(2026, 9, 14, hour, minute, tzinfo=persona.tz)
+                moment = life._opener_moment(now, cfg)
+                if moment is None or life.rhythm.is_sleeping(moment):
+                    bad.append(f"{hour:02d}:{minute:02d} 种子 {seed}")
+    assert not bad, f"{len(bad)} 个组合把开场排进了睡眠里（或排不出来），例如：{bad[:5]}"
+
+
+def test_the_opener_always_respects_the_minimum_delay(persona: Persona) -> None:
+    """兜底那条路也不能绕过"不能刚启动就说话"。"""
+    life = moment_engine(persona)
+    cfg = persona.proactive.opener
+    for hour in range(24):
+        for seed in range(10):
+            life.rng = random.Random(seed * 31 + hour)
+            now = datetime(2026, 9, 14, hour, 0, tzinfo=persona.tz)
+            moment = life._opener_moment(now, cfg)
+            assert moment is not None
+            gap = (moment - now).total_seconds() / 60
+            assert gap >= cfg.min_delay_minutes, f"{hour} 点启动只等了 {gap:.0f} 分钟"
+
+
+async def test_it_never_lands_while_she_is_asleep(tmp_path: Path, persona: Persona) -> None:
+    """走完整条路（建库、排任务）再确认一次落点是醒着的。
+
+    密集采样交给上面那条纯函数测试，这里只保证接起来也是对的。
+    """
+    for hour in (1, 4, 9, 15, 21):
+        now = datetime(2026, 9, 14, hour, 30, tzinfo=persona.tz)
         life, memory, rhythm, _clock = await build(tmp_path / f"h{hour}", persona, now)
         try:
             moment = await life.ensure_opener(CONV, None)
-            assert moment is not None, f"{hour} 点启动时排不出开场"
-            assert not rhythm.is_sleeping(moment), f"{hour} 点启动，开场排在了她睡觉的时候"
+            assert moment is not None, f"{hour}:30 排不出开场"
+            assert not rhythm.is_sleeping(moment), f"{hour}:30 把开场排进了睡眠里"
         finally:
             await memory.close()
 
@@ -197,3 +246,27 @@ async def test_the_moment_is_not_always_the_same(
         finally:
             await memory.close()
     assert len(set(gaps)) > 1, f"六次抽出来一样的偏移：{gaps}"
+
+
+def test_greetings_are_blocked_by_the_guard_not_just_by_the_prompt(persona: Persona) -> None:
+    """提示词只是请求，never_say 才是拦截。
+
+    开场是她说的第一句话，而且上下文全空——模型手里没有别的东西可抓，
+    最容易滑到寒暄上去。只在提示词里写"不要打招呼"是不够的：
+    那句话跟其他几十行指示挤在一起，而这一条错了就没有第二次机会。
+    """
+    from newperson import style_guard
+    from newperson.models import ReplyPart
+
+    for greeting in ("在吗", "你好", "好久没聊", "最近怎么样", "终于加上你了"):
+        _fixed, bad = style_guard.enforce(
+            [ReplyPart(text=greeting)], persona.style, persona.boundaries
+        )
+        assert bad, f"{greeting!r} 没有被拦下来"
+
+    # 普通的一句自己的事要能干净地过去，别把话堵死了
+    for fine in ("今天雪大到地铁都停了", "图书馆一个位置都没有"):
+        _fixed, bad = style_guard.enforce(
+            [ReplyPart(text=fine)], persona.style, persona.boundaries
+        )
+        assert not bad, f"{fine!r} 被误伤了"

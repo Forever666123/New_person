@@ -175,15 +175,24 @@ class LifeEngine:
             if self.rng.random() <= self.rhythm.engage_probability_at(moment):
                 return moment
 
-        # 整个窗口她都在睡——半夜把机器装起来就是这样。
-        # 退到她醒来之后一段时间，别正好卡在起床那一分钟。
+        # 窗口里没抽到——要么她整段都在睡（半夜装机器就是这样），
+        # 要么活跃度那关一直没过。往后找一个她醒着的时刻，
+        # 再往后挪一段，别正好卡在起床那一分钟。
+        #
+        # **加完偏移之后必须再查一次是不是在睡。** 起床前几分钟是"醒着"的，
+        # 但 probe + 40~180 分钟完全可能又落回下一段睡眠里去；
+        # 而开场只有一次机会：真到了那一刻她在睡，handle_proactive_job 直接返回，
+        # 任务标记成 done，kv 里的标记和全局唯一的 dedupe_key 让它再也排不上了。
+        # 这一句不发，就是永远不发。
         probe = earliest
         limit = now + timedelta(hours=cfg.fallback_search_hours)
         step = timedelta(minutes=15)
+        low, high = cfg.after_waking_minutes
         while probe < limit:
             if not self.rhythm.is_sleeping(probe):
-                low, high = cfg.after_waking_minutes
-                return probe + timedelta(minutes=self.rng.uniform(low, high))
+                candidate = probe + timedelta(minutes=self.rng.uniform(low, high))
+                if candidate < limit and not self.rhythm.is_sleeping(candidate):
+                    return candidate
             probe += step
         return None
 

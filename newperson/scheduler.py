@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
@@ -34,6 +35,13 @@ LEASE_SECONDS = 300.0
 IDLE_POLL_SECONDS = 60.0
 """没有任何待办时的兜底轮询间隔。正常情况下靠事件唤醒。"""
 
+BACKLOG_AFTER = timedelta(minutes=2)
+"""过期超过这么久才算"停机期间攒下来的"，才需要打散。
+
+刚到点的任务不是积压，是正常轮到它了——那种必须立刻执行，
+否则每一条回复都要平白多等几分钟。
+"""
+
 STALE_AFTER = {
     "proactive": timedelta(hours=2),
     "follow_up": timedelta(hours=6),
@@ -43,10 +51,18 @@ STALE_AFTER = {
 
 
 class Scheduler:
-    def __init__(self, memory: Memory, clock: Clock, delay_scale: float = 1.0) -> None:
+    def __init__(
+        self,
+        memory: Memory,
+        clock: Clock,
+        delay_scale: float = 1.0,
+        rng: random.Random | None = None,
+    ) -> None:
         self.memory = memory
         self.clock = clock
         self.delay_scale = delay_scale
+        self.rng = rng or random.Random()
+        """恢复时把积压的任务打散用的。测试要复现就传一个进来。"""
         self._handlers: dict[str, Handler] = {}
         self._wake = asyncio.Event()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -105,6 +121,36 @@ class Scheduler:
         stale = await self._expire_stale_jobs()
         if stale:
             log.info("[job] %d 个过期太久的任务作废", stale)
+        spread = await self._spread_overdue_jobs()
+        if spread:
+            log.info("[job] %d 个已经到点的任务往后挪了挪，免得一起涌出来", spread)
+
+    async def _spread_overdue_jobs(self) -> int:
+        """已经过了执行时刻的任务，别在开机后一分钟内全部涌出来。
+
+        **这是整个系统里最容易露馅的一幕。** 部署或者机器重启要几分钟，
+        期间到点的回复、日程、记忆整理会在 recover() 之后的第一轮里一起执行——
+        于是她在进程起来三十秒后，回了一条你几小时前发的消息。
+        没有人是这样的：一个人重新拿起手机，是过一会儿才看到的。
+
+        往后挪的量随机，且按任务种类分开：回复要像"过一会儿才看到"，
+        后台任务（日程、记忆整理）挪多久都无所谓，纯粹是让它们别挤在一起。
+        """
+        now = self.clock.now()
+        spread = {
+            "reply": (150.0, 900.0),
+            "proactive": (300.0, 1800.0),
+            "follow_up": (300.0, 1800.0),
+        }
+        moved = 0
+        for job in await self.memory.pending_jobs():
+            if now - job.run_at <= BACKLOG_AFTER:
+                continue
+            low, high = spread.get(job.kind, (30.0, 300.0))
+            delay = self.rng.uniform(low, high) * max(self.delay_scale, 0.0)
+            await self.memory.reschedule_job(job.id or 0, now + timedelta(seconds=delay))
+            moved += 1
+        return moved
 
     async def _expire_stale_jobs(self) -> int:
         """停机太久之后，有些任务已经没有意义了。"""

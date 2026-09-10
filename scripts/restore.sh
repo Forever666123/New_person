@@ -104,8 +104,18 @@ printf "确认？输 yes："
 read -r ANSWER
 [ "$ANSWER" = "yes" ] || die "算了"
 
+# 停不下来就**不能继续**。原来这里是失败也往下走，后果很重：
+# 服务还开着数据库在写，我们把它的文件改名、再 rm 掉 -wal，
+# 她会继续往一个已经没有名字的 WAL 里写，那些话在下次重启时凭空消失，
+# 然后她打开的是那份旧的恢复库。宁可什么都不做。
 say "停服务"
-$SERVICE_STOP || say "!! 停服务失败，继续（她可能本来就没在跑）"
+$SERVICE_STOP || die "停不下来 $SERVICE_NAME。她还开着数据库，这时候换文件会丢数据。
+   先手动停：systemctl stop $SERVICE_NAME
+   或者在 backup.env 里把 SERVICE_STOP/SERVICE_START 改成你这台机器上对的命令"
+
+# 从这里开始，任何一条失败路径都不能把她留在停着的状态。
+# shellcheck disable=SC2064
+trap "rm -rf '$WORK'; $SERVICE_START || true" EXIT
 
 DATA_DIR="$(dirname "$DB_PATH")"
 NEW="$DB_PATH.incoming-$$"
@@ -129,6 +139,7 @@ mv "$NEW" "$DB_PATH"
 rm -f "$DB_PATH-wal" "$DB_PATH-shm"
 
 say "起服务"
+trap 'rm -rf "$WORK"' EXIT   # 下面自己起，不用兜底的那次了
 $SERVICE_START || die "起不来了。看 journalctl -u $SERVICE_NAME -n 50"
 
 say "✓ 装好了。看一眼日志：journalctl -u $SERVICE_NAME -f"

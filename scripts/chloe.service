@@ -8,6 +8,19 @@ Description=Chloe
 After=network-online.target
 Wants=network-online.target
 
+# **这两行是在保护你的 bot token，而且必须待在 [Unit] 里。**
+# Discord 给每个机器人每 24 小时 1000 次 IDENTIFY（断线重连走 RESUME 不算）。
+# 超了的后果是所有会话被终止**并且 token 被重置**，只发一封邮件通知你。
+# 一个"连上就崩"的循环配下面的 RestartSec=30，一天能重启 2880 次，
+# 八个半小时就烧穿 1000 —— 一个没人看着的晚上就够了。
+# 一小时内最多 20 次，换算成一天 480 次，撞不到上限。
+#
+# 写在 [Service] 里 systemd 会当成未知键**直接忽略**，什么都不会报，
+# 然后套用默认的 5 次/10 秒 —— 而 RestartSec=30 让你永远凑不满 10 秒内 5 次，
+# 于是熔断形同虚设。验一下：systemd-analyze verify chloe.service
+StartLimitIntervalSec=3600
+StartLimitBurst=20
+
 [Service]
 Type=simple
 WorkingDirectory=/opt/New_person
@@ -19,14 +32,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 
 Restart=always
-# **这三行是在保护你的 bot token。**
-# Discord 给每个机器人每 24 小时 1000 次 IDENTIFY（断线重连走 RESUME 不算）。
-# 超了的后果是所有会话被终止**并且 token 被重置**，只发一封邮件通知你。
-# 崩溃后立刻重启的话，一个"连上就崩"的循环一小时就能烧掉上千次。
-# 等 30 秒再拉起来，一天最多两千多次重启，配上下面的熔断就烧不到 1000。
+# 崩了等 30 秒再拉起来，配上 [Unit] 里的熔断，见那里的注释。
 RestartSec=30
-StartLimitIntervalSec=3600
-StartLimitBurst=20
 
 # 日志进 journal，journalctl -u chloe -f 看
 StandardOutput=journal

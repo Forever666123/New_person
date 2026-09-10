@@ -35,7 +35,7 @@ from .delivery import Deliverer, DeliveryBlocked
 from .life import LifeEngine
 from .media import CommandImageGenerator, MediaService, NullImageGenerator, PhotoLibrary
 from .memory import Memory
-from .models import IncomingMessage, Job, PhotoRequest, TimeOfDay
+from .models import IncomingMessage, Job, PhotoRequest, RhythmSnapshot, TimeOfDay
 from .persona import Persona
 from .prompts import build_situation
 from .rhythm import Rhythm
@@ -831,7 +831,7 @@ class PresenceManager:
         elif self._online_until and now < self._online_until:
             status, text = "online", await self._status_text(now)
         elif snapshot.state == "busy":
-            status, text = "dnd" if self.rng.random() < 0.2 else "idle", await self._status_text(now)
+            status, text = self._busy_status(snapshot), await self._status_text(now)
         else:
             status, text = "idle", await self._status_text(now)
 
@@ -843,6 +843,21 @@ class PresenceManager:
                 status=discord.Status(status),
                 activity=discord.CustomActivity(name=text) if text else None,
             )
+
+    def _busy_status(self, snapshot: RhythmSnapshot) -> str:
+        """在忙的时候是"勿扰"还是"闲置"——**同一段课里必须一直是同一个**。
+
+        原来这里每次 apply_once 都重新掷一次骰子，而那个循环一分钟跑一次。
+        她周二周四晚上 18:00-21:00 是一整块 busy，于是头像在勿扰和闲置之间
+        平均每三分钟跳一次，一节课跳五十多回。没有人的客户端是那样的，
+        而且这种高频 change_presence 正是会被 Discord 限流、进而断线重连的东西。
+
+        改成按"这一段是什么时候开始的"抽签：整段课里结果不变，
+        换一段课又是独立的一次抽签。
+        """
+        seed = f"{self.persona.seed}:busy:{snapshot.until.isoformat()}:{snapshot.block_title or ''}"
+        roll = random.Random(seed).random()
+        return "dnd" if roll < 0.2 else "idle"
 
     async def _status_text(self, now: datetime) -> str | None:
         """自定义状态一天最多换一次，而且多数时候不换。
@@ -940,7 +955,7 @@ def build_app(
     )
     attention = AttentionPolicy(persona, rhythm, settings.delay_scale)
     memory = Memory(settings.db_path)
-    scheduler = Scheduler(memory, clock, settings.delay_scale)
+    scheduler = Scheduler(memory, clock, settings.delay_scale, rng)
     brain = Brain(llm_client or build_client(settings), settings, persona, memory)
 
     library = PhotoLibrary(settings.photos_index)

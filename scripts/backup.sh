@@ -37,6 +37,14 @@ die() { echo "✗ $*" >&2; exit 1; }
 say() { echo "[$(date -u +%FT%TZ)] $*"; }
 
 [ -n "$RCLONE_REMOTE" ] || die "没配 RCLONE_REMOTE。看 scripts/backup.env.example"
+# 结尾少一个斜杠，"$RCLONE_REMOTE$NAME" 就会拼成 b2:bucketnewperson-xxx.db.gpg。
+# 更糟的是它不报错：上传照样成功（传到一个叫 bucketnewperson-... 的地方），
+# 而 restore.sh 用同样的拼法去下载就找不到。每天都显示 ✓，一份都恢复不了。
+# 示例配置里只写了句注释提醒，注释拦不住任何人，这里直接补上。
+case "$RCLONE_REMOTE" in
+    */|*:) ;;
+    *) RCLONE_REMOTE="$RCLONE_REMOTE/" ;;
+esac
 [ -r "$GPG_PASSPHRASE_FILE" ] || die "读不到密码文件 $GPG_PASSPHRASE_FILE"
 [ -f "$DB_PATH" ] || die "找不到数据库 $DB_PATH。检查 backup.env 里的 DB_PATH"
 # cron 的 PATH 通常只有 /usr/bin:/bin，装在 /usr/local/bin 的东西找不到。
@@ -95,11 +103,14 @@ say "上传 $NAME"
 rclone copy "$WORK/$NAME" "$RCLONE_REMOTE" || die "上传失败"
 rclone lsf "$RCLONE_REMOTE" 2>/dev/null | grep -qx "$NAME" || die "传完了但对面没有这个文件"
 
+# 回读大小。原来这里 sed 匹配不到时会得到空串，而空串会让下面的比较**整个被跳过**，
+# 于是"确认传到了"这一步在出问题时恰好什么都不确认。现在读不出数字就是失败。
 LOCAL_SIZE="$(wc -c < "$WORK/$NAME")"
 REMOTE_SIZE="$(rclone size --json "$RCLONE_REMOTE$NAME" 2>/dev/null | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p' || true)"
-if [ -n "$REMOTE_SIZE" ] && [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
-    die "大小对不上：本地 $LOCAL_SIZE，对面 $REMOTE_SIZE。这一轮不清理旧备份"
-fi
+case "$REMOTE_SIZE" in
+    ''|*[!0-9]*) die "读不出对面那份的大小（rclone size 没给出数字）。这一轮不清理旧备份" ;;
+esac
+[ "$REMOTE_SIZE" = "$LOCAL_SIZE" ] || die "大小对不上：本地 $LOCAL_SIZE，对面 $REMOTE_SIZE。这一轮不清理旧备份"
 
 # ---- 4. 本地也留几份，顺手清掉旧的 ----------------------------------------
 # 本地这几份是为了"手滑删了数据库"这种当场就发现的事故，不算异地备份。
@@ -111,7 +122,8 @@ done
 
 if [ "$PRUNE" = yes ]; then
     say "清理 $KEEP_DAYS 天以前的远端备份"
-    rclone delete --min-age "${KEEP_DAYS}d" "$RCLONE_REMOTE" || true
+    # 限定文件名：这个 bucket 里可能还有别的东西，别替人家做主
+    rclone delete --min-age "${KEEP_DAYS}d" --include 'newperson-*.db.gpg' "$RCLONE_REMOTE" || true
     # B2 删除只是打个隐藏标记，旧版本还在按量收钱。cleanup 才是真的删。
     rclone cleanup "$RCLONE_REMOTE" 2>/dev/null || true
 fi

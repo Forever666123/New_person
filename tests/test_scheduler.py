@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -222,3 +223,45 @@ async def test_a_handler_that_reschedules_itself_is_not_marked_done(parts) -> No
     got = await memory.get_job(job_id)
     assert got.status == "pending", "被推后的任务不该变成 done"
     assert got.run_at > NOW
+
+
+async def test_a_backlog_does_not_all_come_out_at_once_after_a_restart(parts) -> None:
+    """停机期间攒下的任务，不能在进程起来那一分钟里一起涌出来。
+
+    这是整个系统里最容易露馅的一幕：部署或者机器重启要几分钟，
+    期间到点的回复会在 recover() 之后的第一轮全部执行——
+    于是她在进程起来三十秒后，回了一条你三小时前发的消息。
+    没有人是这样的。一个人重新拿起手机，是过一会儿才看到的。
+    """
+    memory, clock, sched = parts
+    sched.rng = random.Random(5)
+    for i in range(4):
+        await sched.schedule(
+            "reply", NOW - timedelta(hours=3), conversation_id=f"c{i}", dedupe_key=f"k{i}"
+        )
+
+    await sched.recover()
+
+    jobs = await memory.pending_jobs()
+    assert len(jobs) == 4
+    for job in jobs:
+        gap = (job.run_at - NOW).total_seconds()
+        assert gap > 60, f"{job.conversation_id} 只往后挪了 {gap:.0f} 秒，起来就发跟没挪一样"
+    # 而且不能全挪到同一刻，那又是另一种整齐
+    assert len({j.run_at for j in jobs}) > 1
+
+
+async def test_a_job_that_just_came_due_still_runs_immediately(parts) -> None:
+    """刚到点的不算积压。
+
+    把"轮到它了"也当成积压去打散的话，每一条回复都要平白多等几分钟，
+    她会显得比设计的还要慢。
+    """
+    memory, clock, sched = parts
+    await sched.schedule("reply", NOW, conversation_id="owner")
+
+    await sched.recover()
+
+    jobs = await memory.pending_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].run_at == NOW
