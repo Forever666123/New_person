@@ -23,9 +23,12 @@ from .calendar import AcademicCalendar
 from .clock import Clock
 from .memory import Memory
 from .models import DayPlan, Job, PlanEvent
-from .persona import Persona, ProactiveKind, parse_hhmm
+from .persona import OpenerConfig, Persona, ProactiveKind, parse_hhmm
 from .rhythm import Rhythm
 from .scheduler import Scheduler
+
+OPENER_KEY = "opener"
+"""排过开场没有。同时用作任务的去重键，所以它天然只会排上一次。"""
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +113,79 @@ class LifeEngine:
         count = await self.schedule_proactive_candidates(plan, conversation_id)
         log.info("[life] %s 的日程好了，排了 %d 个主动时刻", day, count)
         return plan
+
+    async def ensure_opener(self, conversation_id: str, plan: DayPlan | None) -> datetime | None:
+        """第一次上线时排一句开场。一辈子一次。
+
+        不做的话，第一天是你发消息进去，然后按她的作息可能等三小时才有回音——
+        功能完全正常，但看起来像坏了。这一句是"她在"的证据。
+
+        它借用普通的主动消息通道，用的也是现成的那种口吻，
+        所以内容上跟她第一百天说的话没有区别——**看不出是开场的开场**才是对的开场。
+        真到了要发的时候，``handle_proactive_job`` 的那些守卫照样生效：
+        你要是抢先说话了，这句会并进回复里，而不是自说自话。
+        """
+        cfg = self.persona.proactive.opener
+        if not cfg.enabled or await self.memory.kv_get(OPENER_KEY):
+            return None
+
+        # 已经聊过就不是第一次。老库升级上来不该突然冒出一句开场白。
+        if await self.memory.recent_messages(conversation_id, limit=1):
+            await self.memory.kv_set(OPENER_KEY, "skipped:已经聊过了")
+            log.info("[life] 不是第一次上线，开场跳过")
+            return None
+
+        moment = self._opener_moment(self.clock.now(), cfg)
+        if moment is None:
+            log.warning("[life] 找不到合适的开场时刻，跳过")
+            return None
+
+        shareable = [e for e in plan.events if e.shareable] if plan else []
+        job_id = await self.scheduler.schedule(
+            "proactive",
+            moment,
+            conversation_id=conversation_id,
+            payload={"kind": cfg.kind, "note": self._with_plan_hint(cfg.note, cfg.kind, shareable)},
+            dedupe_key=OPENER_KEY,
+            reason="opener",
+        )
+        if not job_id:
+            return None
+        # 排上了就记账。任务本身已经落库，进程崩了它还在；
+        # 这里记的是"这辈子排过了"，重启不该再排一次。
+        await self.memory.kv_set(OPENER_KEY, moment.isoformat())
+        log.info("[life] 第一次上线，开场排在 %s", moment.strftime("%m-%d %H:%M"))
+        return moment
+
+    def _opener_moment(self, now: datetime, cfg: OpenerConfig) -> datetime | None:
+        """挑一个像人的时刻。
+
+        两条底线：不能是启动后一分钟（那是程序开机的样子），
+        也不能是她正睡着的时候。
+        """
+        earliest = now + timedelta(minutes=cfg.min_delay_minutes)
+        latest = now + timedelta(hours=cfg.max_delay_hours)
+        span = max((latest - earliest).total_seconds(), 1.0)
+
+        # 先在窗口里按活跃度抽：她越可能在看手机的时刻，越容易被抽中。
+        for _ in range(80):
+            moment = earliest + timedelta(seconds=self.rng.uniform(0, span))
+            if self.rhythm.is_sleeping(moment):
+                continue
+            if self.rng.random() <= self.rhythm.engage_probability_at(moment):
+                return moment
+
+        # 整个窗口她都在睡——半夜把机器装起来就是这样。
+        # 退到她醒来之后一段时间，别正好卡在起床那一分钟。
+        probe = earliest
+        limit = now + timedelta(hours=cfg.fallback_search_hours)
+        step = timedelta(minutes=15)
+        while probe < limit:
+            if not self.rhythm.is_sleeping(probe):
+                low, high = cfg.after_waking_minutes
+                return probe + timedelta(minutes=self.rng.uniform(low, high))
+            probe += step
+        return None
 
     async def schedule_next_day_plan(self) -> int:
         """在下一次起床时安排生成明天的日程。去重键保证只有一个。"""
@@ -264,15 +340,22 @@ class LifeEngine:
             if moment is None or moment <= now or self.rhythm.is_sleeping(moment):
                 continue
 
-            note = kind.note
-            if shareable and kind.name in ("own_life", "travel_note"):
-                event = self.rng.choice(shareable)
-                note = f"{note}\n今天可以提的是：{event.title}。{event.detail}"
-                if event.share_hint:
-                    note += f"（{event.share_hint}）"
-            candidates.append((moment, kind, note))
+            candidates.append((moment, kind, self._with_plan_hint(kind.note, kind.name, shareable)))
 
         return sorted(candidates, key=lambda c: c[0])
+
+    def _with_plan_hint(self, note: str, kind_name: str, shareable: list[PlanEvent]) -> str:
+        """给"说说自己"这类主动挂一件今天真发生的事。
+
+        少了这一步她只能泛泛地说，而泛泛正是最像机器人的地方。
+        """
+        if not shareable or kind_name not in ("own_life", "travel_note"):
+            return note
+        event = self.rng.choice(shareable)
+        note = f"{note}\n今天可以提的是：{event.title}。{event.detail}"
+        if event.share_hint:
+            note += f"（{event.share_hint}）"
+        return note
 
     def _weighted_pick(self, kinds: list[ProactiveKind]) -> ProactiveKind:
         """按权重抽一种。权重决定她更常用哪种方式开口。"""

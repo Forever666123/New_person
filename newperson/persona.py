@@ -314,6 +314,32 @@ class ProactiveKind(BaseModel):
     """只在出门在外的时候才成立。"""
 
 
+class OpenerConfig(BaseModel):
+    """她第一次上线时先说的那一句。
+
+    **只在数据库还是空的时候发，一辈子一次。** 目的不是打招呼——
+    他们已经认识一年了，打招呼才是露馅。目的是：不做的话，第一天是你发消息进去，
+    然后按作息可能等三小时才有回音，功能完全正常，但看起来像坏了。
+    这一句是"她在"的证据。
+
+    所以最好的开场是**看不出是开场的开场**：内容上跟她第一百天说的话没有区别。
+    """
+
+    enabled: bool = True
+    kind: str = "own_life"
+    """借用哪一种主动消息的口吻。用现成的，别新造一种"开场白"语气。"""
+    min_delay_minutes: float = 25.0
+    """最早也要等这么久。``docker compose up`` 之后一分钟就冒出一句，那是程序开机的样子。"""
+    max_delay_hours: float = 6.0
+    """在这个窗口里按活跃度抽一个时刻。"""
+    after_waking_minutes: tuple[float, float] = (40.0, 180.0)
+    """窗口里她一直在睡（半夜装机器就是这样）时，退到起床之后这个区间里。"""
+    fallback_search_hours: float = 30.0
+    """往后找"她醒着"最多找这么久。跨一整个夜里也够。"""
+    note: str = ""
+    """给模型的指示。重点是把"打招呼"那条路堵死。"""
+
+
 class ProactiveConfig(BaseModel):
     day_probability: float = 0.4
     """今天她到底会不会主动开口。
@@ -330,6 +356,8 @@ class ProactiveConfig(BaseModel):
     quiet_days_before_callback: float = 3.0
     """多久没说话之后允许提一句旧事。"""
     kinds: list[ProactiveKind] = Field(default_factory=list)
+    opener: OpenerConfig = Field(default_factory=lambda: OpenerConfig())
+    """第一次上线时的那一句。"""
 
 
 # ---------------------------------------------------------------------------

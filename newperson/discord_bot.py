@@ -126,8 +126,12 @@ class App:
         self._prune_downloads()
         self._prune_downloads(folder=self.settings.generated_dir)
         await self.life.schedule_next_day_plan()
+        plan = None
         if not self.rhythm.is_sleeping(self.clock.now()):
-            await self.life.ensure_today_plan(CONVERSATION_ID)
+            plan = await self.life.ensure_today_plan(CONVERSATION_ID)
+        # 第一次上线时先说一句。有了今天的日程她才有具体的事可说，
+        # 所以排在 ensure_today_plan 后面。
+        await self.life.ensure_opener(CONVERSATION_ID, plan)
 
         self.spawn(self.scheduler.run_forever(), "scheduler")
 
