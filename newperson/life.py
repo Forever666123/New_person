@@ -413,12 +413,30 @@ class LifeEngine:
     def _sample_moment(
         self, kind: ProactiveKind, wake: datetime, sleep: datetime, day: date
     ) -> datetime | None:
-        """在她醒着的时间里随机挑一刻，受 kind 的时段限制。"""
+        """在她醒着的时间里挑一刻，**按活跃度加权**，受 kind 的时段限制。
+
+        原来这里是在整个清醒时段里均匀抽。均匀抽的后果是她会在周二晚上
+        七点半——也就是她自己那三个小时的课正上到一半的时候——忽然说一句
+        "今天雪好大"。而那一刻她的 Discord 状态明明写着在上课。
+        状态和行为对不上，是最直白的一种露馅。
+
+        加权之后，她越可能在看手机的时刻越容易被抽中，跟真人一样：
+        课间、走路回去的路上、睡前躺着的时候。
+
+        抽不中就退回原来的均匀抽法——像 window_photo 那种把时段写死在
+        凌晨的类型，作者已经指定了什么时候发，不该被活跃度否掉。
+        """
         if sleep <= wake:
             return None
+        span = (sleep - wake).total_seconds()
+        for _ in range(40):
+            moment = wake + timedelta(seconds=self.rng.uniform(0, span))
+            if not self._hours_allowed(kind, moment):
+                continue
+            if self.rng.random() <= self.rhythm.engage_probability_at(moment):
+                return moment
         for _ in range(30):
-            offset = self.rng.uniform(0, (sleep - wake).total_seconds())
-            moment = wake + timedelta(seconds=offset)
+            moment = wake + timedelta(seconds=self.rng.uniform(0, span))
             if self._hours_allowed(kind, moment):
                 return moment
         return None

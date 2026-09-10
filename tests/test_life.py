@@ -177,3 +177,45 @@ async def test_a_follow_up_lands_when_she_is_awake(harness: Harness) -> None:
     jobs = await harness.memory.pending_jobs("follow_up", "owner")
     assert jobs
     assert not harness.life.rhythm.is_sleeping(jobs[0].run_at)
+
+
+def test_proactive_moments_follow_her_activity_curve(persona: Persona) -> None:
+    """她主动开口的时刻要偏向"她本来就在看手机"的那几段。
+
+    原来是在整个清醒时段里均匀抽，于是她可能在自己那三个小时的课上到一半时
+    忽然说一句"今天雪好大"——而那一刻她的 Discord 状态明明写着在上课。
+    状态和行为对不上是最直白的一种露馅。
+
+    这条测试自己算一遍均匀抽的基线再比，所以改人设参数不会把它弄红。
+    """
+    import statistics
+
+    calendar = AcademicCalendar(persona.academic, persona.seed)
+    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    life = LifeEngine.__new__(LifeEngine)
+    life.rhythm, life.persona = rhythm, persona
+    kind = next(k for k in persona.proactive.kinds if k.name == "own_life")
+
+    weighted: list[float] = []
+    uniform: list[float] = []
+    for day_offset in range(60):
+        day = (datetime(2026, 9, 15, tzinfo=persona.tz) + timedelta(days=day_offset)).date()
+        daily = rhythm.for_day(day)
+        span = (daily.sleep_start - daily.wake).total_seconds()
+        if span <= 0:
+            continue
+        for seed in range(10):
+            life.rng = random.Random(day_offset * 100 + seed)
+            moment = life._sample_moment(kind, daily.wake, daily.sleep_start, day)
+            if moment is not None:
+                assert not rhythm.is_sleeping(moment), "抽到了她睡着的时候"
+                weighted.append(rhythm.activity_at(moment))
+            rng = random.Random(day_offset * 100 + seed)
+            uniform.append(
+                rhythm.activity_at(daily.wake + timedelta(seconds=rng.uniform(0, span)))
+            )
+
+    assert statistics.mean(weighted) > statistics.mean(uniform), (
+        f"加权之后平均活跃度没有提高：{statistics.mean(weighted):.3f} "
+        f"vs 均匀 {statistics.mean(uniform):.3f}"
+    )
