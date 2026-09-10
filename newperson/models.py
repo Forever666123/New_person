@@ -19,6 +19,45 @@ RhythmState = Literal["sleeping", "busy", "free", "winding_down"]
 Heat = Literal["hot", "warm", "cold"]
 
 
+PeriodKind = Literal["in_session", "finals", "break", "summer"]
+
+
+class AcademicPeriod(BaseModel):
+    """学期日历上的一段：上课、期末周、假期、暑假。"""
+
+    name: str
+    kind: PeriodKind
+    start: date
+    end: date
+    """含当天。"""
+    activity_multiplier: float = 1.0
+    engage_multiplier: float = 1.0
+    sleep_bonus_hours: float = 0.0
+    """这段时间平均多睡多久。假期会睡得多一些。"""
+    note: str = ""
+    travel: Literal["none", "short", "long"] = "none"
+    """这段假期有没有可能出门，出远门还是近门。"""
+
+    def contains(self, day: date) -> bool:
+        return self.start <= day <= self.end
+
+
+class Trip(BaseModel):
+    """一次出行。旅行期间她人在别的时区，作息和话题都会跟着变。"""
+
+    start: date
+    end: date
+    place: str
+    timezone: str
+    note: str = ""
+    kind: Literal["short", "long"] = "short"
+    activity_multiplier: float = 1.0
+    """在外面玩的时候看手机更少。住下来的长途影响小一些。"""
+
+    def contains(self, day: date) -> bool:
+        return self.start <= day <= self.end
+
+
 class ClassInstance(BaseModel):
     """某一天真的发生了的一节课。"""
 
@@ -31,6 +70,13 @@ class DailyRhythm(BaseModel):
     """某一天抽签抽出来的作息。同一天同一 seed 抽出来的结果永远相同。"""
 
     day: date
+    period: str = ""
+    """学期日历上的哪一段。"""
+    period_kind: PeriodKind = "in_session"
+    trip: Trip | None = None
+    """今天在不在外面。"""
+    timezone: str = ""
+    """当天她所在的时区。旅行时会变。"""
     phase: str = "平常"
     phase_note: str = ""
     variant: str = ""
@@ -43,10 +89,15 @@ class DailyRhythm(BaseModel):
     engage_probability: float = 0.85
     classes: list[ClassInstance] = Field(default_factory=list)
 
+    period_note: str = ""
+
     @property
     def mood_notes(self) -> list[str]:
-        """今天注入上下文的心态提示，阶段在前，当日变体在后。"""
-        return [n for n in (self.phase_note, self.variant_note) if n]
+        """今天注入上下文的心态提示，从大到小：学期、出行、阶段、当日。"""
+        notes = [self.period_note, self.phase_note, self.variant_note]
+        if self.trip and self.trip.note:
+            notes.insert(1, self.trip.note)
+        return [n for n in notes if n]
 
 
 class RhythmSnapshot(BaseModel):
@@ -60,8 +111,11 @@ class RhythmSnapshot(BaseModel):
     next_sleep: datetime
     activity: float
     """此刻"会看手机"的活跃度，0 到 1。"""
+    period: str = ""
     phase: str = ""
     variant: str = ""
+    trip_place: str = ""
+    """在外面的话，人在哪。"""
     mood_notes: list[str] = Field(default_factory=list)
     block_title: str | None = None
     """当前 busy 区间的标题，非 busy 时为 None。"""

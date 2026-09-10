@@ -19,8 +19,30 @@ def test_mid_sentence_period_becomes_a_breath(persona: Persona) -> None:
     assert sg.sanitize("知道了。你先睡。", persona.style) == "知道了 你先睡"
 
 
-def test_removes_emoji_and_exclamation(persona: Persona) -> None:
-    assert sg.sanitize("好啊！😄", persona.style) == "好啊"
+def test_keeps_one_emoji(persona: Persona) -> None:
+    """年轻人不可能一个 emoji 都不用。偶尔一个是正常的。"""
+    fixed, needs = sg.enforce(parts("好啊 😄"), persona.style, persona.boundaries)
+    assert not needs
+    assert "😄" in fixed[0].text
+
+
+def test_trims_emoji_spam_in_one_bubble(persona: Persona) -> None:
+    """一条里塞五个就不像她了，削到一个。"""
+    fixed, _ = sg.enforce(parts("哈哈😂😂😂🤣😅"), persona.style, persona.boundaries)
+    assert sg.count_emoji(fixed[0].text) == 1
+
+
+def test_only_one_bubble_carries_emoji(persona: Persona) -> None:
+    """一次回复里最多一条带 emoji，后面的削掉。"""
+    fixed, _ = sg.enforce(parts("行😄", "那我先去洗澡😴"), persona.style, persona.boundaries)
+    assert sum(sg.count_emoji(p.text) for p in fixed) == 1
+
+
+def test_emoji_can_be_switched_off_entirely(persona: Persona) -> None:
+    """把预算设成 0 就是完全不用，给别的人设留的口子。"""
+    style = persona.style.model_copy(update={"emoji_budget": 0.0})
+    fixed, _ = sg.enforce(parts("好啊 😄"), style, persona.boundaries)
+    assert sg.count_emoji(fixed[0].text) == 0
 
 
 def test_keeps_decimals_intact(persona: Persona) -> None:
@@ -49,8 +71,23 @@ def test_word_level_english_is_fine(persona: Persona) -> None:
     assert not needs
 
 
-def test_full_english_sentence_is_not(persona: Persona) -> None:
-    _, needs = sg.enforce(parts("i think you should stop"), persona.style, persona.boundaries)
+def test_clean_reply_keeps_its_question_mark(persona: Persona) -> None:
+    fixed, _ = sg.enforce(parts("记了吗？"), persona.style, persona.boundaries)
+    assert fixed[0].text == "记了吗？"
+
+
+def test_a_short_english_line_is_fine(persona: Persona) -> None:
+    """她在美国待了好几年，冒一句短的很正常。"""
+    _, needs = sg.enforce(parts("yeah my bad"), persona.style, persona.boundaries)
+    assert not needs
+
+
+def test_a_whole_english_paragraph_is_not(persona: Persona) -> None:
+    _, needs = sg.enforce(
+        parts("i really think you should stop trading this week and take a break"),
+        persona.style,
+        persona.boundaries,
+    )
     assert [v.kind for v in needs] == ["full_english"]
 
 

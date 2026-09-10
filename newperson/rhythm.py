@@ -29,6 +29,7 @@ import random
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from .calendar import AcademicCalendar
 from .models import ClassInstance, DailyRhythm, RhythmSnapshot
 from .persona import DayVariant, LifePhase, RhythmConfig, hhmm_to_minutes
 
@@ -40,10 +41,18 @@ _PHASE_EPOCH = date(2025, 1, 1)
 
 
 class Rhythm:
-    def __init__(self, config: RhythmConfig, tz: ZoneInfo, seed: int = 0) -> None:
+    def __init__(
+        self,
+        config: RhythmConfig,
+        tz: ZoneInfo,
+        seed: int = 0,
+        calendar: AcademicCalendar | None = None,
+    ) -> None:
         self.config = config
         self.tz = tz
+        """家里的时区。旅行时当天的时区见 :meth:`tz_for`。"""
         self.seed = seed
+        self.calendar = calendar
         self._cache: dict[date, DailyRhythm] = {}
         self._phase_spans: list[tuple[int, int, LifePhase]] = []
 
@@ -65,8 +74,12 @@ class Rhythm:
         return items[-1]
 
     def phase_for(self, day: date) -> LifePhase:
-        """这一天处在哪个阶段。阶段序列从 ``_PHASE_EPOCH`` 起确定性推演。"""
-        phases = self.config.phases
+        """这一天处在哪个阶段。阶段序列从 ``_PHASE_EPOCH`` 起确定性推演。
+
+        放假期间排除掉只在上课期出现的阶段（比如"赶 due"）。
+        """
+        in_session = self.calendar.in_session(day) if self.calendar else True
+        phases = [p for p in self.config.phases if in_session or not p.only_in_session]
         if not phases:
             return LifePhase(name="平常")
         if day < _PHASE_EPOCH:
@@ -76,20 +89,32 @@ class Rhythm:
         if self._phase_spans and self._phase_spans[-1][1] > target:
             for start, end, phase in self._phase_spans:
                 if start <= target < end:
-                    return phase
+                    return phase if phase in phases else phases[0]
 
         cursor = self._phase_spans[-1][1] if self._phase_spans else 0
         while cursor <= target and len(self._phase_spans) < 100_000:
             rng = random.Random(self.seed * 7_919 + cursor)
-            phase = self._weighted_choice(phases, rng)
+            phase = self._weighted_choice(self.config.phases or phases, rng)
             length = rng.randint(phase.min_days, max(phase.min_days, phase.max_days))
             self._phase_spans.append((cursor, cursor + length, phase))
             cursor += length
-        return self._phase_spans[-1][2]
+        found = self._phase_spans[-1][2]
+        return found if found in phases else phases[0]
+
+    def tz_for(self, day: date) -> ZoneInfo:
+        """这一天她人在哪个时区。放假飞去别的地方，作息就跟着那边走。"""
+        if self.calendar is None:
+            return self.tz
+        return ZoneInfo(self.calendar.timezone_for(day))
+
+    def local_date(self, dt: datetime) -> date:
+        """dt 落在她当地的哪一天。先按家里的时区粗算，再用当天的时区校正。"""
+        rough = dt.astimezone(self.tz).date()
+        return dt.astimezone(self.tz_for(rough)).date()
 
     def _at(self, day: date, minutes: float) -> datetime:
         """把"当天第 N 分钟"变成带时区的时刻，允许跨日。"""
-        base = datetime.combine(day, time(0, 0), tzinfo=self.tz)
+        base = datetime.combine(day, time(0, 0), tzinfo=self.tz_for(day))
         return base + timedelta(minutes=minutes)
 
     def _raw_night(self, day: date) -> tuple[datetime, datetime, DayVariant, LifePhase]:
@@ -129,6 +154,8 @@ class Rhythm:
 
         cfg = self.config
         wake, sleep_start, chosen, phase = self._raw_night(day)
+        period = self.calendar.period_for(day) if self.calendar else None
+        trip = self.calendar.trip_for(day) if self.calendar else None
 
         # 起床时刻不能和昨晚的入睡时刻各管各的，否则会抽出"四点睡七点起"这种。
         # 真人睡得晚就起得晚，但也不是全跟着走：有课有闹钟，生物钟会把人拉回来。
@@ -137,7 +164,7 @@ class Rhythm:
         target_sleep = timedelta(
             minutes=(hhmm_to_minutes(cfg.sleep.wake_median) - hhmm_to_minutes(cfg.sleep.start_median))
             % (24 * 60)
-        )
+        ) + timedelta(hours=period.sleep_bonus_hours if period else 0.0)
         follow = prev_sleep_start + target_sleep
         w = cfg.sleep_follow_weight
         wake = follow + (wake - follow) * (1 - w)
@@ -154,7 +181,8 @@ class Rhythm:
 
         classes: list[ClassInstance] = []
         rng = random.Random(self.seed * 1_000_003 + day.toordinal() + 17)
-        for block in cfg.classes:
+        has_class = self.calendar.in_session(day) if self.calendar else True
+        for block in cfg.classes if has_class else []:
             if day.weekday() not in block.days:
                 continue
             if rng.random() > block.probability:
@@ -174,14 +202,30 @@ class Rhythm:
         )
         daily = DailyRhythm(
             day=day,
+            period=period.name if period else "",
+            period_kind=period.kind if period else "in_session",
+            period_note=period.note if period else "",
+            trip=trip,
+            timezone=str(self.tz_for(day)),
             phase=phase.name,
             phase_note=phase.note,
             variant=chosen.name,
             variant_note=chosen.note,
             wake=wake,
             sleep_start=sleep_start,
-            activity_multiplier=chosen.activity_multiplier * phase.activity_multiplier,
-            engage_probability=max(0.05, min(1.0, engage * phase.engage_multiplier)),
+            activity_multiplier=(
+                chosen.activity_multiplier
+                * phase.activity_multiplier
+                * (period.activity_multiplier if period else 1.0)
+                * (trip.activity_multiplier if trip else 1.0)
+            ),
+            engage_probability=max(
+                0.05,
+                min(
+                    1.0,
+                    engage * phase.engage_multiplier * (period.engage_multiplier if period else 1.0),
+                ),
+            ),
             classes=classes,
         )
         self._cache[day] = daily
@@ -195,7 +239,7 @@ class Rhythm:
 
     def logical_day(self, dt: datetime) -> date:
         """凌晨还没睡的时间算作前一天。用来取当日变体。"""
-        d = dt.astimezone(self.tz).date()
+        d = self.local_date(dt)
         return d - timedelta(days=1) if dt < self.wake_of(d) else d
 
     def daily_for(self, dt: datetime) -> DailyRhythm:
@@ -203,7 +247,7 @@ class Rhythm:
 
     def sleep_window_containing(self, dt: datetime) -> tuple[datetime, datetime] | None:
         """若 dt 处于某一觉之中，返回 ``(入睡, 起床)``；否则 None。"""
-        d = dt.astimezone(self.tz).date()
+        d = self.local_date(dt)
         for offset in (-1, 0, 1):
             start = self.for_day(d + timedelta(days=offset)).sleep_start
             end = self.for_day(d + timedelta(days=offset + 1)).wake
@@ -225,7 +269,7 @@ class Rhythm:
         if self.is_sleeping(dt):
             return 0.0
         daily = self.daily_for(dt)
-        local = dt.astimezone(self.tz)
+        local = dt.astimezone(self.tz_for(daily.day))
         minute_of_day = local.hour * 60 + local.minute
 
         base = (
@@ -240,7 +284,7 @@ class Rhythm:
         window = self.sleep_window_containing(dt)
         if window is not None:
             return window[1]
-        d = dt.astimezone(self.tz).date()
+        d = self.local_date(dt)
         for offset in range(0, _SEARCH_LIMIT):
             wake = self.for_day(d + timedelta(days=offset)).wake
             if wake > dt:
@@ -249,7 +293,7 @@ class Rhythm:
 
     def next_sleep_after(self, dt: datetime) -> datetime:
         """dt 之后的下一次入睡。"""
-        d = dt.astimezone(self.tz).date()
+        d = self.local_date(dt)
         for offset in range(-1, _SEARCH_LIMIT):
             start = self.for_day(d + timedelta(days=offset)).sleep_start
             if start > dt:
@@ -272,8 +316,10 @@ class Rhythm:
                 next_wake=next_wake,
                 next_sleep=next_sleep,
                 activity=0.0,
+                period=daily.period,
                 phase=daily.phase,
                 variant=daily.variant,
+                trip_place=daily.trip.place if daily.trip else "",
                 mood_notes=daily.mood_notes,
             )
 
@@ -286,8 +332,10 @@ class Rhythm:
                 next_wake=next_wake,
                 next_sleep=next_sleep,
                 activity=activity,
+                period=daily.period,
                 phase=daily.phase,
                 variant=daily.variant,
+                trip_place=daily.trip.place if daily.trip else "",
                 mood_notes=daily.mood_notes,
                 block_title=block.title,
             )
@@ -303,8 +351,10 @@ class Rhythm:
             next_wake=next_wake,
             next_sleep=next_sleep,
             activity=activity,
+            period=daily.period,
             phase=daily.phase,
             variant=daily.variant,
+            trip_place=daily.trip.place if daily.trip else "",
             mood_notes=daily.mood_notes,
         )
 

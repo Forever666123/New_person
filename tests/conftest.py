@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from newperson.calendar import AcademicCalendar
 from newperson.clock import FakeClock
 from newperson.persona import Persona, load_persona
 from newperson.rhythm import Rhythm
@@ -22,8 +23,13 @@ def persona() -> Persona:
 
 
 @pytest.fixture
-def rhythm(persona: Persona) -> Rhythm:
-    return Rhythm(persona.rhythm, persona.tz, persona.seed)
+def calendar(persona: Persona) -> AcademicCalendar:
+    return AcademicCalendar(persona.academic, persona.seed)
+
+
+@pytest.fixture
+def rhythm(persona: Persona, calendar: AcademicCalendar) -> Rhythm:
+    return Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
 
 
 @pytest.fixture

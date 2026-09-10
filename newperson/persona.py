@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from .models import AcademicPeriod
+
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -135,6 +137,8 @@ class LifePhase(BaseModel):
     activity_multiplier: float = 1.0
     engage_multiplier: float = 1.0
     note: str = ""
+    only_in_session: bool = False
+    """只在上课期间可能抽到。放假的时候不该有"赶 due"这种阶段。"""
 
 
 class DayVariant(BaseModel):
@@ -160,7 +164,7 @@ class RhythmConfig(BaseModel):
     """上课时段的默认活跃度（偷偷回一句的程度）。"""
     classes: list[ClassBlock] = Field(default_factory=list)
     variants: list[DayVariant] = Field(default_factory=list)
-    sleep_follow_weight: float = 0.65
+    sleep_follow_weight: float = 0.8
     """起床时刻有多跟着昨晚的入睡走。0 是完全按生物钟，1 是完全跟着昨晚。
 
     真人介于两者之间：熬夜会起得晚，但有课有闹钟，不会一路睡到下午。
@@ -183,27 +187,75 @@ class RhythmConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 学期日历与出行
+# ---------------------------------------------------------------------------
+
+
+class TravelSpot(BaseModel):
+    place: str
+    timezone: str = ""
+    note: str = ""
+
+
+class TravelConfig(BaseModel):
+    """放假出门的设定。假期长短决定走多远。"""
+
+    short_trips: list[TravelSpot] = Field(default_factory=list)
+    long_trips: list[TravelSpot] = Field(default_factory=list)
+    short_probability: float = 0.5
+    long_probability: float = 0.8
+    short_min_days: int = 3
+    short_max_days: int = 6
+    long_min_days: int = 7
+    long_max_days: int = 18
+    short_activity_multiplier: float = 0.7
+    """短途玩得紧凑，手机看得少。"""
+    long_activity_multiplier: float = 0.9
+    """长途住下来了，跟平时差不多。"""
+
+
+class FallbackYear(BaseModel):
+    """超出显式配置的年份，用这套典型日期推算，免得人物跑过一学年就没日历了。"""
+
+    fall: tuple[str, str] = ("09-02", "12-20")
+    spring: tuple[str, str] = ("01-13", "05-01")
+
+
+class AcademicConfig(BaseModel):
+    home_timezone: str = "America/New_York"
+    periods: list[AcademicPeriod] = Field(default_factory=list)
+    fallback: FallbackYear = Field(default_factory=FallbackYear)
+    travel: TravelConfig = Field(default_factory=TravelConfig)
+
+
+# ---------------------------------------------------------------------------
 # 说话风格（机械约束在 style_guard 里执行）
 # ---------------------------------------------------------------------------
 
 
 class StyleConfig(BaseModel):
+    """说话的机械约束。
+
+    用**预算**而不是开关：偶尔一个 emoji、偶尔一个感叹号是年轻人的正常说话方式，
+    满屏才不正常。把某个预算设成 0 就等于完全禁止。
+    """
+
     max_parts: int = 2
     """一次最多发几条气泡。"""
     extra_part_probability: float = 0.15
-    """偶尔多发一条的概率。"""
     long_sentence_chars: int = 20
     """超过这个字数算"长句"。长句应当罕见，出现时说明是重话。"""
     long_sentence_budget: float = 0.08
-    """允许多大比例的句子是长句，超了就交给 style_guard 处理。"""
     strip_trailing_period: bool = True
     """去掉句尾的句号。"""
-    forbid_emoji: bool = True
-    forbid_exclamation: bool = True
+    emoji_budget: float = 0.2
+    """多大比例的气泡可以带 emoji。0 表示完全不用。"""
+    max_emoji_per_part: int = 1
+    exclamation_budget: float = 0.15
     allow_reactions: bool = True
-    """允许给对方的消息加 Discord 表情反应。不用 emoji 的人物应该关掉。"""
-    forbid_full_english_sentence: bool = True
-    """允许词级中英夹杂，不允许整句英文。"""
+    """允许给对方的消息加 Discord 表情反应。"""
+    english_sentence_max_words: int = 5
+    """纯英文句子最多几个词。短的没问题，整段英文就不像她了。0 表示不限制。"""
     english_words_allowed: list[str] = Field(default_factory=list)
     typing_chars_per_second: float = 2.6
     """打字速度，手机打字比键盘慢。"""
@@ -282,11 +334,25 @@ class TimingConfig(BaseModel):
     """连续聊多久之后开始变慢、想收尾。"""
     hot_seconds: float = 180.0
     warm_seconds: float = 2700.0
+    hot_reply_median_seconds: float = 75.0
+    """正在聊的时候，隔多久回一句。
+
+    没有秒回这回事：手机拿起来放下、打字、被别的事岔开，
+    中位数一分多钟，三五分钟才回也很常见。
+    """
+    hot_reply_sigma: float = 0.8
 
 
 class MemoryConfig(BaseModel):
     recent_messages: int = 40
     summarize_after: int = 60
+    fact_half_life_days: float = 45.0
+    """一条事实多久淡一半。提起来会重新变清晰。"""
+    fact_recall_threshold: float = 0.25
+    """淡到这个程度以下就不再带进上下文，等于想不起来了。
+
+    这是故意的。一个什么都记得的人，聊天就没意思了。
+    """
 
 
 class OwnerInfo(BaseModel):
@@ -325,6 +391,7 @@ class Persona(BaseModel):
     """她自己的边界，写成描述。"""
 
     owner: OwnerInfo = Field(default_factory=OwnerInfo)
+    academic: AcademicConfig = Field(default_factory=AcademicConfig)
     rhythm: RhythmConfig = Field(default_factory=RhythmConfig)
     style: StyleConfig = Field(default_factory=StyleConfig)
     boundaries: Boundaries = Field(default_factory=Boundaries)

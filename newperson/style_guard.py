@@ -1,20 +1,24 @@
 """说话风格的最后一道关。
 
-为什么需要它：如果把"不许用 emoji、不许打句号、不许说加油"这类规则一条条塞进提示词，
-模型会写得非常拘谨，句子变得僵硬，反而更不像人。所以分工是：
+为什么需要它：如果把"少用 emoji、别打句号、别说加油"这类规则一条条塞进提示词，
+模型会写得非常拘谨，句子变僵，反而更不像人。所以分工是：
 
 - **提示词**负责描述她是个什么样的人，让模型自由发挥。
-- **这里**负责在消息发出去之前，把不符合她习惯的地方拦下来。
+- **这里**负责在消息发出去之前，把明显不像她的地方拦下来。
 
-拦下来之后分两种处理：
+拦下来分两种处理：
 
-- 能机械修的（句尾句号、emoji、感叹号）直接修掉，不惊动模型。
-- 不能机械修的（说了"加油"、整句英文、句子太长）返回违规清单，
-  由 ``brain`` 带着这份清单让模型重写一次。重写还不过就退回到机械修剪。
+- 能机械修的（句尾句号、emoji 刷屏、感叹号刷屏）直接修，不惊动模型。
+- 不能机械修的（说了 ``never_say`` 里的话、整段英文、长句超预算）返回违规清单，
+  由 ``brain`` 带着清单让模型重写一次。重写还不过就退回机械修剪，不会卡住。
+
+**用预算，不用开关。** 偶尔一个 emoji、偶尔一个感叹号是年轻人的正常说话方式，
+满屏才不正常。频率交给提示词，这里只管上限。把预算设成 0 就等于完全禁止。
 """
 
 from __future__ import annotations
 
+import math
 import re
 
 from .models import ReplyPart, StyleViolation
@@ -29,55 +33,90 @@ _EMOJI = re.compile(
     "\U0000fe0f"
     "\U00002190-\U000021ff"
     "\U00002300-\U000023ff"
-    "]+"
+    "]"
 )
 _CJK = re.compile(r"[一-鿿]")
 _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
 _SENTENCE_SPLIT = re.compile(r"[。！？!?\n]+")
-_TRAILING_PUNCT = re.compile(r"[。\.！!\s]+$")
+_TRAILING_PUNCT = re.compile(r"[。\.\s]+$")
 
 
-def strip_emoji(text: str) -> str:
-    return _EMOJI.sub("", text)
+def count_emoji(text: str) -> int:
+    return len(_EMOJI.findall(text))
+
+
+def count_exclamations(text: str) -> int:
+    return text.count("！") + text.count("!")
+
+
+def budget_for(part_count: int, ratio: float) -> int:
+    """一次回复里，最多几条气泡可以带这种东西。
+
+    ``ratio`` 为 0 表示一条都不行。否则至少允许一条，
+    因为她一次本来就只发一两条，按比例算会直接归零。
+    """
+    if ratio <= 0:
+        return 0
+    return max(1, round(part_count * ratio))
 
 
 def normalize_punctuation(text: str, style: StyleConfig) -> str:
-    """按她的习惯清理标点：不打句号，不用感叹号。
+    """按她的习惯清理句号：句中的变成空格（换口气继续说），句尾的直接去掉。
 
-    句中的句号和感叹号变成空格（等于她换一口气继续说），句尾的直接去掉。
-    英文句点只动句尾，免得把小数和缩写改坏。
+    英文句点只动句尾，免得把小数和缩写改坏。问号一律保留，她问问题是表达在意的方式。
     """
-    out = text
-    if style.forbid_exclamation:
-        out = out.replace("！", " ").replace("!", " ")
-    if style.strip_trailing_period:
-        out = out.replace("。", " ")
-        out = _TRAILING_PUNCT.sub("", out)
-    # 清理连续空格，但保留换行
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    return out.strip()
+    if not style.strip_trailing_period:
+        return text.strip()
+    out = text.replace("。", " ")
+    out = _TRAILING_PUNCT.sub("", out)
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+def trim_emoji(text: str, keep: int) -> str:
+    """只保留前 ``keep`` 个 emoji，多的删掉。"""
+    if keep <= 0:
+        return _EMOJI.sub("", text)
+    seen = 0
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal seen
+        seen += 1
+        return match.group(0) if seen <= keep else ""
+
+    return _EMOJI.sub(repl, text)
+
+
+def trim_exclamations(text: str, keep: int) -> str:
+    out = []
+    seen = 0
+    for ch in text:
+        if ch in "！!":
+            seen += 1
+            if seen > keep:
+                out.append(" ")
+                continue
+        out.append(ch)
+    return re.sub(r"[ \t]{2,}", " ", "".join(out)).strip()
 
 
 def sanitize(text: str, style: StyleConfig) -> str:
-    """机械清理。不改变语义，只改标点和 emoji。"""
-    out = text
-    if style.forbid_emoji:
-        out = strip_emoji(out)
-    out = normalize_punctuation(out, style)
-    return out
+    """单条气泡的机械清理。不改语义，只管标点和 emoji 上限。"""
+    out = trim_emoji(text, style.max_emoji_per_part if style.emoji_budget > 0 else 0)
+    if style.exclamation_budget <= 0:
+        out = trim_exclamations(out, 0)
+    return normalize_punctuation(out, style)
 
 
 def sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
 
 
-def is_full_english(text: str, style: StyleConfig) -> bool:
-    """整句英文才算违规，词级夹杂是她的正常说话方式。"""
-    if not style.forbid_full_english_sentence:
+def is_too_english(text: str, style: StyleConfig) -> bool:
+    """整段英文才算违规。夹几个英文词是她的正常说话方式。"""
+    limit = style.english_sentence_max_words
+    if limit <= 0 or _CJK.search(text):
         return False
-    if _CJK.search(text):
-        return False
-    return len(_LATIN_WORD.findall(text)) >= 3
+    return len(_LATIN_WORD.findall(text)) > limit
 
 
 def check(
@@ -91,6 +130,28 @@ def check(
             StyleViolation(
                 kind="too_many_parts",
                 detail=f"一次发了 {len(parts)} 条，她一般最多 {style.max_parts} 条",
+                fixable=True,
+            )
+        )
+
+    emoji_budget = budget_for(len(parts), style.emoji_budget)
+    exclaim_budget = budget_for(len(parts), style.exclamation_budget)
+    emoji_parts = sum(1 for p in parts if count_emoji(p.text))
+    exclaim_parts = sum(1 for p in parts if count_exclamations(p.text))
+
+    if emoji_parts > emoji_budget:
+        issues.append(
+            StyleViolation(
+                kind="emoji",
+                detail=f"{emoji_parts} 条带 emoji，她一次最多 {emoji_budget} 条",
+                fixable=True,
+            )
+        )
+    if exclaim_parts > exclaim_budget:
+        issues.append(
+            StyleViolation(
+                kind="exclamation",
+                detail=f"{exclaim_parts} 条带感叹号，她很少用",
                 fixable=True,
             )
         )
@@ -112,21 +173,21 @@ def check(
                     )
                 )
 
-        if style.forbid_emoji and _EMOJI.search(text):
+        if count_emoji(text) > style.max_emoji_per_part:
             issues.append(
-                StyleViolation(kind="emoji", detail="出现 emoji", part_index=i, fixable=True)
+                StyleViolation(
+                    kind="emoji",
+                    detail=f"一条里塞了 {count_emoji(text)} 个 emoji",
+                    part_index=i,
+                    fixable=True,
+                )
             )
 
-        if style.forbid_exclamation and ("！" in text or "!" in text):
-            issues.append(
-                StyleViolation(kind="exclamation", detail="出现感叹号", part_index=i, fixable=True)
-            )
-
-        if is_full_english(text, style):
+        if is_too_english(text, style):
             issues.append(
                 StyleViolation(
                     kind="full_english",
-                    detail="整句英文，她只做词级夹杂",
+                    detail="整段英文，她只是夹几个词",
                     part_index=i,
                     fixable=False,
                 )
@@ -138,7 +199,7 @@ def check(
                 long_sentences.append((i, sentence))
 
     # 长句本身不违规，超出预算才违规。她偶尔说重话，那是有意义的。
-    budget = max(1, int(all_sentences * style.long_sentence_budget + 0.999))
+    budget = max(1, math.ceil(all_sentences * style.long_sentence_budget))
     if len(long_sentences) > budget:
         for i, sentence in long_sentences[budget:]:
             issues.append(
@@ -154,13 +215,33 @@ def check(
 
 
 def apply_fixes(parts: list[ReplyPart], style: StyleConfig) -> list[ReplyPart]:
-    """把能机械修的都修掉，并丢弃修完变空的气泡。"""
+    """把能机械修的都修掉，并丢弃修完变空的气泡。
+
+    超预算的 emoji 和感叹号从**后面**的气泡开始削，第一条留着，
+    因为一段话里最像人的那个表情通常在开头。
+    """
+    emoji_budget = budget_for(len(parts), style.emoji_budget)
+    exclaim_budget = budget_for(len(parts), style.exclamation_budget)
+    emoji_used = exclaim_used = 0
+
     fixed: list[ReplyPart] = []
     for part in parts:
-        text = sanitize(part.text, style)
+        text = part.text
+
+        if count_emoji(text):
+            emoji_used += 1
+            keep = style.max_emoji_per_part if emoji_used <= emoji_budget else 0
+            text = trim_emoji(text, keep)
+        if count_exclamations(text):
+            exclaim_used += 1
+            if exclaim_used > exclaim_budget:
+                text = trim_exclamations(text, 0)
+
+        text = normalize_punctuation(text, style)
         if not text and "{photo}" not in part.text:
             continue
         fixed.append(ReplyPart(text=text, pause_before_seconds=part.pause_before_seconds))
+
     if len(fixed) > style.max_parts + 1:
         # 超出的合并进最后一条，而不是直接丢掉内容
         head = fixed[: style.max_parts]
@@ -199,7 +280,6 @@ def describe_for_rewrite(violations: list[StyleViolation]) -> str:
     if not violations:
         return ""
     lines = ["刚才那版不像你说的话，问题在这几处："]
-    for v in violations:
-        lines.append(f"- {v.detail}")
+    lines += [f"- {v.detail}" for v in violations]
     lines.append("重写一遍。别解释，直接给新的。")
     return "\n".join(lines)

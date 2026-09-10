@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from newperson.calendar import AcademicCalendar
 from newperson.persona import Persona
 from newperson.rhythm import Rhythm
 
@@ -24,13 +25,13 @@ def test_same_day_always_samples_the_same(rhythm: Rhythm, persona: Persona) -> N
     """同一天反复查必须一致，否则重启后人物的作息会变。"""
     day = days(persona)[3]
     first = rhythm.for_day(day)
-    fresh = Rhythm(persona.rhythm, persona.tz, persona.seed)
+    fresh = Rhythm(persona.rhythm, persona.tz, persona.seed, AcademicCalendar(persona.academic, persona.seed))
     assert fresh.for_day(day) == first
 
 
 def test_different_seed_gives_a_different_life(persona: Persona) -> None:
-    a = Rhythm(persona.rhythm, persona.tz, persona.seed)
-    b = Rhythm(persona.rhythm, persona.tz, persona.seed + 1)
+    a = Rhythm(persona.rhythm, persona.tz, persona.seed, AcademicCalendar(persona.academic, persona.seed))
+    b = Rhythm(persona.rhythm, persona.tz, persona.seed + 1, AcademicCalendar(persona.academic, persona.seed + 1))
     day = days(persona)[0]
     assert a.for_day(day).sleep_start != b.for_day(day).sleep_start
 
@@ -78,6 +79,14 @@ def test_a_phase_lasts_several_days(rhythm: Rhythm, persona: Persona) -> None:
 def test_every_phase_shows_up(rhythm: Rhythm, persona: Persona) -> None:
     seen = {rhythm.for_day(d).phase for d in days(persona, 400)}
     assert seen == {p.name for p in persona.rhythm.phases}
+
+
+def test_no_deadline_crunch_during_a_break(rhythm: Rhythm, persona: Persona) -> None:
+    """放假的时候不该有"赶 due"这种阶段。"""
+    for d in days(persona, 300):
+        daily = rhythm.for_day(d)
+        if daily.period_kind in ("break", "summer"):
+            assert daily.phase != "赶due"
 
 
 def test_a_busy_phase_lowers_activity(rhythm: Rhythm, persona: Persona) -> None:

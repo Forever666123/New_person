@@ -1,3 +1,21 @@
+# ---- 说话的机械约束，由 style_guard 执行 ----
+# 用预算不用开关：偶尔一个 emoji 是正常的，满屏才不正常。
+# 频率交给提示词描述，这里只管上限。设成 0 就是完全禁止。
+style:
+  max_parts: 3
+  extra_part_probability: 0.15
+  long_sentence_chars: 30
+  long_sentence_budget: 0.2
+  strip_trailing_period: false
+  emoji_budget: 0.5            # 一次回复里最多几条气泡带 emoji（按比例，至少 1）
+  max_emoji_per_part: 2
+  exclamation_budget: 0.5
+  allow_reactions: true
+  english_sentence_max_words: 0   # 0 表示不限制整句英文
+  english_words_allowed: []
+  typing_chars_per_second: 2.6
+  typo_probability: 0.05
+
 # 人物设定模板。复制成 persona/persona.yaml 再改。
 # 已经有一份填好的真实例子：persona/persona.yaml（沈亦宁）。
 #
@@ -35,6 +53,28 @@ owner:
   does_not_ask: |
     【待填】人物不知道、也不会问的事。
 
+# ---- 学期日历（可选）----
+# 学生人物才需要。填了之后：假期没课、期末周话少、放长假会出门去别的时区。
+# 不是学生就整段删掉，或者把 periods 留空只写 fallback。
+academic:
+  home_timezone: "Asia/Shanghai"
+  periods: []
+  # 例：
+  #   - {name: 秋季学期, kind: in_session, start: 2026-09-02, end: 2026-12-11}
+  #   - {name: 期末周, kind: finals, start: 2026-12-12, end: 2026-12-20,
+  #      activity_multiplier: 0.5, note: 期末周，你在赶 due。}
+  #   - {name: 寒假, kind: break, start: 2026-12-21, end: 2027-01-12,
+  #      sleep_bonus_hours: 1.2, travel: long, note: 放假了。}
+  fallback:                      # 超出 periods 范围的年份按这个推算
+    fall: ["09-02", "12-20"]
+    spring: ["01-13", "05-01"]
+  travel:
+    short_probability: 0.5
+    long_probability: 0.8
+    short_trips: []
+    long_trips: []
+    # 例：{place: 东京, timezone: Asia/Tokyo, note: 你在东京玩。}
+
 # ---- 作息：分布 + 每日抽签 ----
 rhythm:
   sleep:
@@ -60,19 +100,28 @@ rhythm:
   classes:
     - {days: [0, 1, 2, 3, 4], start: "09:30", end: "18:00", title: 上班, probability: 0.95}
 
-  # 每天抽一个。这是"不要出现精确规律"的主要来源，别删空。
+  # 阶段：跨好几天的状态。忙是成片的，不是每天重新掷骰子。
+  phases:
+    - {name: 平常, weight: 55, min_days: 5, max_days: 14}
+    - {name: 忙, weight: 28, min_days: 4, max_days: 9, only_in_session: true,
+       activity_multiplier: 0.6, note: 你最近很忙。}
+    - {name: 松, weight: 17, min_days: 3, max_days: 7, activity_multiplier: 1.2}
+
+  # 当日变体。在阶段之上做单日扰动，别删空，否则每天都一样。
   variants:
     - {name: 普通, weight: 50}
     - {name: 熬夜, weight: 12, sleep_start_shift_hours: 2.5, note: 你昨晚熬得很晚。}
     - {name: 早起, weight: 8, wake_shift_hours: -2}
     - {name: 忙, weight: 14, activity_multiplier: 0.45, note: 你今天事情很多。}
-    - {name: 消失, weight: 6, activity_multiplier: 0.12, reply_probability: 0.25,
-       note: 你今天不想理人。不用解释，回来的时候直接接着说。}
+    - {name: 累, weight: 6, activity_multiplier: 0.5, engage_probability: 0.5,
+       note: 你今天有点累，不太想说话。}
     - {name: 闲, weight: 10, activity_multiplier: 1.5}
 
   base_glance_minutes: 8       # 活跃度为 1 时看手机的间隔中位数
   glance_sigma: 0.6
-  reply_probability: 0.9       # 看到了也有可能就是没回
+  sleep_follow_weight: 0.8     # 起床有多跟着昨晚的入睡走
+  engage_probability: 0.85     # 看到了当场处理的概率。没中就先放着，下次看手机再说
+  max_defers: 3
   winding_down_minutes: 60
   min_activity_to_glance: 0.02
 
