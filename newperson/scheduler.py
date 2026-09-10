@@ -1,25 +1,45 @@
-"""持久化定时任务：把 Job 存进 Memory，到点交给注册的 handler 执行。
+"""持久化定时任务：到点了把 Job 交给对应的 handler。
 
-- 单协程循环：取到期任务 → 标 running → 执行 → done / 失败重试（最多 3 次，间隔 1、3、9 分钟，乘 delay_scale）。
-- 有新任务加入或改时间时通过 ``asyncio.Event`` 唤醒循环，不用轮询太勤。
-- 启动时 ``memory.reset_running_jobs()``。
+几个要点：
+
+- **租约认领**。任务只能被抢到一次；抢到的一方拿着有期限的租约。
+  进程崩在任务中间，租约过期后任务自己回到队列，不会永远卡在 running。
+- **每会话单飞**。同一段对话同时只跑一个任务，免得回复和主动消息在同一个频道里交错发出。
+- **失败重试**。最多三次，间隔一分钟、三分钟、九分钟。对用户表现为"这会儿没看手机"，
+  绝不发任何错误文本出去。
+- **过期策略**。停机很久再启动时，堆积的回复要立刻处理，但过期太久的主动消息就作废了。
+  半夜想说的话第二天中午再冒出来会很怪。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .clock import Clock
 from .memory import Memory
 from .models import Job, JobKind
 
+log = logging.getLogger(__name__)
+
 Handler = Callable[[Job], Awaitable[None]]
 
 MAX_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (60, 180, 540)
+LEASE_SECONDS = 300.0
+IDLE_POLL_SECONDS = 60.0
+"""没有任何待办时的兜底轮询间隔。正常情况下靠事件唤醒。"""
+
+STALE_AFTER = {
+    "proactive": timedelta(hours=2),
+    "follow_up": timedelta(hours=6),
+    "sign_off": timedelta(minutes=30),
+}
+"""过期这么久就作废。半夜想说的话，第二天中午再发出来会很怪。"""
 
 
 class Scheduler:
@@ -29,29 +49,166 @@ class Scheduler:
         self.delay_scale = delay_scale
         self._handlers: dict[str, Handler] = {}
         self._wake = asyncio.Event()
+        self._locks: dict[str, asyncio.Lock] = {}
         self._stopped = False
 
+    # -- 注册与入队 ---------------------------------------------------------
+
     def register(self, kind: JobKind, handler: Handler) -> None:
-        raise NotImplementedError
+        self._handlers[kind] = handler
 
-    async def schedule(self, kind: JobKind, run_at: datetime, conversation_id: str | None = None,
-                       payload: dict[str, Any] | None = None) -> int:
-        """新建任务并唤醒循环，返回 job id。"""
-        raise NotImplementedError
+    async def schedule(
+        self,
+        kind: JobKind,
+        run_at: datetime,
+        conversation_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        dedupe_key: str | None = None,
+        reason: str = "",
+    ) -> int:
+        """新建任务并唤醒循环。带 ``dedupe_key`` 的重复入队返回 0。"""
+        job_id = await self.memory.add_job(
+            Job(
+                kind=kind,
+                run_at=run_at,
+                conversation_id=conversation_id,
+                payload=payload or {},
+                dedupe_key=dedupe_key,
+                reason=reason,
+            ),
+            self.clock.now(),
+        )
+        if job_id:
+            log.info(
+                "[job] 排上 %s#%s %s %s", kind, job_id, run_at.strftime("%m-%d %H:%M"), reason
+            )
+            self._wake.set()
+        return job_id
 
-    async def reschedule(self, job_id: int, run_at: datetime, payload: dict[str, Any] | None = None) -> None:
-        raise NotImplementedError
+    async def reschedule(
+        self, job_id: int, run_at: datetime, payload: dict[str, Any] | None = None
+    ) -> None:
+        await self.memory.reschedule_job(job_id, run_at, payload)
+        self._wake.set()
 
-    async def cancel(self, job_id: int) -> None:
-        raise NotImplementedError
+    async def cancel(self, job_id: int, reason: str = "") -> None:
+        await self.memory.set_job_status(job_id, "cancelled", reason or None)
+        self._wake.set()
+
+    # -- 启动与执行 ---------------------------------------------------------
+
+    async def recover(self) -> None:
+        """启动时清理上一次没跑完的东西。"""
+        revived = await self.memory.sweep_expired_leases(self.clock.now())
+        if revived:
+            log.info("[job] 上次崩溃遗留的 %d 个任务放回队列", revived)
+        stale = await self._expire_stale_jobs()
+        if stale:
+            log.info("[job] %d 个过期太久的任务作废", stale)
+
+    async def _expire_stale_jobs(self) -> int:
+        """停机太久之后，有些任务已经没有意义了。"""
+        now = self.clock.now()
+        count = 0
+        for job in await self.memory.pending_jobs():
+            limit = STALE_AFTER.get(job.kind)
+            if limit and now - job.run_at > limit:
+                await self.memory.set_job_status(job.id or 0, "cancelled", "停机太久，作废")
+                count += 1
+        return count
+
+    def _lock_for(self, conversation_id: str | None) -> asyncio.Lock:
+        key = conversation_id or "__global__"
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     async def run_due_once(self) -> int:
-        """执行所有到期任务一轮，返回执行条数。测试与 run_forever 都用它。"""
-        raise NotImplementedError
+        """把到期的任务跑一轮，返回真的执行了几个。"""
+        now = self.clock.now()
+        await self.memory.sweep_expired_leases(now)
+        ran = 0
+        for job in await self.memory.due_jobs(now):
+            if self._stopped:
+                break
+            if await self._run_job(job):
+                ran += 1
+        return ran
+
+    async def _run_job(self, job: Job) -> bool:
+        job_id = job.id or 0
+        lock = self._lock_for(job.conversation_id)
+        if lock.locked():
+            # 同一段对话已经有任务在跑，等下一轮。不能让两条消息在同一个频道里交错发出。
+            return False
+
+        async with lock:
+            claimed = await self.memory.claim_job(job_id, self.clock.now(), LEASE_SECONDS)
+            if claimed is None:
+                return False
+
+            handler = self._handlers.get(claimed.kind)
+            if handler is None:
+                log.warning("[job] %s 没有注册 handler，跳过", claimed.kind)
+                await self.memory.set_job_status(job_id, "cancelled", "没有 handler")
+                return False
+
+            try:
+                await handler(claimed)
+            except asyncio.CancelledError:
+                await self.memory.set_job_status(job_id, "pending")
+                raise
+            except Exception as exc:  # noqa: BLE001 - 兜底：任何失败都不能让人物崩掉
+                await self._handle_failure(claimed, exc)
+                return False
+
+            await self.memory.set_job_status(job_id, "done")
+            return True
+
+    async def _handle_failure(self, job: Job, exc: Exception) -> None:
+        """失败了就当"这会儿没看手机"，过一阵再试。绝不把错误发给对方。"""
+        job_id = job.id or 0
+        if job.attempts >= MAX_ATTEMPTS:
+            log.error("[job] %s#%s 试了 %d 次都失败：%s", job.kind, job_id, job.attempts, exc)
+            await self.memory.set_job_status(job_id, "failed", str(exc)[:200])
+            return
+
+        backoff = RETRY_BACKOFF_SECONDS[min(job.attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+        retry_at = self.clock.now() + timedelta(seconds=backoff * self.delay_scale)
+        log.warning(
+            "[job] %s#%s 第 %d 次失败，%s 后重试：%s",
+            job.kind,
+            job_id,
+            job.attempts,
+            retry_at.strftime("%H:%M"),
+            exc,
+        )
+        await self.memory.reschedule_job(job_id, retry_at)
+        self._wake.set()
+
+    # -- 主循环 -------------------------------------------------------------
 
     async def run_forever(self) -> None:
-        """循环：算下一个任务时间 → 等待（或被唤醒）→ run_due_once。"""
-        raise NotImplementedError
+        """算出下一个任务什么时候到期，睡到那时候，或者被新任务唤醒。"""
+        await self.recover()
+        while not self._stopped:
+            await self.run_due_once()
+            if self._stopped:
+                break
+            await self._wait_for_next()
+
+    async def _wait_for_next(self) -> None:
+        next_at = await self.memory.next_job_run_at()
+        now = self.clock.now()
+        if next_at is None:
+            timeout = IDLE_POLL_SECONDS
+        else:
+            timeout = max(0.5, min((next_at - now).total_seconds(), IDLE_POLL_SECONDS))
+
+        self._wake.clear()
+        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+            await asyncio.wait_for(self._wake.wait(), timeout=timeout)
 
     def stop(self) -> None:
-        raise NotImplementedError
+        self._stopped = True
+        self._wake.set()

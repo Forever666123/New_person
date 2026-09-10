@@ -36,11 +36,16 @@ class Settings(BaseModel):
     downloads_dir: Path = Path("data/downloads")
     generated_dir: Path = Path("data/generated")
 
+    max_calls_per_day: int = 200
+    """每天最多调多少次模型。超了就当"今天没怎么看手机"，任务顺延，不会崩。"""
+    allow_placeholders: bool = False
+    """人设里还有【待填】时是否允许启动。"""
+
     delay_scale: float = 1.0
     """把所有等待时间按比例缩放，调试用。1.0 = 真实节奏。"""
     log_level: str = "INFO"
     image_gen_command: str | None = None
-    """外部图片生成命令模板，含 {prompt} 与 {out} 占位符。"""
+    """外部图片生成命令模板，含 {prompt} 与 {out} 占位符。留空就只用本地照片库。"""
 
     @field_validator("effort")
     @classmethod
@@ -89,6 +94,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         model=env.get("NEWPERSON_MODEL", "claude-opus-5"),
         effort=env.get("NEWPERSON_EFFORT", "medium"),
         max_tokens=int(env.get("NEWPERSON_MAX_TOKENS", "8000")),
+        max_calls_per_day=int(env.get("MAX_CALLS_PER_DAY", "200")),
         persona_path=Path(env.get("PERSONA_PATH", "persona/persona.yaml")),
         photos_index=Path(env.get("PHOTOS_INDEX", "persona/photos/index.yaml")),
         db_path=Path(env.get("DB_PATH", "data/newperson.db")),
