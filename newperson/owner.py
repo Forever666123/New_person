@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from . import backup as backup_mod
 from .memory import Memory
 
 if TYPE_CHECKING:
@@ -26,7 +27,7 @@ log = logging.getLogger(__name__)
 PREFIX = "!np"
 
 HELP = """\
-`!np status` 她现在什么状态，有什么排着队，今天花了多少钱
+`!np status` 她现在什么状态，有什么排着队，今天花了多少钱，上次备份是什么时候
 `!np now` 让排着的那条回复立刻发
 `!np pause` / `!np resume` 暂停。暂停时她不回也不主动，但消息照常记着
 `!np away 出差 [天数]` / `!np back` 请假。这期间她话少，只保留最低限度的主动
@@ -122,6 +123,17 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
 
     used = await ctx.memory.usage_for(ctx.now.date())
     lines.append(f"今天调了 {used.get('calls', 0)} 次模型，约 ${used.get('estimated_usd', 0):.2f}")
+
+    # 备份停了是不会有任何症状的，直到你需要它那天。所以放在你每天都看的这里。
+    last_backup = backup_mod.last_backup_at(ctx.memory.db_path)
+    if last_backup is None:
+        lines.append("**没有异地备份**。她的记忆只存在这一台机器上")
+    else:
+        hours = (ctx.now - last_backup).total_seconds() / 3600
+        if hours > 48:
+            lines.append(f"**备份停了**：上一次是 {hours / 24:.0f} 天前，去看看 cron")
+        else:
+            lines.append(f"上次备份 {hours:.0f} 小时前")
 
     if err := await ctx.memory.kv_get("last_api_error"):
         lines.append(f"最近一次接口出错：{err}")

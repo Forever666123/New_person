@@ -219,20 +219,90 @@ fly deploy
 `data/newperson.db` 是她的全部记忆：你们说过的话、她记住的关于你的事、
 交易台账、每天的日记。**这个文件没了，她就不认识你了。**
 
-VPS 上加一条定时任务：
+代码和人设都在 git 里，服务器炸了十分钟就能重来。这个文件不行，只此一份。
+
+### 为什么不能直接 cp
+
+数据库跑在 WAL 模式下，刚说过的话还躺在 `newperson.db-wal` 里，主文件里没有。
+只拷主文件，你会得到一个"她还没听见你说话"的版本——而且它完全正常，
+`integrity_check` 也过，你要等真的去恢复那天才发现少了一段。
+三个文件一起拷又可能拷到写了一半的中间状态。
+
+所以用 `scripts/backup.sh`，它走的是 SQLite 的在线备份接口：她一边写，
+我们一边拷，拿到的仍然是某一个瞬间的一致快照。
+
+### 配一次
+
+```bash
+apt install -y rclone gnupg
+
+# 1) 远端。Backblaze B2 免费 10 GB，我们一年才用 2 MB
+rclone config          # 新建一个 b2 远端，然后去 B2 网站建一个私有 bucket
+rclone lsd b2:         # 能列出来就说明配对了
+
+# 2) 加密口令。这个文件是你们全部的对话，不该以明文躺在别人的硬盘上
+openssl rand -base64 32 > /root/.chloe-backup-pass
+chmod 600 /root/.chloe-backup-pass
+
+# 3) 抄一份口令到你的密码管理器里 —— 这一步别跳过
+cat /root/.chloe-backup-pass
+
+# 4) 填配置
+cp scripts/backup.env.example scripts/backup.env
+nano scripts/backup.env        # 至少改 RCLONE_REMOTE
+```
+
+**第 3 步是整段里最容易忽略的。** 口令跟备份存在同一台服务器上是没有意义的：
+服务器没了，两个一起没，那些备份就是一堆你自己也打不开的乱码。
+
+### 跑
+
+```bash
+scripts/backup.sh              # 手动跑一次，确认能通
+scripts/restore.sh             # 演练：下载、解密、验，不碰线上那份
+```
+
+演练会把里面有什么打给你看——多少条消息、从哪天到哪天、她记住了多少事。
+**看到数字对得上，才算你有备份。**
+
+定时：
 
 ```bash
 crontab -e
 ```
 
 ```
-0 4 * * * cd ~/New_person && sqlite3 data/newperson.db ".backup '/root/backup/np-$(date +\%F).db'" && find /root/backup -name 'np-*.db' -mtime +14 -delete
+0 4 * * * /root/New_person/scripts/backup.sh >> /var/log/chloe-backup.log 2>&1
+0 5 * * 0 /root/New_person/scripts/restore.sh >> /var/log/chloe-drill.log 2>&1
 ```
 
-用 `.backup` 而不是直接 `cp`，因为她随时可能在写。留两周，够了。
+第二条是每周一次的恢复演练。备份最常见的死法不是没备份，
+是**备了一年从来没人试过能不能恢复**。
 
-再往上一层是把备份同步到别处（rclone 到网盘之类），
-看你觉得这段记忆值多少。
+### 它怎么防自己出事
+
+- **传完会回头确认对面真的有这个文件**，并且比对大小。`rclone copy` 退出 0
+  不等于东西到了。
+- **只有真正传出去之后才写 `.last_backup_at`**，而 `!np status` 会报
+  "上次备份多久之前"。备份停了是没有任何症状的——cron 的报错邮件没人看，
+  令牌过期了一切照旧——所以把它放进你每天都会看的那个命令里。
+- **拷出来当场跑 `integrity_check`**，坏了就删掉并退非零。一份坏备份比没有
+  备份更危险，它让你以为自己有退路。
+- **空备份不会顶掉旧的**。如果哪天 `DB_PATH` 指错了或者 `data/` 没挂上，
+  拷出来的是个 0 条消息的完好数据库。这种时候它照传，但**不清理旧备份**、
+  **不更新时间标记**，于是 `!np status` 会一直提醒你。否则一个月之后，
+  三十份空备份就把所有真备份全顶掉了，全程没有一句报错。
+
+### 真的要恢复的时候
+
+```bash
+scripts/restore.sh --list                    # 有哪些
+scripts/restore.sh --at 20260912             # 先演练那一份
+scripts/restore.sh --install --at 20260912   # 确认没问题再装回去
+```
+
+`--install` 会停容器、把当前那份改名留着（不删）、装上恢复的那份、再起来。
+她会以为中间那段时间自己没看手机。
 
 ## 跑起来之后
 

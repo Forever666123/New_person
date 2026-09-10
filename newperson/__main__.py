@@ -6,6 +6,8 @@ python -m newperson check      检查配置和人设（加 --online 会真的连
 python -m newperson simulate   用假时钟模拟，看她什么时候回消息（不联网）
 python -m newperson plan       让她给今天编一份日程并打印（联网）
 python -m newperson photos     扫描照片目录，生成索引草稿
+python -m newperson backup     把她的记忆拷一份出来（一致快照，拷完就验）
+python -m newperson verify     检查一份备份还能不能用
 ```
 """
 
@@ -16,6 +18,7 @@ import asyncio
 import logging
 import os
 import random
+import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -456,6 +459,93 @@ def cmd_ledger(args: argparse.Namespace) -> int:
     return asyncio.run(go())
 
 
+EMPTY_BACKUP = 3
+"""``backup`` 拷出来一份没有消息的快照时的返回码。
+
+不是失败——第一天就该是空的。但它和"DB_PATH 配错了"长得一模一样，
+所以调用方要能区分对待：可以传上去，但不能拿它去顶掉旧的备份。
+"""
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """拷一份一致快照出来，并且当场验一遍。
+
+    验不过就返回非零、**不留下那个文件**——一份坏备份比没有备份更危险，
+    它会让你以为自己有退路。
+    """
+    from . import backup as backup_mod
+
+    settings = load_settings()
+    src = Path(args.db) if args.db else settings.db_path
+    dest = Path(args.dest)
+
+    try:
+        backup_mod.snapshot(src, dest)
+    except Exception as exc:  # noqa: BLE001 - 备份失败要说人话，不要甩堆栈
+        print(f"{BAD} 拷不出来：{exc}")
+        return 1
+
+    errors = backup_mod.integrity_errors(dest)
+    if errors:
+        print(f"{BAD} 拷出来的文件是坏的，已经删掉：")
+        for line in errors[:10]:
+            print(f"   {line}")
+        dest.unlink(missing_ok=True)
+        return 1
+
+    info = backup_mod.stats(dest)
+    print(f"{OK} {dest}")
+    for line in info.describe():
+        print(f"   {line}")
+    # 这里**不**写 .last_backup_at。快照只是躺在同一块磁盘上，
+    # 那块磁盘没了它也没了。标记由 scripts/backup.sh 在真正传出去之后才写。
+
+    if info.messages == 0:
+        # 一条消息都没有的备份是**合法的**——第一天就是这样。
+        # 但它也可能是 DB_PATH 指错了、数据卷没挂上。两种情况长得一模一样。
+        # 所以不报错（第一天不能失败），而是用一个单独的返回码告诉调用方：
+        # 这份可以传，但**不要拿它去顶掉旧的**。
+        print(f"{WARN} 这份备份里一条消息都没有")
+        print("   要么她还没开始跟你说话，要么 DB_PATH 指错了、data/ 没挂上")
+        print("   这份还是会传上去，但旧备份先不清理")
+        return EMPTY_BACKUP
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """恢复演练：证明这个文件真的能变回她。
+
+    只看文件在不在是不够的。要跑 integrity_check，还要把里面的东西数出来——
+    一个 0 条消息的完好数据库同样完好，但那不是她。
+    """
+    from . import backup as backup_mod
+
+    path = Path(args.path)
+    if not path.exists():
+        print(f"{BAD} 找不到 {path}")
+        return 1
+
+    try:
+        errors = backup_mod.integrity_errors(path)
+    except sqlite3.DatabaseError as exc:
+        print(f"{BAD} 这不是一个能打开的 SQLite 文件：{exc}")
+        return 1
+    if errors:
+        print(f"{BAD} 文件是坏的：")
+        for line in errors[:10]:
+            print(f"   {line}")
+        return 1
+
+    info = backup_mod.stats(path)
+    print(f"{OK} {path} 能用")
+    for line in info.describe():
+        print(f"   {line}")
+    if info.messages == 0:
+        print(f"{WARN} 一条消息都没有。文件是好的，但里面不是她——确认一下拿对了没有")
+        return 1
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     loaded = load_all(args)
     if loaded is None:
@@ -507,6 +597,13 @@ def main(argv: list[str] | None = None) -> int:
     led.add_argument("--kind", default="trading")
     led.add_argument("--limit", type=int, default=50)
 
+    bak = sub.add_parser("backup", help="把她的记忆拷一份出来（一致快照，拷完就验）")
+    bak.add_argument("dest", help="快照写到哪")
+    bak.add_argument("--db", default="", help="源数据库，默认用 DB_PATH")
+
+    ver = sub.add_parser("verify", help="检查一份备份还能不能用")
+    ver.add_argument("path", help="要检查的 .db 文件")
+
     args = parser.parse_args(argv)
     handlers = {
         "run": cmd_run,
@@ -515,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
         "plan": cmd_plan,
         "photos": cmd_photos,
         "ledger": cmd_ledger,
+        "backup": cmd_backup,
+        "verify": cmd_verify,
     }
     return handlers[args.command](args)
 

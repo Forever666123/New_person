@@ -6,6 +6,8 @@ __pycache__/
 *.egg-info/
 data/
 .env
+scripts/backup.env
+backups/
 # persona/persona.yaml 现在纳入版本控制（人设是项目的核心内容）
 persona/photos/*
 !persona/photos/index.example.yaml
