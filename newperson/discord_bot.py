@@ -281,10 +281,20 @@ class App:
         if away := await owner_cmds.away_state(self.memory, day):
             mood.append(f"你最近{away}，没什么心思聊天。")
 
+        # 作息只知道有没有课，日程才知道她此刻具体在干什么。
+        # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。
+        state_line = self.life.state_line(now)
+        if event := self.life.current_event(plan, now):
+            state_line = (
+                state_line.removesuffix("你现在有空。") + f"你现在：{event.title}。{event.detail}"
+            )
+        elif recent := self.life.recent_event(plan, now):
+            state_line += f"你刚忙完：{recent.title}。"
+
         return build_situation(
             persona=self.persona,
             now=now,
-            state_line=self.life.state_line(now),
+            state_line=state_line,
             mood_notes=mood,
             day_plan=plan,
             diary_notes=notes,

@@ -569,3 +569,36 @@ async def test_corrupt_progress_falls_back_to_thinking_again(
     clock.set(jobs[0].run_at)
     await app.scheduler.run_due_once()
     assert channel.texts == ["嗯"]
+
+
+async def test_the_state_line_matches_the_day_plan(tmp_path: Path, persona: Persona) -> None:
+    """作息只知道有没有课，日程才知道她此刻在干什么。
+
+    不接上的话，"你现在有空"和"19:00-22:00 在图书馆"会同时摆在她面前，
+    她说出来的话就会自相矛盾。
+    """
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="图书馆")])]
+    )
+    day = app.rhythm.local_date(EVENING)
+    await memory.save_day_plan(
+        day,
+        DayPlan(
+            date=str(day),
+            mood="有点烦",
+            events=[
+                PlanEvent(
+                    start="19:00",
+                    end="22:00",
+                    title="在图书馆赶 project",
+                    detail="Snell 三楼",
+                    shareable=True,
+                )
+            ],
+        ),
+    )
+    await send(app, "在干嘛", at=EVENING)
+    await drain(app, clock)
+    situation = llm.calls[0]["messages"][0]["content"].split("## ")[1]
+    assert "在图书馆赶 project" in situation
+    assert "你现在有空" not in situation
