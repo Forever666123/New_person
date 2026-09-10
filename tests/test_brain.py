@@ -309,3 +309,68 @@ async def test_she_can_decide_not_to_say_anything(
         TODAY,
     )
     assert got.send is False
+
+
+async def test_haiku_does_not_get_an_effort_parameter(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """Haiku 4.5 不接受 effort，传了直接 400，她一句话都发不出来。"""
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(client, settings(tmp_path, model="claude-haiku-4-5"), persona, memory)
+    await brain.generate_reply(reply_request(), TODAY)
+    assert "output_config" not in client.messages.calls[0]
+
+
+async def test_an_unknown_model_plays_it_safe(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """不认识的模型宁可少传一个参数，也别让她连不上。"""
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(client, settings(tmp_path, model="something-new"), persona, memory)
+    await brain.generate_reply(reply_request(), TODAY)
+    assert "output_config" not in client.messages.calls[0]
+
+
+async def test_the_day_plan_can_run_on_a_cheaper_model(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """日程和记忆整理不面向对话，只要格式对就行，用便宜的那档能省不少。"""
+    from newperson.brain import DayPlanRequest
+    from newperson.models import DayPlan
+
+    client = fake_client(DayPlan(date="2026-10-12", mood="还行"))
+    brain = Brain(
+        client,
+        settings(tmp_path, model="claude-sonnet-5", utility_model_override="claude-haiku-4-5"),
+        persona,
+        memory,
+    )
+    await brain.generate_day_plan(
+        DayPlanRequest(
+            now=NOW,
+            state_line="",
+            mood_notes=[],
+            wake_at=NOW,
+            sleep_at=NOW,
+            classes=[],
+            yesterday=None,
+            summary="",
+        ),
+        TODAY,
+    )
+    assert client.messages.calls[0]["model"] == "claude-haiku-4-5"
+
+
+async def test_replies_stay_on_the_main_model(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """回复是她像不像人的关键，不能被降级。"""
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(
+        client,
+        settings(tmp_path, model="claude-sonnet-5", utility_model_override="claude-haiku-4-5"),
+        persona,
+        memory,
+    )
+    await brain.generate_reply(reply_request(), TODAY)
+    assert client.messages.calls[0]["model"] == "claude-sonnet-5"

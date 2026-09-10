@@ -27,6 +27,12 @@ class Settings(BaseModel):
     """主动消息发到哪个频道；None 表示私聊 owner。"""
 
     model: str = "claude-opus-5"
+    """回复和主动消息用的模型。这两件事直接决定她像不像人。"""
+    utility_model_override: str = ""
+    """日程生成和记忆整理用的模型。留空就跟主模型一样。
+
+    这两件事不面向对话，只要格式对、意思在就行，用便宜的那档能省不少。
+    """
     effort: str = "medium"
     max_tokens: int = 8000
 
@@ -63,6 +69,10 @@ class Settings(BaseModel):
         return v
 
     @property
+    def utility_model(self) -> str:
+        return self.utility_model_override or self.model
+
+    @property
     def all_allowed_user_ids(self) -> set[int]:
         ids = set(self.allowed_user_ids)
         if self.owner_user_id:
@@ -92,6 +102,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         allowed_user_ids=_split_ids(env.get("ALLOWED_USER_IDS")),
         proactive_channel_id=int(env["PROACTIVE_CHANNEL_ID"]) if env.get("PROACTIVE_CHANNEL_ID") else None,
         model=env.get("NEWPERSON_MODEL", "claude-opus-5"),
+        utility_model_override=env.get("NEWPERSON_UTILITY_MODEL", ""),
         effort=env.get("NEWPERSON_EFFORT", "medium"),
         max_tokens=int(env.get("NEWPERSON_MAX_TOKENS", "8000")),
         max_calls_per_day=int(env.get("MAX_CALLS_PER_DAY", "200")),

@@ -62,6 +62,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems += 1
     if not settings.missing_required():
         print(f"  {OK} Token、API key、你的用户 ID 都在")
+    from .brain import EFFORT_SUPPORTED, PRICING_PER_MTOK
+
+    print(f"  {OK} 回复用 {settings.model}，日程和记忆用 {settings.utility_model}")
+    if settings.model not in PRICING_PER_MTOK:
+        print(f"  {WARN} 不认识 {settings.model} 这个模型，费用估算会不准")
+    if settings.model not in EFFORT_SUPPORTED:
+        print(f"  {WARN} {settings.model} 不接受 effort 参数，NEWPERSON_EFFORT 会被跳过")
     if settings.delay_scale != 1.0:
         print(f"  {WARN} DELAY_SCALE={settings.delay_scale}，时间是被压缩的，别在正式用的时候留着")
 

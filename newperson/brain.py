@@ -54,6 +54,23 @@ PRICING_PER_MTOK = {
 }
 """(输入, 输出) 美元每百万 token。缓存命中按输入的十分之一算，写入按 1.25 倍。"""
 
+EFFORT_SUPPORTED = {
+    "claude-fable-5-1",
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+}
+"""接受 ``output_config.effort`` 的模型。
+
+Haiku 4.5 和 Sonnet 4.5 不接受，传了会直接 400。
+不认识的模型一律不传，宁可少一个参数也别让她连不上。
+"""
+
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 
@@ -152,7 +169,9 @@ class Brain:
         )
         return True
 
-    async def _record_usage(self, response: Any, today: date, purpose: str) -> None:
+    async def _record_usage(
+        self, response: Any, today: date, purpose: str, model_used: str | None = None
+    ) -> None:
         usage = getattr(response, "usage", None)
         if usage is None:
             return
@@ -161,7 +180,7 @@ class Brain:
         written = getattr(usage, "cache_creation_input_tokens", 0) or 0
         out = getattr(usage, "output_tokens", 0) or 0
 
-        in_price, out_price = PRICING_PER_MTOK.get(self.settings.model, (5.0, 25.0))
+        in_price, out_price = PRICING_PER_MTOK.get(model_used or self.settings.model, (5.0, 25.0))
         cost = (
             inp * in_price + cached * in_price * 0.1 + written * in_price * 1.25 + out * out_price
         ) / 1_000_000
@@ -186,20 +205,26 @@ class Brain:
         *,
         purpose: str,
         today: date,
+        model: str | None = None,
     ) -> T | None:
         """调一次模型。任何失败都返回 None，让上层当作"没看手机"。"""
         if await self._over_budget(today):
             return None
 
+        chosen = model or self.settings.model
+        kwargs: dict[str, Any] = {
+            "model": chosen,
+            "max_tokens": self.settings.max_tokens,
+            "system": self.system_blocks(),
+            "messages": [{"role": "user", "content": user_content}],
+            "output_format": output_format,
+        }
+        # Haiku 4.5 之类不接受 effort，传了直接 400。
+        if chosen in EFFORT_SUPPORTED:
+            kwargs["output_config"] = {"effort": self.settings.effort}
+
         try:
-            response = await self.client.messages.parse(
-                model=self.settings.model,
-                max_tokens=self.settings.max_tokens,
-                system=self.system_blocks(),
-                output_config={"effort": self.settings.effort},
-                messages=[{"role": "user", "content": user_content}],
-                output_format=output_format,
-            )
+            response = await self.client.messages.parse(**kwargs)
         except anthropic.RateLimitError:
             log.warning("[brain] %s 撞到限流，稍后重试", purpose)
             return None
@@ -216,7 +241,7 @@ class Brain:
             await self._note_error(str(exc)[:120])
             return None
 
-        await self._record_usage(response, today, purpose)
+        await self._record_usage(response, today, purpose, chosen)
 
         if getattr(response, "stop_reason", None) == "refusal":
             log.warning("[brain] %s 被拒了，这次就当没回", purpose)
@@ -347,7 +372,9 @@ class Brain:
             yesterday=req.yesterday,
             summary=req.summary,
         )
-        return await self._call(DayPlan, prompt, purpose="day_plan", today=today)
+        return await self._call(
+            DayPlan, prompt, purpose="day_plan", today=today, model=self.settings.utility_model
+        )
 
     async def update_memory(self, req: MemoryUpdateRequest, today: date) -> MemoryUpdate | None:
         prompt = build_memory_update_user(
@@ -357,7 +384,9 @@ class Brain:
             existing_owner_facts=req.existing_owner_facts,
             existing_self_facts=req.existing_self_facts,
         )
-        return await self._call(MemoryUpdate, prompt, purpose="memory", today=today)
+        return await self._call(
+            MemoryUpdate, prompt, purpose="memory", today=today, model=self.settings.utility_model
+        )
 
 
 def build_client(settings: Settings) -> anthropic.AsyncAnthropic:
