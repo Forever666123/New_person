@@ -129,7 +129,32 @@ class App:
             await self.life.ensure_today_plan(CONVERSATION_ID)
 
         self.spawn(self.scheduler.run_forever(), "scheduler")
-        log.info("[app] %s 上线了", self.persona.name)
+
+        now = self.clock.now()
+        snapshot = self.rhythm.state_at(now)
+        state_names = {
+            "sleeping": "在睡觉",
+            "busy": snapshot.block_title or "在忙",
+            "free": "有空",
+            "winding_down": "准备睡了",
+        }
+        # 日志里的时间**全部是她那边的**。你和她多半不在一个时区，
+        # 不说清楚的话会一直对不上。
+        line = f"[app] {self.persona.name} 上线了。她那边 {now.strftime('%m-%d %H:%M')}，{state_names[snapshot.state]}"
+        if self.persona.owner_tz:
+            line += f"（你那边 {now.astimezone(self.persona.owner_tz).strftime('%H:%M')}）"
+        log.info(line)
+        log.info(
+            "[app] 日志里的时间都是她那边的时间（%s）", self.persona.timezone
+        )
+        if self.settings.force_awake:
+            log.warning("[app] DEBUG_FORCE_AWAKE 开着，她不会睡觉。看完效果记得关掉")
+        if self.settings.delay_scale != 1.0:
+            log.warning(
+                "[app] DELAY_SCALE=%s，等待时间被压缩了 %.0f 倍",
+                self.settings.delay_scale,
+                1 / self.settings.delay_scale,
+            )
 
     def spawn(self, coro, name: str = "") -> asyncio.Task:
         """起一个后台循环，留住引用，并且死了要有日志。

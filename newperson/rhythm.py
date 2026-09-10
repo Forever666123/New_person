@@ -335,7 +335,10 @@ class Rhythm:
         next_sleep = self.next_sleep_after(dt)
         activity = self.activity_at(dt)
 
-        window = self.sleep_window_containing(dt)
+        # 走 is_sleeping 而不是直接查睡眠区间：调试开关要在这里也生效。
+        # 只改时机计算不改状态显示的话，presence 会拿着"睡着"把她设成隐身，
+        # 看起来就是"我一发消息她头像就灰了"。
+        window = self.sleep_window_containing(dt) if self.is_sleeping(dt) else None
         if window is not None:
             return RhythmSnapshot(
                 state="sleeping",

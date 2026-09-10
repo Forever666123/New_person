@@ -308,3 +308,23 @@ def test_force_awake_is_only_for_debugging(persona: Persona, calendar) -> None:
     noon = datetime(2026, 10, 13, 21, 0, tzinfo=persona.tz)
     if not normal.is_sleeping(noon):
         assert normal.for_day(noon.date()).variant == debug.for_day(noon.date()).variant
+
+
+def test_force_awake_also_changes_what_presence_sees(persona: Persona, calendar) -> None:
+    """调试开关只改时机不改状态显示的话，presence 会拿着"睡着"把她设成隐身。
+
+    看起来就是"我一发消息她头像就灰了"，但她其实在正常排队回复。
+    """
+    debug = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar, force_awake=True)
+    normal = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+
+    night = next(
+        t
+        for t in (
+            datetime(2026, 10, 13, 4, 0, tzinfo=persona.tz) + timedelta(days=d) for d in range(14)
+        )
+        if normal.is_sleeping(t)
+    )
+    assert normal.state_at(night).state == "sleeping"
+    assert debug.state_at(night).state != "sleeping"
+    assert debug.state_at(night).activity > 0
