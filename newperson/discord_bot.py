@@ -886,12 +886,22 @@ class NewPersonClient(discord.Client):
         await super().close()
 
     async def on_ready(self) -> None:
+        """网关就绪。
+
+        跟 ``App.start`` 一样，这里会被反复触发：Discord 隔一阵子就会让会话失效，
+        RESUME 不上就重新 IDENTIFY，长跑的机器人一天可能好几次。
+        所以在线状态那条循环也只能起一次——每次重连都新起一条的话，
+        它们会一起写在线状态，撞上 Discord 的频率限制，
+        而被限流又会导致断线重连，正反馈，越滚越糟。
+        """
         log.info("[discord] 以 %s 的身份连上了", self.user)
         await self.app.start(self)
+        if self.presence is not None:
+            return
         self.presence = PresenceManager(
             self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng
         )
-        asyncio.create_task(self.presence.run_forever())  # noqa: RUF006
+        self.app.spawn(self.presence.run_forever(), "presence")
 
     async def on_message(self, message: discord.Message) -> None:
         try:

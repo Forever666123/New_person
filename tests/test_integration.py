@@ -20,7 +20,7 @@ from newperson.calendar import AcademicCalendar
 from newperson.clock import FakeClock
 from newperson.config import Settings
 from newperson.delivery import Deliverer
-from newperson.discord_bot import CONVERSATION_ID, App
+from newperson.discord_bot import CONVERSATION_ID, App, NewPersonClient
 from newperson.life import LifeEngine
 from newperson.media import MediaService, NullImageGenerator, PhotoLibrary
 from newperson.memory import Memory
@@ -758,6 +758,30 @@ async def test_reconnecting_does_not_start_everything_twice(
     before = len(app._tasks)
     await app.start(app.client)
     assert len(app._tasks) == before
+
+
+async def test_reconnecting_does_not_stack_presence_loops(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """在线状态那条循环也只能有一条。
+
+    ``App.start`` 早就挡住了重复启动，但 presence 循环是在
+    ``NewPersonClient.on_ready`` 里起的，在那个守卫**外面**——
+    每次重连都会再叠一条。后果不只是多跑几个协程：它们会一起写在线状态，
+    撞上 Discord 的频率限制，而被限流又会导致断线重连，正反馈。
+    """
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    app._started = True  # 让 start 走早返回，这里只关心 presence
+    client = NewPersonClient(app)
+
+    await client.on_ready()
+    await client.on_ready()
+
+    presence_loops = [t for t in app._tasks if t.get_name() == "presence"]
+    assert len(presence_loops) == 1
+
+    for task in presence_loops:
+        task.cancel()
 
 
 async def test_heat_looks_at_the_conversation_before_this_message(
