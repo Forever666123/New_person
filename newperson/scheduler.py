@@ -162,6 +162,11 @@ class Scheduler:
                 await self._handle_failure(claimed, exc)
                 return False
 
+            # handler 可能自己把任务重排了（暂停期间、预算用完顺延到明天）。
+            # 那种情况下不能盖成 done，否则那条回复就永远发不出去了。
+            current = await self.memory.get_job(job_id)
+            if current is not None and current.status != "running":
+                return False
             await self.memory.set_job_status(job_id, "done")
             return True
 
@@ -195,7 +200,10 @@ class Scheduler:
         是因为循环本身出意外（比如数据库暂时读不了）不能让她从此彻底不说话，
         那种故障没有任何征兆，你只会觉得她再也不理你了。
         """
-        await self.recover()
+        try:
+            await self.recover()
+        except Exception:  # noqa: BLE001 - 恢复失败也不能让循环没起来就死了
+            log.exception("[job] 启动恢复出意外，继续跑")
         while not self._stopped:
             try:
                 await self.run_due_once()

@@ -93,15 +93,27 @@ class App:
         self.deliverer = deliverer
         self.rng = rng
         self.client: discord.Client | None = None
-        self._channel: Any = None
+        self._default_channel: Any = None
+        self._channels: dict[int, Any] = {}
+        self._started = False
         self._tasks: set[asyncio.Task] = set()
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
 
     # -- 启动 ---------------------------------------------------------------
 
     async def start(self, client: discord.Client) -> None:
-        """网关就绪之后跑一次。"""
+        """网关就绪之后跑一次。
+
+        ``on_ready`` 会被反复触发：断线之后 RESUME 失败就重新 IDENTIFY，
+        长跑的机器人一天可能好几次。不挡住的话每次都会再开一条 SQLite 连接
+        （旧的从不关闭）、再起一个 presence 循环，最后撞上 Discord 的
+        presence 频率限制，而被限流又会导致断线重连，正反馈。
+        """
         self.client = client
+        if self._started:
+            log.info("[app] 网关重连了，沿用已有的状态")
+            return
+        self._started = True
         await self.memory.open()
         self.scheduler.register("reply", self.handle_reply_job)
         self.scheduler.register("proactive", self.handle_proactive_job)
@@ -111,23 +123,35 @@ class App:
 
         await self.scheduler.recover()
         self._prune_downloads()
+        self._prune_downloads(folder=self.settings.generated_dir)
         await self.life.schedule_next_day_plan()
         if not self.rhythm.is_sleeping(self.clock.now()):
             await self.life.ensure_today_plan(CONVERSATION_ID)
 
-        self.spawn(self.scheduler.run_forever())
+        self.spawn(self.scheduler.run_forever(), "scheduler")
         log.info("[app] %s 上线了", self.persona.name)
 
-    def spawn(self, coro) -> asyncio.Task:
-        """起一个后台循环，并留住引用。"""
-        task = asyncio.create_task(coro)
+    def spawn(self, coro, name: str = "") -> asyncio.Task:
+        """起一个后台循环，留住引用，并且死了要有日志。
+
+        循环无声无息地停掉是最难查的故障：你只会觉得她再也不理你了。
+        """
+        task = asyncio.create_task(coro, name=name or None)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._tasks.discard(finished)
+            if finished.cancelled():
+                return
+            if exc := finished.exception():
+                log.error("[app] 后台循环 %s 停了：%r", name or finished.get_name(), exc)
+
+        task.add_done_callback(_done)
         return task
 
-    def _prune_downloads(self, keep_days: float = 14) -> None:
-        """他发过的图片下载在本地，久了会把磁盘撑满。模型早就看过了，留两周够了。"""
-        folder = self.settings.downloads_dir
+    def _prune_downloads(self, keep_days: float = 14, folder: Path | None = None) -> None:
+        """本地的图片久了会把磁盘撑满。模型早就看过了，留两周够了。"""
+        folder = folder or self.settings.downloads_dir
         if not folder.exists():
             return
         cutoff = self.clock.now().timestamp() - keep_days * 86400
@@ -142,23 +166,37 @@ class App:
         if removed:
             log.info("[app] 清掉 %d 张过期的图片", removed)
 
-    async def resolve_channel(self) -> Any:
-        """她说话的地方。默认私聊 Owner，也可以指定一个频道。"""
-        if self._channel is not None:
-            return self._channel
+    async def resolve_channel(self, channel_id: int | None = None) -> Any:
+        """她说话的地方。
+
+        **要回到他说话的那个地方。** 配了 ``PROACTIVE_CHANNEL_ID`` 之后，
+        如果一律回到那个频道，他在私聊说的话就会被回到公开频道里，
+        而且引用回复和表情反应会因为消息不在那个频道而全部静默失效。
+        所以回复走消息的来源，只有主动消息才用默认频道。
+        """
         if self.client is None:
             raise RuntimeError("Discord 还没连上")
 
-        if self.settings.proactive_channel_id:
-            self._channel = self.client.get_channel(
-                self.settings.proactive_channel_id
-            ) or await self.client.fetch_channel(self.settings.proactive_channel_id)
-        else:
-            user = self.client.get_user(
-                self.settings.owner_user_id
-            ) or await self.client.fetch_user(self.settings.owner_user_id)
-            self._channel = user.dm_channel or await user.create_dm()
-        return self._channel
+        if channel_id is not None:
+            cached = self._channels.get(channel_id)
+            if cached is None:
+                cached = self.client.get_channel(channel_id) or await self.client.fetch_channel(
+                    channel_id
+                )
+                self._channels[channel_id] = cached
+            return cached
+
+        if self._default_channel is None:
+            if self.settings.proactive_channel_id:
+                self._default_channel = await self.resolve_channel(
+                    self.settings.proactive_channel_id
+                )
+            else:
+                user = self.client.get_user(
+                    self.settings.owner_user_id
+                ) or await self.client.fetch_user(self.settings.owner_user_id)
+                self._default_channel = user.dm_channel or await user.create_dm()
+        return self._default_channel
 
     # -- 收消息 -------------------------------------------------------------
 
@@ -215,9 +253,9 @@ class App:
         log.info(
             "[inbox] %d 字%s", len(message.content), " 带图" if attachments else ""
         )
-        await self._schedule_reply(now)
+        await self._schedule_reply(now, channel_id=message.channel.id)
 
-    async def _schedule_reply(self, now: datetime) -> None:
+    async def _schedule_reply(self, now: datetime, channel_id: int | None = None) -> None:
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         if not unread:
@@ -269,7 +307,12 @@ class App:
             "reply",
             decision.reply_at,
             conversation_id=CONVERSATION_ID,
-            payload={"hints": decision.hints, "mode": features.mode},
+            payload={
+                "hints": decision.hints,
+                "mode": features.mode,
+                # 回到他说话的那个地方，不是默认频道
+                "channel_id": channel_id,
+            },
             reason=decision.reason[:180],
         )
 
@@ -286,7 +329,9 @@ class App:
                 size=att.size,
             )
             if (att.content_type or "").startswith("image/") and att.size <= MAX_IMAGE_BYTES:
-                target = self.settings.downloads_dir / f"{message.id}-{att.filename}"
+                # filename 是外部输入，可能带路径分隔符，只取最后一段
+                safe = Path(att.filename).name or "image"
+                target = self.settings.downloads_dir / f"{message.id}-{safe}"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     await att.save(target)
@@ -370,6 +415,11 @@ class App:
             except Exception:  # noqa: BLE001 - 存坏了就重新生成，别卡死在这
                 log.warning("[job] 存下来的回复读不出来，重新想一遍")
                 await self.memory.save_job_progress(job.id or 0, {}, covers)
+                # 这批消息在存 progress 之前就标成已读了。不放回去的话
+                # 下面取到的未读是空的，整批消息就再也不会有人回。
+                if covers:
+                    restored = await self.memory.restore_unread(CONVERSATION_ID, covers)
+                    log.info("[job] 把 %d 条消息放回未读", restored)
                 saved = None
             else:
                 log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
@@ -390,6 +440,11 @@ class App:
         if reply_plan is None:
             # 模型没给出结果。**这里绝不能提前把消息标成已读**，
             # 否则重试的时候未读是空的，这批消息就永远回不出去了。
+            if await self.brain.over_budget(self.rhythm.local_date(now)):
+                # 今天的调用额度用完了。这不是故障，别拿三次重试把它烧掉，
+                # 顺延到明天她醒来，表现出来就是今天话少。
+                await self._defer_to_tomorrow(job, now, "今天的模型额度用完了")
+                return
             raise RuntimeError("模型这次没给出回复")
 
         # 生成成功了才算她真的处理过这批消息
@@ -405,6 +460,13 @@ class App:
             return
 
         await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
+
+    async def _defer_to_tomorrow(self, job: Job, now: datetime, why: str) -> None:
+        """把任务推到明天她醒来。用于不是故障、只是今天做不了的情况。"""
+        wake = self.rhythm.next_wake_after(now)
+        run_at = self.rhythm.first_glance_after_waking(wake, self.rng)
+        log.warning("[job] %s，推到 %s", why, run_at.strftime("%m-%d %H:%M"))
+        await self.scheduler.reschedule(job.id or 0, run_at)
 
     async def _generate_reply(self, job: Job, unread: list, now: datetime):
         conv = await self.memory.get_conversation(CONVERSATION_ID)
@@ -446,14 +508,17 @@ class App:
     async def _deliver_reply(
         self, job: Job, plan, unread: list, now: datetime, start_index: int, covers: int
     ) -> None:
-        channel = await self.resolve_channel()
+        channel_id = job.payload.get("channel_id")
+        channel = await self.resolve_channel(channel_id)
         photo = await self._resolve_photo(plan.photo_request, now)
         react_to = (
-            await self._fetch_message(unread[-1].discord_message_id) if unread else None
+            await self._fetch_message(unread[-1].discord_message_id, channel) if unread else None
         )
         reply_to = None
         if plan.reply_to_index is not None and 0 <= plan.reply_to_index < len(unread):
-            reply_to = await self._fetch_message(unread[plan.reply_to_index].discord_message_id)
+            reply_to = await self._fetch_message(
+                unread[plan.reply_to_index].discord_message_id, channel
+            )
 
         async def interrupted() -> bool:
             return await self.memory.has_newer_user_message(CONVERSATION_ID, covers)
@@ -481,21 +546,33 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
             await self._record_sent(blocked.result, now)
             return
+        except Exception as exc:
+            # 网络断在中间时，前几条其实已经到对方手机上了。不记下来的话
+            # 她自己的历史里就少一截，重试续发会重复或者前后矛盾。
+            if partial := getattr(exc, "delivery_result", None):
+                await self._record_sent(partial, now)
+            raise
 
         await self._record_sent(result, now)
         await self._after_reply(plan, now, sent_any=bool(result.sent_texts))
 
         if result.interrupted:
             log.info("[delivery] 他又发了，剩下的不发了，重新排一次")
-            await self._schedule_reply(self.clock.now())
+            await self._schedule_reply(self.clock.now(), channel_id=channel_id)
 
-    async def _fetch_message(self, message_id: int | None):
+    async def _fetch_message(self, message_id: int | None, channel: Any = None):
+        """取回一条消息，用来加表情反应或者引用回复。
+
+        取不到就算了：加不上反应不该让整条回复发不出去。
+        """
         if not message_id or self.client is None:
             return None
-        with contextlib.suppress(Exception):
-            channel = await self.resolve_channel()
-            return await channel.fetch_message(message_id)
-        return None
+        try:
+            target = channel or await self.resolve_channel()
+            return await target.fetch_message(message_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[delivery] 取不到消息 %s：%r", message_id, exc)
+            return None
 
     async def _record_sent(self, result, now: datetime) -> None:
         for i, text in enumerate(result.sent_texts):

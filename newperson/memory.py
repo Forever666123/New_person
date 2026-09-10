@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -92,9 +93,10 @@ CREATE INDEX IF NOT EXISTS idx_ledger_kind ON ledger(kind, resolved);
 
 CREATE TABLE IF NOT EXISTS diary (
     day TEXT PRIMARY KEY,
-    status TEXT NOT NULL DEFAULT 'ready',
+    status TEXT NOT NULL DEFAULT 'idle',
     day_plan_json TEXT,
-    notes_json TEXT NOT NULL DEFAULT '[]'
+    notes_json TEXT NOT NULL DEFAULT '[]',
+    claimed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -149,6 +151,13 @@ class Memory:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
+        self._write_lock = asyncio.Lock()
+        """读-改-写要串起来。
+
+        Discord 事件回调、调度器任务、presence 循环是三条并发的协程共用一条连接。
+        aiosqlite 只保证单条语句排队，不保证事务边界，任何一方的 commit
+        都会把别人写到一半的东西提交掉。结果是日记或事实偶尔少一条，无迹可查。
+        """
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -304,6 +313,20 @@ class Memory:
         )
         return int(row["n"]) if row else 0
 
+    async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
+        """把一批消息放回未读。
+
+        存下来的回复读不出来时用：那批消息已经标成已读了，
+        不放回去的话它们就再也不会被回复，而且没有任何征兆。
+        """
+        cur = await self.db.execute(
+            "UPDATE messages SET read_at = NULL WHERE conversation_id = ?"
+            " AND author_kind = 'user' AND id <= ? AND read_at IS NOT NULL",
+            (conversation_id, upto_id),
+        )
+        await self.db.commit()
+        return cur.rowcount
+
     async def has_newer_user_message(self, conversation_id: str, after_id: int) -> bool:
         """投递到一半检查对方有没有又发新的。"""
         row = await self._fetch_one(
@@ -398,6 +421,16 @@ class Memory:
         source_message_id: int | None = None,
     ) -> None:
         """记下新事实。已经记过的只是重新变清晰，不重复插入。"""
+        async with self._write_lock:
+            await self._add_facts(subject, facts, at, source_message_id)
+
+    async def _add_facts(
+        self,
+        subject: str,
+        facts: list[str],
+        at: datetime,
+        source_message_id: int | None = None,
+    ) -> None:
         for fact in facts:
             text = fact.strip()
             if not text:
@@ -506,19 +539,40 @@ class Memory:
             return None
         return DayPlan.model_validate_json(row["day_plan_json"])
 
-    async def claim_day_plan(self, day: date) -> bool:
-        """抢占今天的日程生成权。返回 True 表示该你生成，False 表示别人已经在做了。"""
+    async def claim_day_plan(
+        self, day: date, now: datetime, stale_after_minutes: float = 30
+    ) -> bool:
+        """抢占今天的日程生成权。返回 True 表示该你生成。
+
+        **不能拿"diary 行存不存在"当锁。** 她过了午夜还在回消息的话，
+        inner_note 会先把那一天的行建出来，早上再想生成日程就永远抢不到，
+        结果是那一整天没有日程、没有任何主动消息，而且一个字的日志都没有。
+        人设的入睡中位数在午夜之后，这条路径每周都会踩到。
+
+        所以锁看的是 ``day_plan_json`` 有没有内容，外加一个会过期的抢占标记，
+        免得生成到一半进程被杀，那一天就再也生成不出来了。
+        """
+        await self.db.execute(
+            "INSERT OR IGNORE INTO diary (day, status) VALUES (?, 'idle')", (day.isoformat(),)
+        )
+        cutoff = (now - timedelta(minutes=stale_after_minutes)).isoformat()
         cur = await self.db.execute(
-            "INSERT OR IGNORE INTO diary (day, status) VALUES (?, 'generating')",
-            (day.isoformat(),),
+            "UPDATE diary SET status = 'generating', claimed_at = ?"
+            " WHERE day = ? AND day_plan_json IS NULL"
+            "   AND (status != 'generating' OR claimed_at IS NULL OR claimed_at < ?)",
+            (now.isoformat(), day.isoformat(), cutoff),
         )
         await self.db.commit()
         return cur.rowcount > 0
 
     async def release_day_plan(self, day: date) -> None:
-        """生成失败了就把抢占放掉，否则这一整天都不会再有日程。"""
+        """生成失败了就把抢占放掉，否则这一整天都不会再有日程。
+
+        注意只放抢占标记，不删行：那一行里可能已经有日记了。
+        """
         await self.db.execute(
-            "DELETE FROM diary WHERE day = ? AND status = 'generating' AND day_plan_json IS NULL",
+            "UPDATE diary SET status = 'idle', claimed_at = NULL"
+            " WHERE day = ? AND day_plan_json IS NULL",
             (day.isoformat(),),
         )
         await self.db.commit()
@@ -532,15 +586,18 @@ class Memory:
         await self.db.commit()
 
     async def add_diary_note(self, day: date, note: str, at: datetime) -> None:
-        row = await self._fetch_one("SELECT notes_json FROM diary WHERE day = ?", (day.isoformat(),))
-        notes = json.loads(row["notes_json"]) if row else []
-        notes.append({"at": at.isoformat(), "note": note})
-        await self.db.execute(
-            "INSERT INTO diary (day, notes_json) VALUES (?, ?)"
-            " ON CONFLICT(day) DO UPDATE SET notes_json = excluded.notes_json",
-            (day.isoformat(), json.dumps(notes, ensure_ascii=False)),
-        )
-        await self.db.commit()
+        async with self._write_lock:  # 读-改-写，见 _write_lock 的说明
+            row = await self._fetch_one(
+                "SELECT notes_json FROM diary WHERE day = ?", (day.isoformat(),)
+            )
+            notes = json.loads(row["notes_json"]) if row else []
+            notes.append({"at": at.isoformat(), "note": note})
+            await self.db.execute(
+                "INSERT INTO diary (day, notes_json) VALUES (?, ?)"
+                " ON CONFLICT(day) DO UPDATE SET notes_json = excluded.notes_json",
+                (day.isoformat(), json.dumps(notes, ensure_ascii=False)),
+            )
+            await self.db.commit()
 
     async def diary_notes(self, day: date) -> list[tuple[datetime, str]]:
         row = await self._fetch_one("SELECT notes_json FROM diary WHERE day = ?", (day.isoformat(),))

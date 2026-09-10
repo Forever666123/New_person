@@ -202,3 +202,23 @@ async def test_the_loop_survives_a_database_hiccup(parts) -> None:
     sched.stop()
     await asyncio.wait_for(task, timeout=2)
     assert calls, "第一次出意外之后循环就死了"
+
+
+async def test_a_handler_that_reschedules_itself_is_not_marked_done(parts) -> None:
+    """handler 自己把任务推后了，调度器不能再盖成 done。
+
+    暂停期间就是这个路径：回复被推后十分钟，但返回后被标成 done，
+    resume 之后那条回复永远发不出去，消息一直躺在未读里。
+    """
+    memory, clock, sched = parts
+
+    async def defers(job: Job) -> None:
+        await sched.reschedule(job.id or 0, clock.now() + timedelta(minutes=10))
+
+    sched.register("reply", defers)
+    job_id = await sched.schedule("reply", NOW, conversation_id="owner")
+    await sched.run_due_once()
+
+    got = await memory.get_job(job_id)
+    assert got.status == "pending", "被推后的任务不该变成 done"
+    assert got.run_at > NOW

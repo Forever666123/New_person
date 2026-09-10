@@ -77,7 +77,7 @@ class LifeEngine:
         existing = await self.memory.get_day_plan(day)
         if existing is not None:
             return existing
-        if not await self.memory.claim_day_plan(day):
+        if not await self.memory.claim_day_plan(day, now):
             return None  # 别人正在生成
 
         daily = self.rhythm.for_day(day)

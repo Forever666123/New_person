@@ -190,8 +190,50 @@ async def test_next_run_at_tells_the_scheduler_when_to_wake(memory: Memory) -> N
 
 
 async def test_only_one_day_plan_generator_wins(memory: Memory) -> None:
-    assert await memory.claim_day_plan(NOW.date()) is True
-    assert await memory.claim_day_plan(NOW.date()) is False
+    assert await memory.claim_day_plan(NOW.date(), NOW) is True
+    assert await memory.claim_day_plan(NOW.date(), NOW) is False
+
+
+async def test_a_late_night_note_does_not_block_the_day_plan(memory: Memory) -> None:
+    """她过了午夜还在回消息，inner_note 会先把那天的日记行建出来。
+
+    早先拿"行存不存在"当锁，于是早上再想生成日程就永远抢不到，
+    那一整天没有日程、没有任何主动消息，而且一个字的日志都没有。
+    人设的入睡中位数在午夜之后，这条路径每周都会踩到。
+    """
+    await memory.add_diary_note(NOW.date(), "他今天听着挺累", NOW)
+    assert await memory.claim_day_plan(NOW.date(), NOW) is True
+
+
+async def test_a_stuck_claim_expires(memory: Memory) -> None:
+    """生成到一半进程被杀，不能让这一天再也生成不出来。"""
+    assert await memory.claim_day_plan(NOW.date(), NOW) is True
+    assert await memory.claim_day_plan(NOW.date(), NOW + timedelta(minutes=5)) is False
+    assert await memory.claim_day_plan(NOW.date(), NOW + timedelta(hours=1)) is True
+
+
+async def test_a_finished_day_plan_is_never_reclaimed(memory: Memory) -> None:
+    await memory.claim_day_plan(NOW.date(), NOW)
+    await memory.save_day_plan(NOW.date(), DayPlan(date="2026-10-12", mood="还行"))
+    assert await memory.claim_day_plan(NOW.date(), NOW + timedelta(days=1)) is False
+
+
+async def test_releasing_a_claim_keeps_the_notes(memory: Memory) -> None:
+    """生成失败要放掉抢占，但那一行里可能已经有日记了，不能整行删掉。"""
+    await memory.add_diary_note(NOW.date(), "写了点什么", NOW)
+    await memory.claim_day_plan(NOW.date(), NOW)
+    await memory.release_day_plan(NOW.date())
+    assert len(await memory.diary_notes(NOW.date())) == 1
+    assert await memory.claim_day_plan(NOW.date(), NOW) is True
+
+
+async def test_messages_can_be_put_back_in_the_unread_pile(memory: Memory) -> None:
+    """存下来的回复读不出来时，那批消息要能放回去重新处理。"""
+    ids = [await memory.add_user_message(incoming(i)) for i in range(3)]
+    await memory.mark_read(ids, NOW)
+    assert await memory.unread_messages(CONV) == []
+    assert await memory.restore_unread(CONV, ids[-1]) == 3
+    assert len(await memory.unread_messages(CONV)) == 3
 
 
 async def test_day_plan_round_trip(memory: Memory) -> None:

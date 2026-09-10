@@ -134,6 +134,13 @@ class Brain:
 
     # -- 统一调用 -----------------------------------------------------------
 
+    async def over_budget(self, today: date) -> bool:
+        """今天的调用额度是不是用完了。
+
+        调用方拿它区分"故障"和"今天做不了"：前者重试，后者顺延到明天。
+        """
+        return await self._over_budget(today)
+
     async def _over_budget(self, today: date) -> bool:
         if self.memory is None or self.settings.max_calls_per_day <= 0:
             return False

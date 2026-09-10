@@ -150,7 +150,7 @@ async def build(tmp_path: Path, persona: Persona, script: list, *, now=EVENING):
         rng=rng,
     )
     channel = FakeChannel()
-    app._channel = channel
+    app._default_channel = channel
     app.client = SimpleNamespace(user=SimpleNamespace(id=999))
     scheduler.register("reply", app.handle_reply_job)
     scheduler.register("proactive", app.handle_proactive_job)
@@ -651,3 +651,110 @@ async def test_photo_placeholder_without_a_photo_is_cleaned_up(
     await drain(app, clock)
     assert all("{photo}" not in t for t in channel.texts)
     assert "冷死了" in channel.texts
+
+
+async def test_a_paused_reply_still_goes_out_after_resume(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """暂停期间到期的回复，恢复之后要能发出去。
+
+    早先的写法把它推后十分钟，但 handler 正常返回后被盖成 done，
+    resume 之后干等再也不会发。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="在")])]
+    )
+    await memory.kv_set("paused", "1")
+    await send(app, "在吗", at=EVENING)
+    await drain(app, clock, hops=2)
+    assert channel.sent == []
+
+    await memory.kv_delete("paused")
+    await drain(app, clock, hops=4)
+    assert channel.texts == ["在"], "恢复之后这条回复还是没发出去"
+
+
+async def test_a_crash_mid_delivery_still_records_what_was_sent(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """网络断在中间时，前几条其实已经到对方手机上了。
+
+    不记下来的话她自己的历史里就少一截，重试续发会重复或者前后矛盾。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="第一条"), ReplyPart(text="第二条")])],
+    )
+
+    sent = 0
+    original = channel.send
+
+    async def flaky(content=None, *, file=None, reference=None):
+        nonlocal sent
+        sent += 1
+        if sent == 2:
+            raise RuntimeError("连接断了")
+        return await original(content, file=file, reference=reference)
+
+    channel.send = flaky
+    await send(app, "在吗", at=EVENING)
+    await drain(app, clock, hops=3)
+
+    history = [m.content for m in await memory.recent_messages(CONVERSATION_ID, 10)]
+    assert "第一条" in history, "已经发出去的话没进她自己的历史"
+
+
+async def test_corrupt_progress_puts_the_messages_back(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """存下来的回复读不出来时，那批消息已经是已读了。
+
+    不放回未读的话，重新生成时看到的是空的，整批消息就再也不会有人回。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="第一版")]), ReplyPlan(parts=[ReplyPart(text="第二版")])],
+    )
+    await send(app, "在吗", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    clock.set(jobs[0].run_at)
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["第一版"]
+
+    # 模拟升级之后队列里的 progress 读不出来了
+    job_id = (await memory.jobs_of_kind("reply", CONVERSATION_ID))[0].id
+    await memory.save_job_progress(job_id, {"plan": {"parts": "坏的"}}, 1)
+    await memory.set_job_status(job_id, "pending")
+    await app.scheduler.run_due_once()
+    assert "第二版" in channel.texts, "消息没被放回未读，重新生成时什么都看不到"
+
+
+async def test_the_daily_cap_defers_instead_of_dropping(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """额度用完不是故障，别拿三次重试把它烧掉然后把消息丢了。"""
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [None])
+    app.settings.max_calls_per_day = 1
+    await memory.record_usage(app.rhythm.local_date(EVENING), input_tokens=10)
+
+    await send(app, "在吗", at=EVENING)
+    await drain(app, clock, hops=2)
+
+    assert channel.sent == []
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert jobs, "任务被丢掉了，这批消息再也不会有人回"
+    assert jobs[0].run_at > EVENING + timedelta(hours=1), "应该顺延到明天，不是几分钟后重试"
+    assert await memory.unread_messages(CONVERSATION_ID), "消息要留着"
+
+
+async def test_reconnecting_does_not_start_everything_twice(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """on_ready 会被反复触发。每次都重来一遍会泄漏连接、叠加 presence 循环。"""
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    app._started = True
+    before = len(app._tasks)
+    await app.start(app.client)
+    assert len(app._tasks) == before
