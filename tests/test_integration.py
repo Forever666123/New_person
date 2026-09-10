@@ -511,3 +511,61 @@ async def test_usage_is_tracked(tmp_path: Path, persona: Persona) -> None:
     used = await memory.usage_for(app.rhythm.local_date(EVENING))
     assert used["calls"] == 1
     assert used["cache_read_tokens"] == 80
+
+
+async def test_a_model_failure_does_not_swallow_the_message(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """模型第一次没给出结果，重试时这批消息还要在。
+
+    早先的写法在调模型之前就把消息标成已读，重试时未读是空的，
+    整批消息就永远回不出去了。这个测试守着这件事。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [None, ReplyPlan(parts=[ReplyPart(text="刚看到")])]
+    )
+    await send(app, "帮我看下这个", at=EVENING)
+
+    await drain(app, clock, hops=2)
+    assert channel.sent == []
+    assert await memory.unread_messages(CONVERSATION_ID), "失败之后消息不能被标成已读"
+
+    await drain(app, clock, hops=4)
+    assert channel.texts == ["刚看到"]
+
+
+async def test_delivery_resumes_without_calling_the_model_again(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """发到一半崩了，重启接着发，不重新想一遍。"""
+    plan = ReplyPlan(parts=[ReplyPart(text="第一条"), ReplyPart(text="第二条")])
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [plan])
+    await send(app, "在吗", at=EVENING)
+    await drain(app, clock, hops=1)
+
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    job_id = jobs[0].id
+    # 假装第一条发出去之后进程挂了
+    await memory.save_job_progress(
+        job_id, {"plan": plan.model_dump(mode="json"), "sent_parts": 1}, 1
+    )
+    clock.set(jobs[0].run_at)
+    await app.scheduler.run_due_once()
+
+    assert channel.texts == ["第二条"], "第一条不该重发"
+    assert llm.calls == [], "续发不该再调模型"
+
+
+async def test_corrupt_progress_falls_back_to_thinking_again(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """存下来的回复读不出来时，重新生成，而不是卡死。"""
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    await send(app, "在吗", at=EVENING)
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    await memory.save_job_progress(jobs[0].id, {"plan": {"parts": "这不是列表"}}, 1)
+    clock.set(jobs[0].run_at)
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["嗯"]

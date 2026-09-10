@@ -6,8 +6,9 @@
 
 - **在线状态跟着行为走，不跟着时钟走。** 每天准点上线下线是最大的破绽。
   她睡觉时离线，醒着时默认 idle（手机在口袋里），只有真的在看手机的那几分钟才 online。
-- **她只有一部手机。** 任何动作之前先把所有未读标成已看到，
-  不会出现一边发主动消息一边让半小时前的私信躺着没读。
+- **她只有一部手机。** 一次把所有未读一起处理，不会出现一边发主动消息、
+  一边让半小时前的私信躺着没读。但"已读"要等她真的想好了怎么回才落库，
+  模型没给出结果时消息还留着，重试时不会凭空消失。
 - **``!np`` 开头的消息不入库、不进模型。** 她不知道你在操控她。
 """
 
@@ -320,28 +321,46 @@ class App:
             return
 
         now = self.clock.now()
+        from .models import ReplyPlan
+
+        saved = job.progress.get("plan")
+        if saved is not None:
+            # 上次发到一半（崩了或者投递失败），接着发，不重新调模型
+            start_index = int(job.progress.get("sent_parts", 0))
+            covers = job.covers_upto_message_id
+            try:
+                reply_plan = ReplyPlan.model_validate(saved)
+            except Exception:  # noqa: BLE001 - 存坏了就重新生成，别卡死在这
+                log.warning("[job] 存下来的回复读不出来，重新想一遍")
+                await self.memory.save_job_progress(job.id or 0, {}, covers)
+                saved = None
+            else:
+                log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
+                unread = [
+                    m
+                    for m in await self.memory.recent_messages(CONVERSATION_ID, 40)
+                    if m.author_kind == "user" and m.id <= covers
+                ]
+                await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
+                return
+
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         if not unread:
             return
-
-        # 她只有一部手机：动手之前，所有未读都算看到了
-        await self.memory.mark_read([m.id for m in unread], now)
         covers = max(m.id for m in unread)
 
-        plan = job.progress.get("plan")
-        start_index = int(job.progress.get("sent_parts", 0))
-        if plan is not None:
-            from .models import ReplyPlan
+        reply_plan = await self._generate_reply(job, unread, now)
+        if reply_plan is None:
+            # 模型没给出结果。**这里绝不能提前把消息标成已读**，
+            # 否则重试的时候未读是空的，这批消息就永远回不出去了。
+            raise RuntimeError("模型这次没给出回复")
 
-            reply_plan = ReplyPlan.model_validate(plan)
-            log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
-        else:
-            reply_plan = await self._generate_reply(job, unread, now)
-            if reply_plan is None:
-                raise RuntimeError("模型这次没给出回复")
-            await self.memory.save_job_progress(
-                job.id or 0, {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}, covers
-            )
+        # 生成成功了才算她真的处理过这批消息
+        await self.memory.mark_read([m.id for m in unread], now)
+        start_index = 0
+        await self.memory.save_job_progress(
+            job.id or 0, {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}, covers
+        )
 
         if not reply_plan.parts and not reply_plan.reaction:
             log.info("[brain] 这条她不打算回")
@@ -392,7 +411,9 @@ class App:
     ) -> None:
         channel = await self.resolve_channel()
         photo = await self._resolve_photo(plan.photo_request, now)
-        react_to = await self._fetch_message(unread[-1].discord_message_id)
+        react_to = (
+            await self._fetch_message(unread[-1].discord_message_id) if unread else None
+        )
         reply_to = None
         if plan.reply_to_index is not None and 0 <= plan.reply_to_index < len(unread):
             reply_to = await self._fetch_message(unread[plan.reply_to_index].discord_message_id)
