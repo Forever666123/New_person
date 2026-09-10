@@ -141,9 +141,11 @@ class TimingDecision(BaseModel):
     """人物开始回复（开始打字）的时间。"""
     reason: str
     """人类可读的解释，写进日志方便调参。"""
-    will_reply: bool = True
-    """False 表示这次看到了但没回（下一条消息或下一次主动才会带出来）。"""
+    defers: int = 0
+    """看到了先放着的次数。真人常有的"待会儿再回"。"""
     quick_before_sleep: bool = False
+    hints: list[str] = Field(default_factory=list)
+    """给模型的处境提示，进上下文，不会直接发出去。"""
 
 
 # ---------------------------------------------------------------------------

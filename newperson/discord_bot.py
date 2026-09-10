@@ -21,6 +21,7 @@ import random
 
 import discord
 
+from .attention import AttentionPolicy
 from .brain import Brain
 from .clock import Clock
 from .config import Settings
@@ -32,7 +33,6 @@ from .models import Job
 from .persona import Persona
 from .rhythm import Rhythm
 from .scheduler import Scheduler
-from .timing import ReplyTimingPolicy
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class App:
         persona: Persona,
         clock: Clock,
         rhythm: Rhythm,
-        timing: ReplyTimingPolicy,
+        attention: AttentionPolicy,
         memory: Memory,
         scheduler: Scheduler,
         brain: Brain,

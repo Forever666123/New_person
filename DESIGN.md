@@ -49,7 +49,7 @@ Discord Gateway ──► discord_bot.py（收消息 / 发消息 / 在线状态 
 - `calendar.py`：学期日历与出行 → 某天处在学期的哪一段、在不在外面、人在哪个时区。
 - `rhythm.py`：作息 → `sleeping / busy / free / winding_down` + 活跃度 + 下一次看手机。
 - `style_guard.py`：说话风格的最后一道关，预算制。
-- `attention.py`（原 timing.py 的升级）：**核心"像真人"逻辑**——"看手机"（glance）过程 + 回复时机 + 防抖 + 疲劳。
+- `attention.py`：**核心"像真人"逻辑**——看到消息的时机、回复的时机、防抖、疲劳、给模型的处境提示。
 - `persona.py` / `config.py` / `models.py`。
 
 ## 2. 关键行为规范

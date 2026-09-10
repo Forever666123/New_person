@@ -11,9 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from .attention import AttentionPolicy
 from .clock import Clock
 from .models import ProactivePlan, ReplyPart, ReplyPlan, ResolvedPhoto
-from .timing import ReplyTimingPolicy
 
 DISCORD_MAX_LEN = 2000
 
@@ -45,10 +45,10 @@ class DeliveryResult:
 
 
 class Deliverer:
-    def __init__(self, clock: Clock, timing: ReplyTimingPolicy, rng: random.Random, make_file: Callable[[Path], Any]) -> None:
+    def __init__(self, clock: Clock, attention: AttentionPolicy, rng: random.Random, make_file: Callable[[Path], Any]) -> None:
         """make_file: 把本地路径变成 discord.File（测试里传 lambda p: p）。"""
         self.clock = clock
-        self.timing = timing
+        self.attention = attention
         self.rng = rng
         self.make_file = make_file
 
