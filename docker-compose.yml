@@ -1,0 +1,8 @@
+services:
+  newperson:
+    build: .
+    env_file: .env
+    volumes:
+      - ./persona:/app/persona:ro
+      - ./data:/app/data
+    restart: unless-stopped
