@@ -287,14 +287,18 @@ datetime 一律存 ISO8601 含时区偏移的字符串。
 - 人物配置：`persona/persona.yaml`（见 `persona/persona.example.yaml`）。新增 `timing.typing_chars_per_second=2.0`、`timing.fatigue_after_minutes=30`、`timing.forgot_probability=0.15`、`timing.typo_probability=0.07`。
 - `check`：`background` / `speaking_style` 仍含【待填】→ 失败；其他占位 → 警告。`run` 在有【待填】时拒绝启动，除非 `--allow-placeholders`。
 
+## 4.5 实现状态
+
+全部模块已实现，215 个测试通过，不联网。模块与职责见 README 的项目结构。
+
 ## 5. 命令行
 
 ```
-python -m newperson run [--allow-placeholders]   # 启动机器人
-python -m newperson check [--online]             # 检查配置；--online 会登录 Discord 验证 token、privileged intent、能否私聊 Owner
-python -m newperson simulate [--days N --seed S --messages-per-day M] [--from-db]   # 用假时钟模拟回复时机；--from-db 回放库里真实消息
-python -m newperson plan                          # 生成今日日程并打印（联网）
-python -m newperson photos scan                   # 为照片目录生成 index 草稿
+python -m newperson run [--allow-placeholders]
+python -m newperson check [--online]
+python -m newperson simulate [--days N --seed S --messages-per-day M] [--verbose]
+python -m newperson plan [--save]
+python -m newperson photos
 ```
 
 ## 6. 首次接入 Discord（README 必须包含）

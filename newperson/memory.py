@@ -189,6 +189,7 @@ class Memory:
         return StoredMessage(
             id=row["id"],
             conversation_id=row["conversation_id"],
+            discord_message_id=row["discord_message_id"],
             author_kind=row["author_kind"],
             author_id=row["author_id"],
             author_name=row["author_name"],
@@ -514,6 +515,14 @@ class Memory:
         await self.db.commit()
         return cur.rowcount > 0
 
+    async def release_day_plan(self, day: date) -> None:
+        """生成失败了就把抢占放掉，否则这一整天都不会再有日程。"""
+        await self.db.execute(
+            "DELETE FROM diary WHERE day = ? AND status = 'generating' AND day_plan_json IS NULL",
+            (day.isoformat(),),
+        )
+        await self.db.commit()
+
     async def save_day_plan(self, day: date, plan: DayPlan) -> None:
         await self.db.execute(
             "INSERT INTO diary (day, status, day_plan_json) VALUES (?, 'ready', ?)"
@@ -680,6 +689,19 @@ class Memory:
             sql += " AND conversation_id = ?"
             args.append(conversation_id)
         rows = await self._fetch_all(sql + " ORDER BY run_at", tuple(args))
+        return [self._row_to_job(r) for r in rows]
+
+    async def jobs_of_kind(self, kind: JobKind, conversation_id: str | None = None) -> list[Job]:
+        """某一类的全部任务，不限状态。排查和测试用。"""
+        if conversation_id:
+            rows = await self._fetch_all(
+                "SELECT * FROM jobs WHERE kind = ? AND conversation_id = ? ORDER BY id",
+                (kind, conversation_id),
+            )
+        else:
+            rows = await self._fetch_all(
+                "SELECT * FROM jobs WHERE kind = ? ORDER BY id", (kind,)
+            )
         return [self._row_to_job(r) for r in rows]
 
     async def running_jobs(self, conversation_id: str | None = None) -> list[Job]:

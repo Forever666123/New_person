@@ -175,6 +175,8 @@ class IncomingMessage(BaseModel):
 class StoredMessage(BaseModel):
     id: int
     conversation_id: str
+    discord_message_id: int | None = None
+    """Discord 那边的消息 id。加表情反应和引用回复都要用它。"""
     author_kind: Literal["user", "bot"]
     author_id: int
     author_name: str = ""

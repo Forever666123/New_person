@@ -1,51 +1,74 @@
-"""Discord 适配层：收消息、发消息、在线状态。
+"""Discord 适配层与组合根。
 
-组成：
-- ``NewPersonClient(discord.Client)``：网关事件 → ``App``。
-- ``PresenceManager``：每 60s 按作息更新 presence（DESIGN.md 2.6）。
-- ``App``：组合根，把 memory / scheduler / brain / life / delivery 串起来，注册各类任务的 handler：
-    - reply：读未读消息 → 构造 ReplyContext → brain.generate_reply → media.resolve → deliver →
-      存库、mark_read、follow_up、diary、必要时安排 memory_update；被打断则按 hot 规则重新安排。
-    - proactive / follow_up：检查 sleeping / hot → brain.generate_proactive → deliver → 存库。
-    - day_plan：life.handle_day_plan_job。
-    - memory_update：brain.update_memory → 更新 summary / facts。
+这里把所有模块串起来，并处理和 Discord 打交道的那部分：收消息、发消息、在线状态。
 
-权限：只处理 DM 里来自 allowed 用户的消息，或频道里 @人物 的消息（同样限 allowed 用户）。忽略机器人。
-附件：image/* 且 ≤ 5MB 的下载到 downloads_dir，作为 images 传给 brain。
+几个关键决定：
+
+- **在线状态跟着行为走，不跟着时钟走。** 每天准点上线下线是最大的破绽。
+  她睡觉时离线，醒着时默认 idle（手机在口袋里），只有真的在看手机的那几分钟才 online。
+- **她只有一部手机。** 任何动作之前先把所有未读标成已看到，
+  不会出现一边发主动消息一边让半小时前的私信躺着没读。
+- **``!np`` 开头的消息不入库、不进模型。** 她不知道你在操控她。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import random
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 import discord
 
-from .attention import AttentionPolicy
-from .brain import Brain
-from .clock import Clock
+from . import owner as owner_cmds
+from .attention import AttentionPolicy, extract_features, heat_of
+from .brain import Brain, MemoryUpdateRequest, ProactiveRequest, ReplyRequest, build_client
+from .calendar import AcademicCalendar
+from .clock import Clock, RealClock
 from .config import Settings
-from .delivery import Deliverer
+from .delivery import Deliverer, DeliveryBlocked
 from .life import LifeEngine
-from .media import MediaService
+from .media import CommandImageGenerator, MediaService, NullImageGenerator, PhotoLibrary
 from .memory import Memory
-from .models import Job
+from .models import IncomingMessage, Job, PhotoRequest, TimeOfDay
 from .persona import Persona
+from .prompts import build_situation
 from .rhythm import Rhythm
 from .scheduler import Scheduler
 
 log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+CONVERSATION_ID = "owner"
+PHOTO_SHORTLIST = 20
+"""进上下文的照片最多这么多条，免得库大了把提示词撑爆。"""
+
+
+def time_of_day_at(dt: datetime) -> TimeOfDay:
+    """给照片挑选用的时段。半夜不该发白天拍的照片。"""
+    hour = dt.hour
+    if hour < 5 or hour >= 23:
+        return "night"
+    if hour < 11:
+        return "morning"
+    if hour < 17:
+        return "day"
+    return "evening"
 
 
 class App:
+    """组合根。所有任务的 handler 都挂在这里。"""
+
     def __init__(
         self,
         settings: Settings,
         persona: Persona,
         clock: Clock,
         rhythm: Rhythm,
+        calendar: AcademicCalendar,
         attention: AttentionPolicy,
         memory: Memory,
         scheduler: Scheduler,
@@ -55,35 +78,621 @@ class App:
         deliverer: Deliverer,
         rng: random.Random,
     ) -> None:
-        raise NotImplementedError
+        self.settings = settings
+        self.persona = persona
+        self.clock = clock
+        self.rhythm = rhythm
+        self.calendar = calendar
+        self.attention = attention
+        self.memory = memory
+        self.scheduler = scheduler
+        self.brain = brain
+        self.media = media
+        self.life = life
+        self.deliverer = deliverer
+        self.rng = rng
+        self.client: discord.Client | None = None
+        self._channel: Any = None
+
+    # -- 启动 ---------------------------------------------------------------
 
     async def start(self, client: discord.Client) -> None:
-        """on_ready 时调用：打开 memory、reset running、注册 handler、ensure_today_plan、启动 scheduler 与 presence 循环。"""
-        raise NotImplementedError
+        """网关就绪之后跑一次。"""
+        self.client = client
+        await self.memory.open()
+        self.scheduler.register("reply", self.handle_reply_job)
+        self.scheduler.register("proactive", self.handle_proactive_job)
+        self.scheduler.register("follow_up", self.handle_proactive_job)
+        self.scheduler.register("day_plan", self.life.handle_day_plan_job)
+        self.scheduler.register("memory_update", self.handle_memory_update_job)
+
+        await self.scheduler.recover()
+        await self.life.schedule_next_day_plan()
+        if not self.rhythm.is_sleeping(self.clock.now()):
+            await self.life.ensure_today_plan(CONVERSATION_ID)
+
+        asyncio.create_task(self.scheduler.run_forever())  # noqa: RUF006
+        log.info("[app] %s 上线了", self.persona.name)
+
+    async def resolve_channel(self) -> Any:
+        """她说话的地方。默认私聊 Owner，也可以指定一个频道。"""
+        if self._channel is not None:
+            return self._channel
+        if self.client is None:
+            raise RuntimeError("Discord 还没连上")
+
+        if self.settings.proactive_channel_id:
+            self._channel = self.client.get_channel(
+                self.settings.proactive_channel_id
+            ) or await self.client.fetch_channel(self.settings.proactive_channel_id)
+        else:
+            user = self.client.get_user(
+                self.settings.owner_user_id
+            ) or await self.client.fetch_user(self.settings.owner_user_id)
+            self._channel = user.dm_channel or await user.create_dm()
+        return self._channel
+
+    # -- 收消息 -------------------------------------------------------------
+
+    def _should_handle(self, message: discord.Message) -> bool:
+        if message.author.bot:
+            return False
+        if self.client and message.author.id == getattr(self.client.user, "id", None):
+            return False
+        if message.author.id not in self.settings.all_allowed_user_ids:
+            return False
+        if isinstance(message.channel, discord.DMChannel):
+            return True
+        return bool(
+            self.settings.proactive_channel_id
+            and message.channel.id == self.settings.proactive_channel_id
+        )
 
     async def on_user_message(self, message: discord.Message) -> None:
-        """过滤 → 存库 → 有 pending reply 就 merge，否则 plan_reply 并 schedule。"""
-        raise NotImplementedError
+        if not self._should_handle(message):
+            return
+
+        # !np 开头的是给程序看的，不入库也不进模型
+        if owner_cmds.is_command(message.content) and message.author.id == self.settings.owner_user_id:
+            reply = await owner_cmds.handle(
+                message.content,
+                owner_cmds.OwnerContext(
+                    memory=self.memory,
+                    rhythm=self.rhythm,
+                    scheduler=self.scheduler,
+                    life=self.life,
+                    conversation_id=CONVERSATION_ID,
+                    now=self.clock.now(),
+                ),
+            )
+            await message.channel.send(reply)
+            return
+
+        now = self.clock.now()
+        attachments = await self._download_images(message)
+        stored_id = await self.memory.add_user_message(
+            IncomingMessage(
+                conversation_id=CONVERSATION_ID,
+                discord_message_id=message.id,
+                author_id=message.author.id,
+                author_name=message.author.display_name,
+                content=message.content,
+                attachments=attachments,
+                created_at=now,
+            )
+        )
+        if not stored_id:
+            return  # 网关重发，已经处理过了
+
+        log.info(
+            "[inbox] %d 字%s", len(message.content), " 带图" if attachments else ""
+        )
+        await self._schedule_reply(now)
+
+    async def _schedule_reply(self, now: datetime) -> None:
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        unread = await self.memory.unread_messages(CONVERSATION_ID)
+        if not unread:
+            return
+
+        heat = heat_of(
+            now,
+            conv.last_user_message_at,
+            conv.last_bot_message_at,
+            self.persona.timing.hot_seconds,
+            self.persona.timing.warm_seconds,
+        )
+
+        pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
+        if pending:
+            # 他还在连着发，就等他说完再一起回，但不会无限等下去
+            job = pending[0]
+            new_at = self.attention.merge_pending(job.run_at, now, heat, self.rng)
+            await self.scheduler.reschedule(job.id or 0, new_at)
+            log.info("[timing] 他还在打字，回复推到 %s", new_at.strftime("%H:%M"))
+            return
+
+        if heat == "hot" and conv.hot_session_started_at is None:
+            await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=now)
+        elif heat == "cold":
+            await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
+
+        features = extract_features(
+            [m.content for m in unread],
+            self.persona,
+            has_image=any(m.attachments for m in unread),
+        )
+        decision = self.attention.plan_reply(
+            now,
+            heat,
+            features,
+            unread[-1].created_at,
+            self.rng,
+            session_started_at=conv.hot_session_started_at,
+        )
+        log.info(
+            "[timing] heat=%s 看到 %s 回 %s　%s",
+            heat,
+            decision.notice_at.strftime("%m-%d %H:%M"),
+            decision.reply_at.strftime("%m-%d %H:%M"),
+            decision.reason,
+        )
+        await self.scheduler.schedule(
+            "reply",
+            decision.reply_at,
+            conversation_id=CONVERSATION_ID,
+            payload={"hints": decision.hints, "mode": features.mode},
+            reason=decision.reason[:180],
+        )
+
+    async def _download_images(self, message: discord.Message) -> list:
+        """把他发的图片存下来，之后要真的给她看。"""
+        from .models import Attachment
+
+        out: list[Attachment] = []
+        for att in message.attachments:
+            item = Attachment(
+                url=att.url,
+                filename=att.filename,
+                content_type=att.content_type,
+                size=att.size,
+            )
+            if (att.content_type or "").startswith("image/") and att.size <= MAX_IMAGE_BYTES:
+                target = self.settings.downloads_dir / f"{message.id}-{att.filename}"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    await att.save(target)
+                    item.local_path = str(target)
+                except Exception as exc:  # noqa: BLE001 - 下不下来就当没这张图
+                    log.warning("[inbox] 图片没存下来：%s", exc)
+            out.append(item)
+        return out
+
+    # -- 上下文 -------------------------------------------------------------
+
+    async def _build_situation(self, now: datetime) -> str:
+        day = self.rhythm.local_date(now)
+        daily = self.rhythm.for_day(day)
+        plan = await self.memory.get_day_plan(day)
+        notes = [note for _, note in await self.memory.diary_notes(day)]
+
+        mood = list(daily.mood_notes)
+        if away := await owner_cmds.away_state(self.memory, day):
+            mood.append(f"你最近{away}，没什么心思聊天。")
+
+        return build_situation(
+            persona=self.persona,
+            now=now,
+            state_line=self.life.state_line(now),
+            mood_notes=mood,
+            day_plan=plan,
+            diary_notes=notes,
+        )
+
+    async def _photo_shortlist(self, now: datetime) -> list:
+        used = await self.memory.recently_used_photo_ids(now)
+        return self.media.library.available(used, time_of_day_at(now))[:PHOTO_SHORTLIST]
+
+    async def _recall(self, now: datetime) -> tuple[list[str], list[str]]:
+        cfg = self.persona.memory
+        owner_facts = await self.memory.recall_facts(
+            "owner", now, cfg.fact_half_life_days, cfg.fact_recall_threshold
+        )
+        self_facts = await self.memory.recall_facts(
+            "self", now, cfg.fact_half_life_days, cfg.fact_recall_threshold
+        )
+        return owner_facts, self_facts
+
+    async def _resolve_photo(self, request: PhotoRequest | None, now: datetime):
+        if request is None:
+            return None
+        used = await self.memory.recently_used_photo_ids(now)
+        return await self.media.resolve(request, used, self.rng, time_of_day_at(now))
+
+    # -- 回复 ---------------------------------------------------------------
 
     async def handle_reply_job(self, job: Job) -> None:
-        raise NotImplementedError
+        if await owner_cmds.is_paused(self.memory):
+            log.info("[job] 暂停中，回复先不发")
+            await self.scheduler.reschedule(
+                job.id or 0, self.clock.now() + timedelta(minutes=10)
+            )
+            return
+
+        now = self.clock.now()
+        unread = await self.memory.unread_messages(CONVERSATION_ID)
+        if not unread:
+            return
+
+        # 她只有一部手机：动手之前，所有未读都算看到了
+        await self.memory.mark_read([m.id for m in unread], now)
+        covers = max(m.id for m in unread)
+
+        plan = job.progress.get("plan")
+        start_index = int(job.progress.get("sent_parts", 0))
+        if plan is not None:
+            from .models import ReplyPlan
+
+            reply_plan = ReplyPlan.model_validate(plan)
+            log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
+        else:
+            reply_plan = await self._generate_reply(job, unread, now)
+            if reply_plan is None:
+                raise RuntimeError("模型这次没给出回复")
+            await self.memory.save_job_progress(
+                job.id or 0, {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}, covers
+            )
+
+        if not reply_plan.parts and not reply_plan.reaction:
+            log.info("[brain] 这条她不打算回")
+            await self._after_reply(reply_plan, now, sent_any=False)
+            return
+
+        await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
+
+    async def _generate_reply(self, job: Job, unread: list, now: datetime):
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        owner_facts, self_facts = await self._recall(now)
+        recent = await self.memory.recent_messages(
+            CONVERSATION_ID, self.persona.memory.recent_messages
+        )
+        recent = [m for m in recent if m.id not in {u.id for u in unread}]
+
+        mode_name = job.payload.get("mode")
+        mode = next((m for m in self.persona.modes if m.name == mode_name), None)
+        ledger = await self.memory.ledger(mode.ledger_kind) if mode and mode.include_ledger else []
+
+        images = []
+        for msg in unread:
+            for att in msg.attachments:
+                if att.local_path and Path(att.local_path).exists():
+                    images.append(
+                        (att.content_type or "image/png", Path(att.local_path).read_bytes())
+                    )
+
+        return await self.brain.generate_reply(
+            ReplyRequest(
+                situation=await self._build_situation(now),
+                summary=conv.summary,
+                owner_facts=owner_facts,
+                self_facts=self_facts,
+                ledger=ledger,
+                mode_instruction=mode.instruction if mode else "",
+                recent=recent,
+                unread=unread,
+                hints=list(job.payload.get("hints", [])),
+                photos=await self._photo_shortlist(now),
+                images=images,
+            ),
+            self.rhythm.local_date(now),
+        )
+
+    async def _deliver_reply(
+        self, job: Job, plan, unread: list, now: datetime, start_index: int, covers: int
+    ) -> None:
+        channel = await self.resolve_channel()
+        photo = await self._resolve_photo(plan.photo_request, now)
+        react_to = await self._fetch_message(unread[-1].discord_message_id)
+        reply_to = None
+        if plan.reply_to_index is not None and 0 <= plan.reply_to_index < len(unread):
+            reply_to = await self._fetch_message(unread[plan.reply_to_index].discord_message_id)
+
+        async def interrupted() -> bool:
+            return await self.memory.has_newer_user_message(CONVERSATION_ID, covers)
+
+        async def on_progress(index: int) -> None:
+            await self.memory.save_job_progress(
+                job.id or 0,
+                {"plan": plan.model_dump(mode="json"), "sent_parts": index + 1},
+                covers,
+            )
+
+        try:
+            result = await self.deliverer.deliver_reply(
+                channel,
+                plan,
+                photo,
+                react_to=react_to,
+                interrupted=interrupted,
+                reply_to=reply_to,
+                on_progress=on_progress,
+                start_index=start_index,
+            )
+        except DeliveryBlocked as blocked:
+            log.error("[delivery] 发不出去：%s", blocked.hint)
+            await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
+            await self._record_sent(blocked.result, now)
+            return
+
+        await self._record_sent(result, now)
+        await self._after_reply(plan, now, sent_any=bool(result.sent_texts))
+
+        if result.interrupted:
+            log.info("[delivery] 他又发了，剩下的不发了，重新排一次")
+            await self._schedule_reply(self.clock.now())
+
+    async def _fetch_message(self, message_id: int | None):
+        if not message_id or self.client is None:
+            return None
+        with contextlib.suppress(Exception):
+            channel = await self.resolve_channel()
+            return await channel.fetch_message(message_id)
+        return None
+
+    async def _record_sent(self, result, now: datetime) -> None:
+        for i, text in enumerate(result.sent_texts):
+            await self.memory.add_bot_message(
+                CONVERSATION_ID,
+                text,
+                now,
+                discord_message_id=result.sent_message_ids[i]
+                if i < len(result.sent_message_ids)
+                else None,
+            )
+        if result.photo_sent and result.photo_sent.photo_id:
+            await self.memory.mark_photo_used(
+                result.photo_sent.photo_id, CONVERSATION_ID, now, result.photo_sent.is_fresh
+            )
+
+    async def _after_reply(self, plan, now: datetime, sent_any: bool) -> None:
+        day = self.rhythm.local_date(now)
+        if plan.inner_note:
+            await self.memory.add_diary_note(day, plan.inner_note, now)
+        if plan.ledger_entries:
+            await self.memory.add_ledger_entries(plan.ledger_entries, now)
+        if plan.follow_up:
+            await self.life.schedule_follow_up(
+                CONVERSATION_ID, plan.follow_up.delay_minutes, plan.follow_up.note
+            )
+        if sent_any:
+            await self.memory.update_conversation(CONVERSATION_ID, unanswered_initiations=0)
+        await self._maybe_summarize()
+
+    async def _maybe_summarize(self) -> None:
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        pending = await self.memory.count_messages_after(
+            CONVERSATION_ID, conv.summary_upto_message_id
+        )
+        if pending < self.persona.memory.summarize_after:
+            return
+        if await self.memory.pending_jobs("memory_update", CONVERSATION_ID):
+            return
+        await self.scheduler.schedule(
+            "memory_update",
+            self.clock.now() + timedelta(seconds=30),
+            conversation_id=CONVERSATION_ID,
+            reason="对话攒够了，整理一下",
+        )
+
+    # -- 主动消息 -----------------------------------------------------------
 
     async def handle_proactive_job(self, job: Job) -> None:
-        raise NotImplementedError
+        now = self.clock.now()
+        if await owner_cmds.is_paused(self.memory):
+            return
+        if self.rhythm.is_sleeping(now):
+            log.info("[proactive] 这会儿在睡觉，算了")
+            return
+
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        if not conv.deliverable:
+            return
+
+        # 有未读就不另起话头了，那是回复该做的事
+        unread = await self.memory.unread_messages(CONVERSATION_ID)
+        pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
+        if unread or pending:
+            log.info("[proactive] 有未读，本来想说的话并进回复里")
+            if pending:
+                await self.scheduler.reschedule(
+                    pending[0].id or 0, now + timedelta(seconds=self.rng.uniform(20, 90))
+                )
+            return
+
+        heat = heat_of(
+            now,
+            conv.last_user_message_at,
+            conv.last_bot_message_at,
+            self.persona.timing.hot_seconds,
+            self.persona.timing.warm_seconds,
+        )
+        if heat == "hot":
+            log.info("[proactive] 正聊着呢，不用另起话头")
+            return
+
+        day = self.rhythm.local_date(now)
+        kind = job.payload.get("kind", "own_life")
+        if not await self.life.can_initiate_today(CONVERSATION_ID, day):
+            log.info("[proactive] 今天已经主动过而且他没回，不追了")
+            return
+        if away := await owner_cmds.away_state(self.memory, day):
+            if kind not in ("callback", "follow_up"):
+                log.info("[proactive] 请假中（%s），这类主动跳过", away)
+                return
+
+        photos = await self._photo_shortlist(now)
+        if job.payload.get("requires_photo") and not photos:
+            log.info("[proactive] 想发照片但库里没有，跳过")
+            return
+
+        owner_facts, self_facts = await self._recall(now)
+        last = max(
+            [t for t in (conv.last_user_message_at, conv.last_bot_message_at) if t],
+            default=None,
+        )
+        plan = await self.brain.generate_proactive(
+            ProactiveRequest(
+                situation=await self._build_situation(now),
+                trigger_note=job.payload.get("note", ""),
+                summary=conv.summary,
+                owner_facts=owner_facts,
+                self_facts=self_facts,
+                recent=await self.memory.recent_messages(CONVERSATION_ID, 20),
+                hours_since_last_exchange=(now - last).total_seconds() / 3600 if last else None,
+                unanswered_initiations=conv.unanswered_initiations,
+                photos=photos,
+            ),
+            day,
+        )
+        if plan is None:
+            raise RuntimeError("主动消息没生成出来")
+        if not plan.send or (not plan.parts and not plan.photo_request):
+            log.info("[proactive] 她想了想，没什么要说的")
+            return
+
+        photo = await self._resolve_photo(plan.photo_request, now)
+        if job.payload.get("requires_photo") and photo is None:
+            return
+
+        try:
+            result = await self.deliverer.deliver_proactive(
+                await self.resolve_channel(), plan, photo
+            )
+        except DeliveryBlocked as blocked:
+            log.error("[delivery] 发不出去：%s", blocked.hint)
+            await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
+            return
+
+        await self._record_sent(result, now)
+        if result.sent_texts or result.photo_sent:
+            await self.life.mark_proactive_sent(kind, day, CONVERSATION_ID)
+            await self.memory.add_diary_note(
+                day, plan.inner_note or f"主动说了句（{kind}）", now
+            )
+
+    # -- 记忆整理 -----------------------------------------------------------
 
     async def handle_memory_update_job(self, job: Job) -> None:
-        raise NotImplementedError
+        now = self.clock.now()
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        messages = await self.memory.recent_messages(
+            CONVERSATION_ID, 200, after_id=conv.summary_upto_message_id
+        )
+        if not messages:
+            return
+
+        owner_facts = [f for s, f in await self.memory.all_facts("owner")]
+        self_facts = [f for s, f in await self.memory.all_facts("self")]
+        update = await self.brain.update_memory(
+            MemoryUpdateRequest(
+                previous_summary=conv.summary,
+                messages=messages,
+                existing_owner_facts=owner_facts,
+                existing_self_facts=self_facts,
+            ),
+            self.rhythm.local_date(now),
+        )
+        if update is None:
+            raise RuntimeError("记忆整理失败")
+
+        await self.memory.update_conversation(
+            CONVERSATION_ID,
+            summary=update.summary,
+            summary_upto_message_id=messages[-1].id,
+        )
+        await self.memory.add_facts("owner", update.owner_facts, now)
+        await self.memory.add_facts("self", update.self_facts, now)
+        log.info(
+            "[memory] 摘要更新了，新记住 %d 条关于他的",
+            len(update.owner_facts),
+        )
 
 
 class PresenceManager:
-    def __init__(self, client: discord.Client, persona: Persona, rhythm: Rhythm, life: LifeEngine, memory: Memory, clock: Clock) -> None:
-        raise NotImplementedError
+    """在线状态。
 
-    async def run_forever(self) -> None:
-        raise NotImplementedError
+    **跟着行为走，不跟着时钟走。** 每天准点上线下线是最容易看出是程序的地方。
+    睡觉时离线；醒着默认 idle（手机在口袋里）；只有真的在看手机的那几分钟才 online。
+    自定义状态一天最多换一次，而且大多数时候不换。
+    """
+
+    def __init__(
+        self,
+        client: discord.Client,
+        persona: Persona,
+        rhythm: Rhythm,
+        memory: Memory,
+        clock: Clock,
+        rng: random.Random,
+    ) -> None:
+        self.client = client
+        self.persona = persona
+        self.rhythm = rhythm
+        self.memory = memory
+        self.clock = clock
+        self.rng = rng
+        self._current: tuple[str, str | None] | None = None
+        self._online_until: datetime | None = None
+
+    def note_activity(self, minutes: float | None = None) -> None:
+        """她刚看了手机。接下来几分钟显示在线。"""
+        span = minutes if minutes is not None else self.rng.uniform(1, 8)
+        self._online_until = self.clock.now() + timedelta(minutes=span)
 
     async def apply_once(self) -> None:
-        raise NotImplementedError
+        now = self.clock.now()
+        snapshot = self.rhythm.state_at(now)
+
+        if snapshot.state == "sleeping":
+            status, text = "invisible", None
+        elif self._online_until and now < self._online_until:
+            status, text = "online", await self._status_text(now)
+        elif snapshot.state == "busy":
+            status, text = "dnd" if self.rng.random() < 0.2 else "idle", await self._status_text(now)
+        else:
+            status, text = "idle", await self._status_text(now)
+
+        if (status, text) == self._current:
+            return
+        self._current = (status, text)
+        with contextlib.suppress(Exception):
+            await self.client.change_presence(
+                status=discord.Status(status),
+                activity=discord.CustomActivity(name=text) if text else None,
+            )
+
+    async def _status_text(self, now: datetime) -> str | None:
+        """自定义状态一天最多换一次，而且多数时候不换。
+
+        真人不会每两小时改一次签名，跟着日程自动轮换是明显的破绽。
+        """
+        day = self.rhythm.local_date(now).isoformat()
+        if await self.memory.kv_get("status_text_day") == day:
+            return await self.memory.kv_get("status_text") or None
+        await self.memory.kv_set("status_text_day", day)
+        if self.rng.random() > 0.3:
+            await self.memory.kv_set("status_text", "")
+            return None
+        plan = await self.memory.get_day_plan(self.rhythm.local_date(now))
+        text = (plan.mood if plan else "")[:60]
+        await self.memory.kv_set("status_text", text)
+        return text or None
+
+    async def run_forever(self) -> None:
+        while True:
+            with contextlib.suppress(Exception):
+                await self.apply_once()
+            await asyncio.sleep(60)
 
 
 class NewPersonClient(discord.Client):
@@ -93,14 +702,80 @@ class NewPersonClient(discord.Client):
         intents.dm_messages = True
         super().__init__(intents=intents)
         self.app = app
+        self.presence: PresenceManager | None = None
 
     async def on_ready(self) -> None:
-        raise NotImplementedError
+        log.info("[discord] 以 %s 的身份连上了", self.user)
+        await self.app.start(self)
+        self.presence = PresenceManager(
+            self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng
+        )
+        asyncio.create_task(self.presence.run_forever())  # noqa: RUF006
 
     async def on_message(self, message: discord.Message) -> None:
-        raise NotImplementedError
+        try:
+            if self.presence and message.author.id in self.app.settings.all_allowed_user_ids:
+                self.presence.note_activity()
+            await self.app.on_user_message(message)
+        except Exception:  # noqa: BLE001 - 一条消息处理失败不能把网关拖垮
+            log.exception("[discord] 处理消息时出错")
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        content = (payload.data or {}).get("content")
+        if content is not None:
+            await self.app.memory.edit_message(payload.message_id, content, self.app.clock.now())
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        await self.app.memory.delete_message(payload.message_id)
 
 
-def build_app(settings: Settings, persona: Persona, *, client: object | None = None, seed: int | None = None) -> App:
-    """组合根：创建所有组件。client 为 AsyncAnthropic（None 时自动创建）。"""
-    raise NotImplementedError
+def build_app(
+    settings: Settings,
+    persona: Persona,
+    *,
+    llm_client: Any = None,
+    seed: int | None = None,
+) -> App:
+    """把所有零件装起来。"""
+    rng = random.Random(seed)
+    clock = RealClock(persona.tz)
+    calendar = AcademicCalendar(persona.academic, persona.seed)
+    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    attention = AttentionPolicy(persona, rhythm, settings.delay_scale)
+    memory = Memory(settings.db_path)
+    scheduler = Scheduler(memory, clock, settings.delay_scale)
+    brain = Brain(llm_client or build_client(settings), settings, persona, memory)
+
+    library = PhotoLibrary(settings.photos_index)
+    library.load()
+    generator = (
+        CommandImageGenerator(settings.image_gen_command)
+        if settings.image_gen_command
+        else NullImageGenerator()
+    )
+    media = MediaService(library, generator, settings.generated_dir)
+    life = LifeEngine(persona, rhythm, calendar, memory, scheduler, brain, clock, rng)
+    deliverer = Deliverer(clock, attention, rng, lambda path: discord.File(path))
+
+    return App(
+        settings=settings,
+        persona=persona,
+        clock=clock,
+        rhythm=rhythm,
+        calendar=calendar,
+        attention=attention,
+        memory=memory,
+        scheduler=scheduler,
+        brain=brain,
+        media=media,
+        life=life,
+        deliverer=deliverer,
+        rng=rng,
+    )
+
+
+def run(settings: Settings, persona: Persona) -> None:
+    """启动机器人，直到被中断。"""
+    app = build_app(settings, persona)
+    client = NewPersonClient(app)
+    client.run(settings.discord_bot_token, log_handler=None)
