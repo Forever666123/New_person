@@ -119,6 +119,26 @@ def is_too_english(text: str, style: StyleConfig) -> bool:
     return len(_LATIN_WORD.findall(text)) > limit
 
 
+def _opens_with_greeting(opening: str, phrase: str) -> bool:
+    """``opening`` 是不是**以这句寒暄开头并且到此为止**。
+
+    光看前缀不够："你好像把参数记错了"和"好久没聊这个话题了"都以寒暄开头，
+    但它们只是句子的前半截，不是打招呼。真正的寒暄后面接的是句末——
+    要么没了，要么是标点，要么是"呀""了""吗"这类语气词。
+    """
+    if not opening.startswith(phrase):
+        return False
+    rest = opening[len(phrase) :]
+    return not rest or rest[0] in GREETING_TAIL
+
+
+GREETING_TAIL = " \t\u3000，。、！？~…呀啊阿吗么了呢哦噢喔嘛哈诶欸的"
+"""寒暄后面允许跟的东西。再往后就是别的句子了，不是打招呼。"""
+
+OPENING_NOISE = " \t\u3000，。、！？~…—-·:：;；\"'“”‘’（）()"
+"""判断"是不是用寒暄开头"之前先掐掉的东西。"""
+
+
 def check(
     parts: list[ReplyPart], style: StyleConfig, boundaries: Boundaries
 ) -> list[StyleViolation]:
@@ -168,6 +188,20 @@ def check(
                     StyleViolation(
                         kind="banned_phrase",
                         detail=f"用了她不会说的话：{phrase}",
+                        part_index=i,
+                        fixable=False,
+                    )
+                )
+
+        # 寒暄只有在开口那一下才是寒暄。掐掉前面的标点空白再比，
+        # 这样"在吗"作为整条消息会被拦下，"我现在吗？在图书馆"不会。
+        opening = text.lstrip(OPENING_NOISE)
+        for phrase in boundaries.never_open_with:
+            if _opens_with_greeting(opening, phrase):
+                issues.append(
+                    StyleViolation(
+                        kind="banned_phrase",
+                        detail=f"用寒暄开头了：{phrase}",
                         part_index=i,
                         fixable=False,
                     )

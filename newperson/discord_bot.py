@@ -900,6 +900,14 @@ class PresenceManager:
                 activity=discord.CustomActivity(name=text) if text else None,
             )
 
+    def forget_last_applied(self) -> None:
+        """忘掉"上次设的是什么"，下一轮循环会重新设一次。
+
+        网关重连之后 Discord 那边的状态被重置成在线，而我们这边的缓存
+        还记着 invisible，于是永远不去纠正。见 on_ready 里的说明。
+        """
+        self._current = None
+
     def _busy_status(self, snapshot: RhythmSnapshot) -> str:
         """在忙的时候是"勿扰"还是"闲置"——**同一段课里必须一直是同一个**。
 
@@ -972,6 +980,14 @@ class NewPersonClient(discord.Client):
         log.info("[discord] 以 %s 的身份连上了", self.user)
         await self.app.start(self)
         if self.presence is not None:
+            # **重连之后必须重发一次在线状态。**
+            # 重新 IDENTIFY 时 discord.py 只在 ConnectionState 自带 status 的情况下
+            # 把状态塞进 IDENTIFY 里，而 change_presence 从不回写那个字段——
+            # 所以新会话默认是"在线"（绿灯）。而 apply_once 有个 _current 缓存，
+            # 它记得自己上次设的是 invisible，于是判定"没变化"直接返回，
+            # 永远不去纠正。结果就是她半夜三点亮着绿灯，一直到进程重启为止。
+            # 清掉缓存，下一轮循环会重新设一次。
+            self.presence.forget_last_applied()
             return
         self.presence = PresenceManager(
             self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng

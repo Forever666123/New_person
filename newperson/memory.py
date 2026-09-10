@@ -842,6 +842,15 @@ class Memory:
         )
         return parse_dt(row["t"]) if row and row["t"] else None
 
+    async def release_dedupe_key(self, job_id: int) -> None:
+        """把这一行的去重键让出来。
+
+        ``dedupe_key`` 是全表唯一的，作废或失败的行照样占着键，
+        于是同一个键再也排不进来。对"一辈子一次"的任务，那等于永久销毁。
+        """
+        await self.db.execute("UPDATE jobs SET dedupe_key = NULL WHERE id = ?", (job_id,))
+        await self.db.commit()
+
     async def set_job_status(
         self, job_id: int, status: JobStatus, reason: str | None = None
     ) -> None:

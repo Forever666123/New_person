@@ -265,7 +265,21 @@ class StyleConfig(BaseModel):
 
 class Boundaries(BaseModel):
     never_say: list[str] = Field(default_factory=list)
-    """出现即判违规的短语，由 style_guard 拦截并要求重写。"""
+    """出现即判违规的短语，由 style_guard 拦截并要求重写。
+
+    **裸子串匹配，所以只放那些出现在任何位置都不对的话。**
+    像"在吗""你好"这种只有开头才是寒暄的词要放 never_open_with，
+    不然"现在吗""你好像""加油站"全会被误伤。
+    """
+    never_open_with: list[str] = Field(default_factory=list)
+    """只有**开头**才算违规的短语，主要是寒暄。
+
+    他们认识一年了，任何形式的打招呼都是聊天机器人的味道——但那只在开口那一下成立。
+    "我现在吗？在图书馆"里的"在吗"、"你好像把参数记错了"里的"你好"、
+    "周末去加油站碰到她"里的"加油"，都是正常说话。
+    裸子串匹配会把这些全判违规，每一次误伤都白花一次重写的模型调用，
+    而重写出来的句子往往还不如原来那句。
+    """
     deflect_topics: list[str] = Field(default_factory=list)
     """被问到就岔开或者不答的话题。"""
     deflect_hint: str = ""

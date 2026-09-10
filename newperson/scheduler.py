@@ -153,13 +153,28 @@ class Scheduler:
         return moved
 
     async def _expire_stale_jobs(self) -> int:
-        """停机太久之后，有些任务已经没有意义了。"""
+        """停机太久之后，有些任务已经没有意义了。
+
+        **按最初排的那个时刻算，不按当前的 run_at 算。**
+        _spread_overdue_jobs 每次恢复都会改写 run_at，于是"过期了多久"这个计时
+        被一次次清零：机器每小时重启一次的话，一条凌晨的 sign_off 可以一路
+        被推到中午还是 pending，永远等不到作废。实测连调六次 recover()，
+        run_at 从 01:26 一路挪到 03:32，而它本该在两点半就没意义了。
+        """
         now = self.clock.now()
         count = 0
         for job in await self.memory.pending_jobs():
             limit = STALE_AFTER.get(job.kind)
-            if limit and now - job.run_at > limit:
+            if limit and now - (job.original_run_at or job.run_at) > limit:
                 await self.memory.set_job_status(job.id or 0, "cancelled", "停机太久，作废")
+                # dedupe_key 是全表唯一的，作废的那一行照样占着这个键，
+                # 所以同一个键**永远排不进来第二次**。对那种"一辈子一次"的任务
+                # （开场就是），作废等于永久销毁：kv 里的标记还在，
+                # ensure_opener 下次启动直接跳过，那句话就再也不会有了。
+                # 把键让出来，让上层有机会重排。
+                if job.dedupe_key:
+                    await self.memory.release_dedupe_key(job.id or 0)
+                    await self.memory.kv_delete(job.dedupe_key)
                 count += 1
         return count
 

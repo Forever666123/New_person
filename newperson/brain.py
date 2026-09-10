@@ -404,8 +404,17 @@ class Brain:
         retry_prompt = f"{prompt}\n\n{style_guard.describe_for_rewrite(needs_rewrite)}"
         again = await self._call(ProactivePlan, retry_prompt, purpose="proactive", today=today)
         if again is None or not again.send:
-            # 重写没出来就用机械修剪那版。为这个卡住不如少说一句，
-            # 但已经想说的话不该因为重写失败就整个丢掉。
+            # 重写没出来的时候要看是什么问题。
+            # 表情太多、句子太长这类机械修剪已经处理掉了，用 fixed 发出去没问题。
+            # **但禁语不是机械可修的**：style_guard 把 banned_phrase 标成 fixable=False，
+            # apply_fixes 一个字都不动，所以 fixed 里那句"在吗 好久没聊了"原封不动。
+            # 与其把一句聊天机器人味的寒暄发出去，不如这次不说话——
+            # 她本来就不是每次想说都会说。
+            if any(v.kind == "banned_phrase" for v in needs_rewrite):
+                log.info("[brain] 重写没出来，而问题是禁语，这次就不说了")
+                plan.send = False
+                plan.parts = []
+                return plan
             plan.parts = fixed
             return plan
         again.parts, _ = style_guard.enforce(

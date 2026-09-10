@@ -145,3 +145,27 @@ def test_talking_about_his_stuff_is_fine(persona: Persona) -> None:
     for text in ("soxl那个新闻出来跌了还是涨了", "止损设了没", "成本多少"):
         _, needs = sg.enforce(parts(text), persona.style, persona.boundaries)
         assert not needs, f"{text} 不该被拦"
+
+
+def test_greetings_are_only_greetings_at_the_start(persona: Persona) -> None:
+    """"在吗""你好"这些只有开口那一下才是寒暄。
+
+    早先它们被放进 never_say，而 never_say 是裸子串匹配，于是
+    "我现在吗？在图书馆""你好像把参数记错了""好久没聊这个话题了"
+    全被判违规。每次误伤都白花一次重写的模型调用，而重写出来的句子
+    往往还不如原来那句。
+    """
+    for greeting in ("在吗", "在吗？", "你好", "你好呀", "好久没聊了", "最近怎么样", "嗨"):
+        _, needs = sg.enforce(parts(greeting), persona.style, persona.boundaries)
+        assert needs, f"{greeting!r} 是寒暄，应该拦下来"
+
+    for innocent in (
+        "我现在吗？在图书馆",
+        "你好像把那个参数记错了",
+        "你好好想想",
+        "好久没聊这个话题了 上次还是暑假",
+        "最近怎么样都睡不好",
+        "今天雪大到地铁都停了",
+    ):
+        _, needs = sg.enforce(parts(innocent), persona.style, persona.boundaries)
+        assert not needs, f"{innocent!r} 是正常说话，不该被拦"

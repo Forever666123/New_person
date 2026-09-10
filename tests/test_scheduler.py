@@ -265,3 +265,42 @@ async def test_a_job_that_just_came_due_still_runs_immediately(parts) -> None:
     jobs = await memory.pending_jobs()
     assert len(jobs) == 1
     assert jobs[0].run_at == NOW
+
+
+async def test_the_staleness_clock_survives_repeated_recovery(parts) -> None:
+    """过期判定按最初排的时刻算，不按被打散之后的 run_at 算。
+
+    _spread_overdue_jobs 每次 recover 都会改写 run_at，于是"过期了多久"
+    被一次次清零。机器每小时重启一次的话，一条凌晨的 sign_off 可以一路
+    被推到中午还是 pending——而它两点半就该没意义了。
+    """
+    memory, clock, sched = parts
+    await sched.schedule("sign_off", NOW, conversation_id="owner", dedupe_key="s1")
+
+    for step in range(1, 8):
+        clock.set(NOW + timedelta(minutes=25 * step))
+        await sched.recover()
+
+    jobs = await memory.pending_jobs()
+    assert jobs == [], f"停机快三小时了还没作废：{[(j.kind, j.run_at) for j in jobs]}"
+
+
+async def test_a_cancelled_one_shot_can_be_scheduled_again(parts) -> None:
+    """作废的行不能永远占着去重键。
+
+    dedupe_key 是全表唯一的，作废的行照样占着它，于是同一个键再也排不进来。
+    对"一辈子一次"的开场来说，那等于永久销毁：kv 标记还在，
+    ensure_opener 下次启动直接跳过，那句话再也不会有了。
+    """
+    memory, clock, sched = parts
+    await memory.kv_set("opener", "2026-10-12T20:00:00+00:00")
+    first = await sched.schedule("proactive", NOW, conversation_id="c", dedupe_key="opener")
+    assert first
+
+    clock.set(NOW + timedelta(hours=5))
+    await sched.recover()
+    assert await memory.pending_jobs() == []
+    assert await memory.kv_get("opener") is None, "键让出来了，标记也该清掉"
+
+    second = await sched.schedule("proactive", clock.now(), conversation_id="c", dedupe_key="opener")
+    assert second, "作废之后应该能重新排"

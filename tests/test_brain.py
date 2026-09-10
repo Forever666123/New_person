@@ -367,12 +367,16 @@ async def test_a_clean_proactive_message_does_not_cost_a_second_call(
     assert got.parts[0].text == "图书馆一个位置都没有"
 
 
-async def test_a_failed_rewrite_still_sends_the_trimmed_version(
+async def test_a_failed_rewrite_never_lets_a_greeting_through(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:
-    """重写没出来的话，用机械修剪那版发出去。
+    """重写调不动模型的时候，宁可这次不说话，也不能把寒暄原样发出去。
 
-    为一次重写失败就整句丢掉不值得——她本来是有话想说的。
+    禁语**不是机械可修的**：style_guard 把它标成 fixable=False，
+    apply_fixes 一个字都不动，所以"修剪过的那版"就是原句。
+    早先这里是"重写没出来就用修剪版发出去"，等于给寒暄开了一道后门——
+    模型抽风或者网络抖一下，她的第一句话就变成"在吗"。
+    她本来就不是每次想说都会说，少说一句没有代价。
     """
     client = fake_client(
         ProactivePlan(send=True, parts=[ReplyPart(text="在吗")]),
@@ -383,8 +387,25 @@ async def test_a_failed_rewrite_still_sends_the_trimmed_version(
     got = await brain.generate_proactive(proactive_request(), TODAY)
 
     assert got is not None
-    assert got.send is True
-    assert got.parts
+    assert got.send is False, "寒暄不能因为重写失败就漏出去"
+    assert not got.parts
+
+
+async def test_a_failed_rewrite_still_sends_when_the_problem_is_cosmetic(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """表情太多、句子太长这类是机械可修的，修完照发。
+
+    不能因为上面那条就把所有重写失败都变成沉默——那她会平白少说很多话。
+    """
+    noisy = "今天雪大到地铁都停了🥹🥹🥹🥹🥹"
+    client = fake_client(ProactivePlan(send=True, parts=[ReplyPart(text=noisy)]), None)
+    brain = Brain(client, settings(tmp_path), persona, memory)
+
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+
+    assert got is not None and got.send is True
+    assert got.parts, "机械可修的问题不该导致她闭嘴"
 
 
 async def test_haiku_does_not_get_an_effort_parameter(
