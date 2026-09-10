@@ -46,10 +46,10 @@ python -m newperson check --online
 python -m newperson run
 ```
 
-或者用 Docker：
+放到服务器上让她一直在线：见 [DEPLOY.md](DEPLOY.md)。
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 ## 命令
@@ -61,6 +61,7 @@ docker compose up -d
 | `simulate [--days N]` | 不联网，看她在各个时间点会什么时候回消息。调参数时用 |
 | `plan [--save]` | 让她给今天编一份日程并打印（会调模型） |
 | `photos` | 扫描照片目录，为没登记的图生成索引草稿 |
+| `ledger` | 打印她记下的、你在交易上说过的话 |
 
 `simulate` 会模拟一整段对话，不是把每条消息当孤立事件。
 真人聊天是成簇的，他连发两句、她回完他马上接话，那时候手机还在手上：
@@ -85,6 +86,7 @@ docker compose up -d
 | `!np pause` / `resume` | 暂停。暂停时她不回也不主动，但消息照常记着 |
 | `!np away 出差 5` / `back` | 请假。这期间她话少，基本不主动 |
 | `!np chatty 0.5` | 主动消息的频率倍率 |
+| `!np ledger` | 她记下的、你在交易上说过的话 |
 | `!np plan` | 看今天她给自己编的日程 |
 
 她隔二十分钟才回是设计好的，但你盯着屏幕的时候分不出"正常"和"坏了"。
@@ -179,7 +181,7 @@ persona/
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q          # 281 个测试，不联网
+python -m pytest -q          # 283 个测试，不联网
 ruff check newperson tests
 ```
 

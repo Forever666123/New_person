@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -872,6 +873,18 @@ class NewPersonClient(discord.Client):
         self.app = app
         self.presence: PresenceManager | None = None
 
+    async def close(self) -> None:
+        """收工。
+
+        容器停机、机器重启都会走这里。数据库每次写都 commit，
+        所以丢不了东西，但把连接干净地关掉能免掉一堆 WAL 残留。
+        """
+        log.info("[app] 收工，正在关掉手上的东西")
+        self.app.scheduler.stop()
+        with contextlib.suppress(Exception):
+            await self.app.memory.close()
+        await super().close()
+
     async def on_ready(self) -> None:
         log.info("[discord] 以 %s 的身份连上了", self.user)
         await self.app.start(self)
@@ -945,7 +958,20 @@ def build_app(
 
 
 def run(settings: Settings, persona: Persona) -> None:
-    """启动机器人，直到被中断。"""
+    """启动机器人，直到被中断。
+
+    容器里她是 1 号进程，`docker stop` 发的是 SIGTERM。
+    不接这个信号的话进程会被直接砍掉，十秒后强杀，
+    连关数据库的机会都没有。转成 KeyboardInterrupt 走正常的收工流程。
+    """
     app = build_app(settings, persona)
     client = NewPersonClient(app)
+
+    def _stop(signum: int, _frame: object) -> None:
+        log.info("[app] 收到信号 %s，准备收工", signum)
+        raise KeyboardInterrupt
+
+    with contextlib.suppress(ValueError):  # 非主线程时装不上，忽略
+        signal.signal(signal.SIGTERM, _stop)
+
     client.run(settings.discord_bot_token, log_handler=None)

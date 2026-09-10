@@ -420,6 +420,42 @@ def cmd_photos(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ledger(args: argparse.Namespace) -> int:
+    """把她记下的交易陈述打出来。
+
+    她拿这个指出你前后矛盾，你可以拿它当自己的交易日志：
+    每一笔当时的理由、答应过要做的事，都在里面。
+    """
+    loaded = load_all(args)
+    if loaded is None:
+        return 1
+    settings, _persona = loaded
+
+    async def go() -> int:
+        from .memory import Memory
+
+        memory = Memory(settings.db_path)
+        await memory.open()
+        try:
+            entries = await memory.ledger(args.kind, limit=args.limit)
+            if not entries:
+                print("还没记下什么。跟她聊到仓位、止损、回测这些的时候她才会记。")
+                return 0
+            print(f"她记着这些（{args.kind}，{len(entries)} 条，最近的在前）\n")
+            for at, entry in entries:
+                print(f"{at.strftime('%Y-%m-%d %H:%M')}  {entry.claim}")
+                if entry.reason:
+                    print(f"{'':20}理由：{entry.reason}")
+                if entry.committed_to:
+                    print(f"{'':20}你答应：{entry.committed_to}")
+                print()
+            return 0
+        finally:
+            await memory.close()
+
+    return asyncio.run(go())
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     loaded = load_all(args)
     if loaded is None:
@@ -467,6 +503,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("photos", help="扫描照片目录生成索引草稿")
 
+    led = sub.add_parser("ledger", help="打印她记下的、你在交易上说过的话")
+    led.add_argument("--kind", default="trading")
+    led.add_argument("--limit", type=int, default=50)
+
     args = parser.parse_args(argv)
     handlers = {
         "run": cmd_run,
@@ -474,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         "simulate": cmd_simulate,
         "plan": cmd_plan,
         "photos": cmd_photos,
+        "ledger": cmd_ledger,
     }
     return handlers[args.command](args)
 

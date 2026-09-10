@@ -1,8 +1,22 @@
 services:
   newperson:
     build: .
+    container_name: newperson
     env_file: .env
     volumes:
+      # 人设只读：跑起来之后不该被改，改了要重启才生效
       - ./persona:/app/persona:ro
+      # 她的记忆。**这个目录没了就等于失忆**，记得备份
       - ./data:/app/data
     restart: unless-stopped
+    # 日志留两轮，不然跑几个月能把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # 她是一个 Python 进程加一个 SQLite，用不了多少
+    deploy:
+      resources:
+        limits:
+          memory: 512M

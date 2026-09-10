@@ -889,3 +889,41 @@ async def test_good_night_can_go_unanswered(tmp_path: Path, persona: Persona) ->
     await drain(app, clock)
     assert channel.sent == []
     assert len(llm.calls) == 1, "闲聊不该被逼着重来"
+
+
+async def test_the_ledger_is_readable_by_the_owner(tmp_path: Path, persona: Persona) -> None:
+    """她记下的交易陈述，你自己也要看得到。那既是她对质的依据，
+    也是你的交易日志。"""
+    from newperson import owner as owner_cmds
+    from newperson.models import LedgerEntry
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await memory.add_ledger_entries(
+        [LedgerEntry(claim="买了 1 万块 soxl，成本 124.5", committed_to="设个止损")], EVENING
+    )
+    ctx = owner_cmds.OwnerContext(
+        memory=memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=EVENING,
+    )
+    text = await owner_cmds.handle("!np ledger", ctx)
+    assert "soxl" in text
+    assert "设个止损" in text
+
+
+async def test_an_empty_ledger_says_how_to_fill_it(tmp_path: Path, persona: Persona) -> None:
+    from newperson import owner as owner_cmds
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    ctx = owner_cmds.OwnerContext(
+        memory=memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=EVENING,
+    )
+    assert "还没记下" in await owner_cmds.handle("!np ledger", ctx)

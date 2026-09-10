@@ -31,6 +31,7 @@ HELP = """\
 `!np pause` / `!np resume` 暂停。暂停时她不回也不主动，但消息照常记着
 `!np away 出差 [天数]` / `!np back` 请假。这期间她话少，只保留最低限度的主动
 `!np chatty 0.5` 主动消息的频率倍率，0 到 2
+`!np ledger` 她记下的、你在交易上说过的话
 `!np plan` 看今天她给自己编的日程
 `!np help` 这些"""
 
@@ -63,6 +64,7 @@ async def handle(text: str, ctx: OwnerContext) -> str:
         "away": _away,
         "back": _back,
         "chatty": _chatty,
+        "ledger": _ledger,
         "plan": _plan,
         "help": _help,
     }
@@ -183,6 +185,28 @@ async def _chatty(args: list[str], ctx: OwnerContext) -> str:
     value = max(0.0, min(2.0, value))
     await ctx.memory.kv_set("chattiness", str(value))
     return f"主动消息频率设成 {value}。明天的日程生效"
+
+
+async def _ledger(args: list[str], ctx: OwnerContext) -> str:
+    """她记下的、你在交易上说过的话。
+
+    这是她拿来指出你前后矛盾的依据，也顺便是你自己的交易日志：
+    说过的理由、答应过要做的事，都在这儿。
+    """
+    kind = args[0] if args else "trading"
+    entries = await ctx.memory.ledger(kind, limit=12)
+    if not entries:
+        return "还没记下什么。跟她聊到仓位、止损、回测这些的时候她才会记。"
+
+    lines = [f"**她记着这些**（{kind}，最近 {len(entries)} 条）"]
+    for at, entry in entries:
+        line = f"`{at.strftime('%m-%d')}` {entry.claim}"
+        if entry.reason:
+            line += f"\n　　理由：{entry.reason}"
+        if entry.committed_to:
+            line += f"\n　　你答应：{entry.committed_to}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 async def _plan(_args: list[str], ctx: OwnerContext) -> str:
