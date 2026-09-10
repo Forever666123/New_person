@@ -218,20 +218,41 @@ class LifeEngine:
             chattiness = float(await self.memory.kv_get("chattiness") or 1.0)
         except ValueError:
             chattiness = 1.0
+
+        # 先问"今天她到底会不会开口"。少了这一步，每种主动各自掷骰子，
+        # 合起来就变成几乎每天都要找你说话，那很黏人。
+        if self.rng.random() > cfg.day_probability * decay * chattiness:
+            return []
+
         now = self.clock.now()
         wake, sleep = self._awake_window(day)
+        travelling = self.calendar.trip_for(day) is not None
 
         shareable = [e for e in plan.events if e.shareable]
-        candidates: list[tuple[datetime, ProactiveKind, str]] = []
 
+        eligible: list[ProactiveKind] = []
         for kind in cfg.kinds:
+            if kind.only_while_travelling and not travelling:
+                continue
             if await self._days_since_last(kind.name, day) < kind.min_days_since_last:
                 continue
+            eligible.append(kind)
+        if not eligible:
+            return []
+
+        # 开了口不代表要说一整天。多数日子只说一件事。
+        keep = 1
+        while keep < cfg.max_per_day and self.rng.random() < cfg.second_message_probability:
+            keep += 1
+
+        candidates: list[tuple[datetime, ProactiveKind, str]] = []
+        pool = list(eligible)
+        for _ in range(min(keep, len(pool))):
+            kind = self._weighted_pick(pool)
+            pool.remove(kind)
 
             moment = self._sample_moment(kind, wake, sleep, day)
             if moment is None or moment <= now or self.rhythm.is_sleeping(moment):
-                continue
-            if self.rng.random() > cfg.base_probability * decay * chattiness:
                 continue
 
             note = kind.note
@@ -242,8 +263,20 @@ class LifeEngine:
                     note += f"（{event.share_hint}）"
             candidates.append((moment, kind, note))
 
-        self.rng.shuffle(candidates)
-        return sorted(candidates[: cfg.max_per_day], key=lambda c: c[0])
+        return sorted(candidates, key=lambda c: c[0])
+
+    def _weighted_pick(self, kinds: list[ProactiveKind]) -> ProactiveKind:
+        """按权重抽一种。权重决定她更常用哪种方式开口。"""
+        total = sum(max(k.weight, 0.0) for k in kinds)
+        if total <= 0:
+            return self.rng.choice(kinds)
+        roll = self.rng.uniform(0, total)
+        acc = 0.0
+        for kind in kinds:
+            acc += max(kind.weight, 0.0)
+            if roll <= acc:
+                return kind
+        return kinds[-1]
 
     def _sample_moment(
         self, kind: ProactiveKind, wake: datetime, sleep: datetime, day: date

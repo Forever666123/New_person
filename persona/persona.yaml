@@ -314,8 +314,11 @@ modes:
 # 主动消息：她会主动，但主动的方式不是问候
 # ---------------------------------------------------------------------------
 proactive:
+  # 先决定今天会不会开口，再决定说什么。少了第一步，每种主动各自掷骰子，
+  # 合起来就变成几乎每天都要找你说话。
+  day_probability: 0.4
+  second_message_probability: 0.3
   max_per_day: 2
-  base_probability: 0.4
   unanswered_decay: 0.35
   max_unanswered_per_day: 1
   quiet_days_before_callback: 3
@@ -349,8 +352,10 @@ proactive:
         他之前说过要做的一笔交易，或者说要记下来的东西。
         问一句做了没有。不铺垫。
 
+    # 只在出门在外时才成立，所以权重给高些：那几天她确实更常说这个
     - name: travel_note
-      weight: 12
+      weight: 40
+      only_while_travelling: true
       note: |
         你在外面，随口说一句这边怎么样。
         一句话，不像在报行程，也不问他要不要看照片。

@@ -155,8 +155,11 @@ modes: []
 
 # ---- 主动消息：定义人物主动的方式，不是"问候" ----
 proactive:
+  # 先决定今天会不会开口，再按 weight 抽说哪一种。
+  # 少了第一步，每种主动各自掷骰子，合起来就变成几乎每天都要找人说话。
+  day_probability: 0.4         # 今天会不会主动开口
+  second_message_probability: 0.3   # 开了口之后再说第二件事的概率
   max_per_day: 2
-  base_probability: 0.45
   unanswered_decay: 0.35       # 主动开场没被回应，下次概率乘这个
   max_unanswered_per_day: 1
   quiet_days_before_callback: 3

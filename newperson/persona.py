@@ -299,6 +299,7 @@ class TopicMode(BaseModel):
 class ProactiveKind(BaseModel):
     name: str
     weight: float = 1.0
+    """在今天要说的几种里被抽中的相对权重。"""
     note: str = ""
     """给模型的触发说明，描述这次主动是出于什么。"""
     hours: list[str] = Field(default_factory=list, description="限定时段，如 ['00:00-04:00']；空表示不限")
@@ -309,11 +310,20 @@ class ProactiveKind(BaseModel):
     """为真时允许只发照片不配字。"""
     min_days_since_last: float = 0.0
     """距离上次同类主动至少隔多少天。"""
+    only_while_travelling: bool = False
+    """只在出门在外的时候才成立。"""
 
 
 class ProactiveConfig(BaseModel):
+    day_probability: float = 0.4
+    """今天她到底会不会主动开口。
+
+    先过这一关再谈说什么。少了这一步，每种主动各自掷骰子，
+    合起来就变成几乎每天都要找你说话，很黏人。
+    """
+    second_message_probability: float = 0.3
+    """开了口之后，今天再说第二件事的概率。"""
     max_per_day: int = 2
-    base_probability: float = 0.45
     unanswered_decay: float = 0.35
     """每有一次主动开场没被回应，下次概率乘这个数。"""
     max_unanswered_per_day: int = 1
