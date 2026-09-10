@@ -283,3 +283,23 @@ def test_a_bad_mood_lowers_it_all_day(rhythm: Rhythm, persona: Persona) -> None:
             good = rhythm.engage_probability_at(noon)
     assert bad is not None and good is not None
     assert bad < good
+
+
+def test_force_awake_is_only_for_debugging(persona: Persona, calendar) -> None:
+    """第一次跑起来常常是半夜，她正在睡觉，发什么都要等到早上，看不到效果。
+
+    这个开关让她当作醒着，但只影响作息判定，不改她说话的方式。
+    """
+    normal = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    debug = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar, force_awake=True)
+
+    night = datetime(2026, 10, 13, 4, 0, tzinfo=persona.tz)
+    assert normal.is_sleeping(night)
+    assert not debug.is_sleeping(night)
+    assert debug.activity_at(night) > 0.5
+    assert normal.activity_at(night) == 0.0
+
+    # 白天两者应该一致，开关不该改变正常时段的行为
+    noon = datetime(2026, 10, 13, 21, 0, tzinfo=persona.tz)
+    if not normal.is_sleeping(noon):
+        assert normal.for_day(noon.date()).variant == debug.for_day(noon.date()).variant

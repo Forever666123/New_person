@@ -47,8 +47,11 @@ class Rhythm:
         tz: ZoneInfo,
         seed: int = 0,
         calendar: AcademicCalendar | None = None,
+        force_awake: bool = False,
     ) -> None:
         self.config = config
+        self.force_awake = force_awake
+        """调试用：当她一直醒着。只影响作息判定，不改说话方式。"""
         self.tz = tz
         """家里的时区。旅行时当天的时区见 :meth:`tz_for`。"""
         self.seed = seed
@@ -262,6 +265,8 @@ class Rhythm:
         return None
 
     def is_sleeping(self, dt: datetime) -> bool:
+        if self.force_awake:
+            return False
         return self.sleep_window_containing(dt) is not None
 
     def class_containing(self, dt: datetime) -> ClassInstance | None:
@@ -274,6 +279,8 @@ class Rhythm:
         """此刻"会看手机"的活跃度，0 到 1。睡着时为 0。"""
         if self.is_sleeping(dt):
             return 0.0
+        if self.force_awake:
+            return 0.7  # 调试时别让凌晨那段低活跃度把等待拖得看不出效果
         daily = self.daily_for(dt)
         local = dt.astimezone(self.tz_for(daily.day))
         minute_of_day = local.hour * 60 + local.minute

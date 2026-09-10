@@ -879,7 +879,9 @@ def build_app(
     rng = random.Random(seed)
     clock = RealClock(persona.tz)
     calendar = AcademicCalendar(persona.academic, persona.seed)
-    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    rhythm = Rhythm(
+        persona.rhythm, persona.tz, persona.seed, calendar, force_awake=settings.force_awake
+    )
     attention = AttentionPolicy(persona, rhythm, settings.delay_scale)
     memory = Memory(settings.db_path)
     scheduler = Scheduler(memory, clock, settings.delay_scale)

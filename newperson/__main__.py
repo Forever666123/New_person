@@ -69,6 +69,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"  {WARN} 不认识 {settings.model} 这个模型，费用估算会不准")
     if settings.model not in EFFORT_SUPPORTED:
         print(f"  {WARN} {settings.model} 不接受 effort 参数，NEWPERSON_EFFORT 会被跳过")
+    if settings.force_awake:
+        print(f"  {WARN} DEBUG_FORCE_AWAKE 开着，她不会睡觉。看完效果记得关掉")
     if settings.delay_scale != 1.0:
         print(f"  {WARN} DELAY_SCALE={settings.delay_scale}，时间是被压缩的，别在正式用的时候留着")
 
@@ -117,12 +119,17 @@ def cmd_check(args: argparse.Namespace) -> int:
     if problems:
         print(f"{BAD} 有 {problems} 个问题要先解决")
         return 1
-    print(f"{OK} 可以跑了")
+    print(f"{OK} 配置没问题。")
+    print("  注意：check 只是检查，她现在**没在跑**。启动是 python -m newperson run")
     return 0
 
 
 def _check_online(settings: Settings) -> int:
-    """真的连一次 Discord。新手最常卡在这两件事上。"""
+    """真的连一次 Discord。新手最常卡在这两件事上。
+
+    探针用隐身登录：不然它连上的那几秒她会显示在线，
+    你以为跑起来了就去发消息，探针一退出她就离线，消息也没人处理。
+    """
     import discord
 
     print("Discord")
@@ -150,7 +157,9 @@ def _check_online(settings: Settings) -> int:
     intents = discord.Intents.default()
     intents.message_content = True
     try:
-        Probe(intents=intents).run(settings.discord_bot_token, log_handler=None)
+        Probe(intents=intents, status=discord.Status.invisible).run(
+            settings.discord_bot_token, log_handler=None
+        )
     except discord.PrivilegedIntentsRequired:
         print(
             f"  {BAD} MESSAGE CONTENT INTENT 没打开。"

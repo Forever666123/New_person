@@ -49,6 +49,12 @@ class Settings(BaseModel):
 
     delay_scale: float = 1.0
     """把所有等待时间按比例缩放，调试用。1.0 = 真实节奏。"""
+    force_awake: bool = False
+    """调试用：让她一直醒着。
+
+    第一次跑起来常常是半夜，她按作息正在睡觉，于是你发什么都要等到早上，
+    看不到任何效果。这个开关只影响作息判定，不改她说话的方式。
+    """
     log_level: str = "INFO"
     image_gen_command: str | None = None
     """外部图片生成命令模板，含 {prompt} 与 {out} 占位符。留空就只用本地照片库。"""
@@ -112,6 +118,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         downloads_dir=Path(env.get("DOWNLOADS_DIR", "data/downloads")),
         generated_dir=Path(env.get("GENERATED_DIR", "data/generated")),
         delay_scale=float(env.get("DELAY_SCALE", "1.0")),
+        force_awake=env.get("DEBUG_FORCE_AWAKE", "").strip().lower() in {"1", "true", "yes"},
         log_level=env.get("LOG_LEVEL", "INFO"),
         image_gen_command=env.get("IMAGE_GEN_COMMAND") or None,
     )
