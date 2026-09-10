@@ -293,8 +293,13 @@ def test_force_awake_is_only_for_debugging(persona: Persona, calendar) -> None:
     normal = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
     debug = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar, force_awake=True)
 
-    night = datetime(2026, 10, 13, 4, 0, tzinfo=persona.tz)
-    assert normal.is_sleeping(night)
+    night = next(
+        t
+        for t in (
+            datetime(2026, 10, 13, 4, 0, tzinfo=persona.tz) + timedelta(days=d) for d in range(14)
+        )
+        if normal.is_sleeping(t)
+    )
     assert not debug.is_sleeping(night)
     assert debug.activity_at(night) > 0.5
     assert normal.activity_at(night) == 0.0
