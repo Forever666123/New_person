@@ -6,7 +6,7 @@ __pycache__/
 *.egg-info/
 data/
 .env
-persona/persona.yaml
+# persona/persona.yaml 现在纳入版本控制（人设是项目的核心内容）
 persona/photos/*
 !persona/photos/index.example.yaml
 !persona/photos/.gitkeep

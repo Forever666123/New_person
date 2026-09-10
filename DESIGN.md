@@ -1,11 +1,14 @@
-# NewPerson 设计文档（v2）
+# NewPerson 设计文档（v3）
 
 > 目标：做一个接入 Discord 的"虚拟人物"。它不是客服机器人，而是一个"有自己生活"的人：
 > 不秒回、睡觉时不回、上班时偶尔瞄一眼手机、有空的时候会主动找你聊天、会发照片。
 > 人物背景（persona）后续由使用者填写，代码里只留插槽。
 >
-> v2 在 v1 基础上吸收了四路评审（真人感 / 可靠性 / LLM 集成 / 产品）的结论，改动最大的三处：
+> v2 吸收了四路评审（真人感 / 可靠性 / LLM 集成 / 产品）的结论：
 > **"看手机"模型代替单峰延迟**、**任务租约与进度持久化**、**Owner 控制命令**。
+>
+> v3 按实际人物（沈亦宁）落地，三处大改：**作息从时刻表改成每日抽签**、
+> **新增 style_guard 把关说话风格**、**主动消息类型由人设定义而不是写死**。
 
 ## 0. 范围（v1 明确只做什么）
 
@@ -49,29 +52,42 @@ Discord Gateway ──► discord_bot.py（收消息 / 发消息 / 在线状态 
 
 ## 2. 关键行为规范
 
-### 2.1 作息状态（rhythm）
+### 2.1 作息：每天抽一次签
 
-persona.yaml 按"工作日 / 周末"定义 `sleep`（入睡、起床）和 `busy`（不方便看手机的区间，带标题）。
+**不用时刻表。** 固定的睡觉区间会让她每天同一分钟上线下线，这是最容易看出是程序的地方。
+persona.yaml 里给的是分布和权重，`rhythm.py` 每天抽一次：
 
-- 状态判定优先级：sleep 区间 → `sleeping`；busy 区间 → `busy`；距入睡 < `winding_down_minutes` → `winding_down`；否则 `free`。
-- **睡眠区间属于"入睡那天"的作息**：周五 23:30 入睡按工作日作息，起床时间用工作日的 07:30（即使醒来是周六）。文档和测试都要写明。
-- 时区：只有 persona.timezone 一个来源；Docker 里容器时区无关紧要，因为所有计算都用 aware datetime。
-- DST：用 `zoneinfo`，`HH:MM` 落到当天当地时间；对不存在/重复的时刻取 `fold=0`。中国无 DST，但代码不能假设。
+1. 按 `variants` 权重抽当日变体：普通 / 熬夜 / 早起 / 忙 / 消失 / 闲。
+   变体会平移入睡起床时刻、缩放活跃度、覆盖回复概率，并往上下文注入一句当日心态。
+2. 从 `sleep` 分布采样这一晚的入睡和起床时刻，再把睡眠时长夹进 `[min_hours, max_hours]`。
+3. 每节课按自己的 `probability` 决定今天去没去，允许翘课。
+
+抽签的随机源是 `(persona.seed, 日期)`，所以同一天反复查询结果一致，进程重启也一致，
+但不同的日子互不相关。日期一换，作息就换。
+
+**活跃度曲线**取代了 busy 开关。`activity_at(dt)` 返回此刻"会看手机"的程度，0 到 1：
+睡着是 0，上课是 `class_activity`，其余按 `activity.points` 阶梯取值，最后乘当日变体的倍率。
+它只决定多久瞄一眼手机，不决定回不回。
+
+状态判定：在睡眠区间 → `sleeping`；在课里 → `busy`；距入睡不足 `winding_down_minutes` → `winding_down`；否则 `free`。
+
+时区只有 `persona.timezone` 一个来源，容器时区无关紧要，所有计算都用 aware datetime。
+DST 用 `zoneinfo` 处理。
 
 ### 2.2 注意力与回复时机（attention）
 
 真人不是"收到消息后等一个随机时间再回"，而是"隔一阵看一眼手机，看到了就回（偶尔看到了忘了回）"。所以：
 
-**(a) 看手机（glance）过程**。按作息状态生成"下一次看手机"的时间：
+**(a) 看手机（glance）过程**。间隔由活跃度决定，而不是由状态查表：
 
-| 状态 | 相邻两次看手机的间隔 | 备注 |
-|---|---|---|
-| free | 对数正态，中位数 12 min，σ0.7 | 最短 1 min |
-| winding_down | 中位数 8 min，σ0.6 | 躺床上刷手机 |
-| busy | 中位数 35 min，σ0.6，且不早于区间开始 + 10 min | 上班偷瞄 |
-| sleeping | 不看；起床后第一次：p=0.6 在 起床 + U(0,20)min（躺床上），否则 起床 + U(20,60)min | |
+```
+间隔中位数 = base_glance_minutes / activity_at(t)
+实际间隔  = 中位数 × exp(N(0, glance_sigma))
+```
 
-`next_glance_after(dt, rng)` 从 dt 起按当前状态逐段采样直到落在清醒时段。
+活跃度 0.85 的晚上大约十分钟看一次，活跃度 0.15 的课上大约一小时看一次，
+睡着（活跃度 0）就完全不看，顺延到起床。醒来后第一眼：六成的概率在起床后二十五分钟内，
+其余落在一个半小时内。`next_glance_after(dt, rng)` 负责这些。
 
 **(b) 回复时机** `plan_reply(now, heat, features, last_user_at, rng) -> TimingDecision`：
 
@@ -80,7 +96,12 @@ persona.yaml 按"工作日 / 周末"定义 `sleep`（入睡、起床）和 `busy
 - warm：`notice_at = min(next_glance, now + LN(4min, σ0.8))`（刚聊过，手机还在附近）；`reply_at = notice_at + LN(40s, σ0.7)`。
 - cold：`notice_at = next_glance`；`reply_at = notice_at + LN(60s, σ0.7)`；**另以 p=0.15 "看了忘了回"**：`reply_at` 推到再下一次 glance + 短滞后（reason 里注明 `forgot_once`）。
 - sleeping：按 glance 规则自然落到起床后。**例外**：heat==hot 且入睡不到 20 min → 允许一次快速回复（`quick_before_sleep=True`），上下文告诉模型"你已经准备睡了"。
-- 问题/紧急（`?`/`？`/"吗"/"在吗"/"急"/"快"/"救命"/`!!!`）：所有滞后 × `urgent_multiplier`（默认 0.6），最低 8 s；busy 时也会更快看一眼（glance 间隔 × 0.6）。
+- **看到了不一定回**：每次 notice 之后按 `DailyRhythm.reply_probability` 掷一次骰子，没中就 `will_reply=False`。
+  这条消息不会得到回复，但会留在未读里，下一次她说话时一起带进上下文。
+  "消失"变体把这个概率压到很低，于是自然产生"一整天没理你，第二天直接接着说"的效果。
+- **话题模式**：命中 `persona.modes` 的触发词会改变节奏和口吻。交易话题 `delay_multiplier=0.6`，
+  她更上心；同时把她记过的台账带进上下文，让她能指出前后矛盾。
+- 问题/紧急（`?`/`？`/"吗"/"在吗"/"急"/"快"/"救命"/`!!!`）：所有滞后 × `urgent_multiplier`，最低 8 s。
 - 长消息（> 120 字）：`reply_at` 加阅读时间 `len/6` 秒。
 - **疲劳**：连续 hot 交流超过 `fatigue_after_minutes`（默认 30）后，每多 15 min 滞后中位数 ×2，并在上下文里提示模型"你们已经聊了一会儿，可以自然收尾去做事"。
 - **边界提示**：若 15 min 内将切换到 sleeping/busy 且 heat 为 hot/warm，上下文提示"你 N 分钟后要去睡/上班了，可以自然收尾，需要的话用 follow_up 约晚点聊"。
@@ -97,9 +118,23 @@ persona.yaml 按"工作日 / 周末"定义 `sleep`（入睡、起床）和 `busy
 **(d) 全局注意力**：人只有一部手机。任何主动动作（reply / proactive / follow_up）执行前都调用 `attention.notice_all(now)`：
 把所有未读消息的 notice_at 设为 now。**proactive/follow_up 触发时若存在未读消息或 pending reply** → 不发主动消息，而是把 pending reply 提前到 `now + LN(30s)`，并把主动消息的 note 塞进回复上下文（"你本来想跟 TA 说 xxx"）。
 
-### 2.3 投递（delivery）
+### 2.3 说话风格把关与投递（style_guard + delivery）
 
-`ReplyPlan.parts` 是若干条短气泡。对每条：
+**先过关，再投递。** 如果把"不许用 emoji、不许打句号、不许说加油"一条条塞进提示词，
+模型会写得非常拘谨，句子变僵，反而更不像人。所以分工是：提示词只描述她是个什么样的人，
+`style_guard` 在发出去之前把不符合她习惯的地方拦下来。
+
+拦下来分两种处理：
+
+- **能机械修的**直接修，不惊动模型：句尾句号去掉，句中句号变空格（等于换口气继续说），
+  emoji 和感叹号删掉，气泡超量就合并而不是丢内容。
+- **不能机械修的**返回违规清单，让模型带着清单重写一次：说了 `never_say` 里的话、
+  整句英文、长句超预算。重写还不过就退回机械修剪，不会卡住。
+
+两个刻意的宽松处：问号保留（她问问题是表达在意的方式）；长句按**预算**判定而不是一刀切，
+因为"极少数超过二十个字的句子"本身是人设的一部分，出现时说明是重话。
+
+`ReplyPlan.parts` 过关之后进入投递。对每条：
 
 1. `pause_before_seconds > 0` 先静默等待。
 2. 打字模拟：时长 = `1.0 + len(text) / cps + N(0, 0.5)`，`cps` 来自 persona（默认 **2.0**，手机打字），限制在 `[1.5, 40]` 秒；用 `async with channel.typing():`（discord.py 会每 ~5 s 自动续），**不要**用 `trigger_typing()`。
@@ -117,8 +152,15 @@ persona.yaml 按"工作日 / 周末"定义 `sleep`（入睡、起床）和 `busy
 ### 2.4 主动消息（life）
 
 - **每日日程**：`day_plan` 任务，**去重键** `day_plan:<本地日期>`（`jobs.dedupe_key UNIQUE`，`INSERT OR IGNORE`）。启动时若今天没有日程且现在已醒 → 立刻入队；否则在下一次起床时间 + U(0,10)min 入队。执行：`brain.generate_day_plan()` → 存 `diary` → 生成候选。
-- **候选时刻**：`shareable` 事件在 `[start, end]` 内随机一刻（`event_share`）；`random_chat_slots` 个 free 时段随机一刻（`random_chat`）；沉默天数 ≥ `reach_out_after_silent_days` → 一个 `reach_out`；若入睡前 15 min 内对话仍 hot/warm → 一个 `sign_off`（由 attention 在回复时顺带安排，不在日程里）。
-- **抽样**：概率 = `base_probability × 0.35^unanswered_initiations`；`unanswered_initiations` 是"人物主动开的话头对方没回"的次数，对方任何消息都会清零。**每天最多 1 次未被回应的主动开场**（同一次 session 内多条气泡不算）。总数 ≤ `max_per_day`。过滤睡眠时段和已过去的时刻。
+- **候选类型**由 `persona.proactive.kinds` 定义，不写死在代码里。沈亦宁的四种是：
+  凌晨发一张窗外的照片不配字、说一句自己今天的事、提一句他几天前说过的事、
+  问他之前说要做的交易做了没有。每种带权重、时段限制（`hours`）、照片要求（`requires_photo`）、
+  同类最小间隔（`min_days_since_last`）。
+  **没有"问候"这一类**：她不会说"最近怎么样"，主动的方式是直接说事。
+- **抽样**：概率 = `base_probability × unanswered_decay ^ unanswered_initiations`。
+  `unanswered_initiations` 是她主动开的话头对方没回的次数，对方任何消息都清零。
+  每天最多 `max_unanswered_per_day` 次没被回应的主动开场，总数 ≤ `max_per_day`。
+  过滤掉睡眠时段、已过去的时刻、以及 `requires_photo` 但挑不到图的候选。
 - **触发时**：sleeping → 丢弃；存在未读/pending reply → 转为提前回复（2.2d）；heat hot → 丢弃；away 模式下只允许 reach_out；否则 `brain.generate_proactive()`，模型可返回 `send=false`。
 - **follow-up**：模型在回复里声明 `follow_up{delay_minutes, note}` → `follow_up` 任务；触发时走 proactive 流程，`trigger_kind="follow_up"`。
 

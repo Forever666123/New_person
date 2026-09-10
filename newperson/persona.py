@@ -1,4 +1,15 @@
-"""人物设定（persona.yaml）的加载与校验。"""
+"""人物设定（persona.yaml）的加载与校验。
+
+设计原则：**不要写死**。
+这里几乎所有"行为"字段都是倾向、权重、概率，而不是硬性规则。
+真正硬的只有两类：
+
+1. 说话风格里的机械约束（不用 emoji、不打句号之类），由 ``style_guard`` 在发出前做后处理，
+   不塞进提示词里当二十条军规，那样模型会写得很拘谨。
+2. ``boundaries.never_say`` 里的禁用语，同样在后处理里拦截。
+
+其余（作息、主动消息、话题模式）全部交给概率和上下文提示，让模型自己发挥。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +19,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -21,10 +32,86 @@ def parse_hhmm(value: str) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
-class BusyBlock(BaseModel):
+def hhmm_to_minutes(value: str) -> int:
+    h, m = parse_hhmm(value)
+    return h * 60 + m
+
+
+# ---------------------------------------------------------------------------
+# 作息：倾向 + 每日抽签
+# ---------------------------------------------------------------------------
+
+
+class SleepDistribution(BaseModel):
+    """睡觉时间不是一个区间，是一个分布。每天从这里采样一次。"""
+
+    start_median: str = "01:30"
+    """入睡时间的中位数（可以在午夜之后）。"""
+    start_sigma_minutes: float = 70.0
+    wake_median: str = "08:30"
+    wake_sigma_minutes: float = 65.0
+    min_hours: float = 4.5
+    """采样后强制的最短睡眠，防止抽出荒唐的值。"""
+    max_hours: float = 11.0
+
+    @field_validator("start_median", "wake_median")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        parse_hhmm(v)
+        return v
+
+
+class ActivityCurve(BaseModel):
+    """一天里"会看手机"的活跃度曲线，0 到 1。
+
+    ``points`` 是阶梯函数：key 为该段起点 ``HH:MM``，value 为这一段的活跃度，
+    直到下一个 key 为止。必须包含 ``"00:00"``。
+
+    活跃度只影响"多久瞄一眼手机"，不是"回不回"。回不回另有概率。
+    """
+
+    points: dict[str, float] = Field(
+        default_factory=lambda: {"00:00": 0.5, "02:00": 0.05, "08:00": 0.3, "19:00": 0.8}
+    )
+
+    @field_validator("points")
+    @classmethod
+    def _check(cls, v: dict[str, float]) -> dict[str, float]:
+        if not v:
+            raise ValueError("activity.points 不能为空")
+        for k, val in v.items():
+            parse_hhmm(k)
+            if not 0.0 <= val <= 1.0:
+                raise ValueError(f"activity.points[{k}] 应在 0 到 1 之间，收到 {val}")
+        if "00:00" not in v:
+            raise ValueError('activity.points 必须包含 "00:00" 这一段')
+        return v
+
+    def sorted_points(self) -> list[tuple[int, float]]:
+        return sorted(((hhmm_to_minutes(k), v) for k, v in self.points.items()), key=lambda x: x[0])
+
+    def at_minutes(self, minute_of_day: int) -> float:
+        """取该时刻所在段的活跃度。"""
+        pts = self.sorted_points()
+        value = pts[-1][1]  # 默认用最后一段（跨过午夜回绕）
+        for start, val in pts:
+            if minute_of_day >= start:
+                value = val
+            else:
+                break
+        return value
+
+
+class ClassBlock(BaseModel):
+    """课/固定安排。``probability`` 表示"今天真的去了"的概率，允许翘课。"""
+
+    days: list[int] = Field(default_factory=list, description="0=周一 … 6=周日")
     start: str
     end: str
-    title: str = "忙"
+    title: str = "上课"
+    probability: float = 1.0
+    activity: float | None = None
+    """这段时间的活跃度覆盖值；None 表示用曲线里 class_activity。"""
 
     @field_validator("start", "end")
     @classmethod
@@ -33,58 +120,138 @@ class BusyBlock(BaseModel):
         return v
 
 
-class DaySchedule(BaseModel):
-    sleep: tuple[str, str] = ("23:30", "07:30")
-    """(入睡, 起床)，可跨午夜。"""
-    busy: list[BusyBlock] = Field(default_factory=list)
+class DayVariant(BaseModel):
+    """当日变体。每天按 ``weight`` 抽一个，用来打破规律。"""
 
-    @field_validator("sleep")
-    @classmethod
-    def _check_sleep(cls, v: tuple[str, str]) -> tuple[str, str]:
-        parse_hhmm(v[0])
-        parse_hhmm(v[1])
-        if v[0] == v[1]:
-            raise ValueError("入睡时间和起床时间不能相同")
-        return v
-
-    @model_validator(mode="before")
-    @classmethod
-    def _coerce_busy(cls, data):  # type: ignore[no-untyped-def]
-        # 允许 yaml 里写成 ["09:00", "12:00", "上班"] 或 ["09:00", "12:00"] 的简写
-        if isinstance(data, dict) and isinstance(data.get("busy"), list):
-            blocks = []
-            for item in data["busy"]:
-                if isinstance(item, (list, tuple)):
-                    if len(item) == 2:
-                        blocks.append({"start": item[0], "end": item[1]})
-                    elif len(item) >= 3:
-                        blocks.append({"start": item[0], "end": item[1], "title": item[2]})
-                    else:
-                        raise ValueError(f"busy 区间格式不对：{item!r}")
-                else:
-                    blocks.append(item)
-            data = {**data, "busy": blocks}
-        return data
+    name: str
+    weight: float = 1.0
+    sleep_start_shift_hours: float = 0.0
+    wake_shift_hours: float = 0.0
+    activity_multiplier: float = 1.0
+    reply_probability: float | None = None
+    """看到消息后真的回复的概率；None 表示用 rhythm.reply_probability。"""
+    note: str = ""
+    """一句话注入当天的上下文，比如"你今天不太想说话"。不会直接发给对方。"""
 
 
 class RhythmConfig(BaseModel):
-    weekday: DaySchedule = Field(default_factory=DaySchedule)
-    weekend: DaySchedule = Field(default_factory=lambda: DaySchedule(sleep=("00:30", "09:30")))
-    winding_down_minutes: int = 60
-    busy_status: Literal["idle", "dnd"] = "idle"
+    sleep: SleepDistribution = Field(default_factory=SleepDistribution)
+    activity: ActivityCurve = Field(default_factory=ActivityCurve)
+    class_activity: float = 0.15
+    """上课时段的默认活跃度（偷偷回一句的程度）。"""
+    classes: list[ClassBlock] = Field(default_factory=list)
+    variants: list[DayVariant] = Field(default_factory=list)
+    base_glance_minutes: float = 8.0
+    """活跃度为 1 时，两次看手机的间隔中位数。实际间隔 = base / activity。"""
+    glance_sigma: float = 0.6
+    reply_probability: float = 0.9
+    """看到了之后真的回的概率。剩下的就是"看到了没回"。"""
+    winding_down_minutes: float = 60.0
+    """距离入睡还有多久算"准备睡了"。"""
+    min_activity_to_glance: float = 0.02
+    """低于这个活跃度就完全不看手机（睡着了）。"""
 
 
-class TimingConfig(BaseModel):
-    max_delay_hours: float = 10.0
-    urgent_multiplier: float = 0.6
-    typing_chars_per_second: float = 3.5
+# ---------------------------------------------------------------------------
+# 说话风格（机械约束在 style_guard 里执行）
+# ---------------------------------------------------------------------------
+
+
+class StyleConfig(BaseModel):
+    max_parts: int = 2
+    """一次最多发几条气泡。"""
+    extra_part_probability: float = 0.15
+    """偶尔多发一条的概率。"""
+    long_sentence_chars: int = 20
+    """超过这个字数算"长句"。长句应当罕见，出现时说明是重话。"""
+    long_sentence_budget: float = 0.08
+    """允许多大比例的句子是长句，超了就交给 style_guard 处理。"""
+    strip_trailing_period: bool = True
+    """去掉句尾的句号。"""
+    forbid_emoji: bool = True
+    forbid_exclamation: bool = True
+    allow_reactions: bool = True
+    """允许给对方的消息加 Discord 表情反应。不用 emoji 的人物应该关掉。"""
+    forbid_full_english_sentence: bool = True
+    """允许词级中英夹杂，不允许整句英文。"""
+    english_words_allowed: list[str] = Field(default_factory=list)
+    typing_chars_per_second: float = 2.6
+    """打字速度，手机打字比键盘慢。"""
+    typo_probability: float = 0.05
+    """发出错别字然后过几秒编辑掉的概率。"""
+
+
+class Boundaries(BaseModel):
+    never_say: list[str] = Field(default_factory=list)
+    """出现即判违规的短语，由 style_guard 拦截并要求重写。"""
+    deflect_topics: list[str] = Field(default_factory=list)
+    """被问到就岔开或者不答的话题。"""
+    deflect_hint: str = ""
+    """怎么岔开，给模型的提示。"""
+    never_admit_ai: bool = True
+
+
+# ---------------------------------------------------------------------------
+# 话题模式：某些话题会让她换一副样子
+# ---------------------------------------------------------------------------
+
+
+class TopicMode(BaseModel):
+    name: str
+    triggers: list[str] = Field(default_factory=list)
+    """命中任一关键词就进入这个模式（大小写不敏感）。"""
+    instruction: str = ""
+    """进入模式后追加到上下文的指令。"""
+    delay_multiplier: float = 1.0
+    """这个话题下回复快慢的倍率，小于 1 表示更上心。"""
+    include_ledger: bool = False
+    """是否把对方过往的相关陈述（ledger）带进上下文，用来指出前后矛盾。"""
+    ledger_kind: str = ""
+
+
+# ---------------------------------------------------------------------------
+# 主动消息
+# ---------------------------------------------------------------------------
+
+
+class ProactiveKind(BaseModel):
+    name: str
+    weight: float = 1.0
+    note: str = ""
+    """给模型的触发说明，描述这次主动是出于什么。"""
+    hours: list[str] = Field(default_factory=list, description="限定时段，如 ['00:00-04:00']；空表示不限")
+    photo_tags: list[str] = Field(default_factory=list)
+    requires_photo: bool = False
+    """为真时如果挑不到合适的照片，这次主动就取消。"""
+    text_optional: bool = False
+    """为真时允许只发照片不配字。"""
+    min_days_since_last: float = 0.0
+    """距离上次同类主动至少隔多少天。"""
 
 
 class ProactiveConfig(BaseModel):
-    max_per_day: int = 3
-    base_probability: float = 0.5
-    reach_out_after_silent_days: int = 3
-    random_chat_slots: int = 1
+    max_per_day: int = 2
+    base_probability: float = 0.45
+    unanswered_decay: float = 0.35
+    """每有一次主动开场没被回应，下次概率乘这个数。"""
+    max_unanswered_per_day: int = 1
+    quiet_days_before_callback: float = 3.0
+    """多久没说话之后允许提一句旧事。"""
+    kinds: list[ProactiveKind] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 其余
+# ---------------------------------------------------------------------------
+
+
+class TimingConfig(BaseModel):
+    max_delay_hours: float = 14.0
+    urgent_multiplier: float = 0.7
+    fatigue_after_minutes: float = 30.0
+    """连续聊多久之后开始变慢、想收尾。"""
+    hot_seconds: float = 180.0
+    warm_seconds: float = 2700.0
 
 
 class MemoryConfig(BaseModel):
@@ -93,28 +260,51 @@ class MemoryConfig(BaseModel):
 
 
 class OwnerInfo(BaseModel):
-    nickname: str = "你"
-    notes: str = ""
+    name: str = ""
+    nickname: str = ""
+    timezone: str = ""
+    """对方所在时区。人物知道有时差，但不迁就。"""
+    knows: str = ""
+    """人物知道对方的哪些事。"""
+    does_not_ask: str = ""
+    """人物不知道也不问的事。"""
 
-
-class RulesConfig(BaseModel):
-    never_admit_ai: bool = True
-    extra_rules: str = ""
+    @field_validator("timezone")
+    @classmethod
+    def _check_tz(cls, v: str) -> str:
+        if v:
+            try:
+                ZoneInfo(v)
+            except ZoneInfoNotFoundError as e:
+                raise ValueError(f"未知时区 {v!r}") from e
+        return v
 
 
 class Persona(BaseModel):
     name: str
-    timezone: str = "Asia/Shanghai"
+    english_name: str = ""
+    age: int | None = None
+    timezone: str = "America/New_York"
     language: str = "zh-CN"
+
     background: str = ""
-    speaking_style: str = ""
+    voice: str = ""
+    """说话方式。用描述而不是规则清单。"""
     relationship: str = ""
+    self_boundaries: str = ""
+    """她自己的边界，写成描述。"""
+
     owner: OwnerInfo = Field(default_factory=OwnerInfo)
     rhythm: RhythmConfig = Field(default_factory=RhythmConfig)
+    style: StyleConfig = Field(default_factory=StyleConfig)
+    boundaries: Boundaries = Field(default_factory=Boundaries)
+    modes: list[TopicMode] = Field(default_factory=list)
     timing: TimingConfig = Field(default_factory=TimingConfig)
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
-    rules: RulesConfig = Field(default_factory=RulesConfig)
+
+    seed: int = 0
+    """人物的随机种子，影响每日抽签。改这个数会得到一整套不同的作息序列。"""
 
     @field_validator("timezone")
     @classmethod
@@ -129,15 +319,48 @@ class Persona(BaseModel):
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
 
+    @property
+    def owner_tz(self) -> ZoneInfo | None:
+        return ZoneInfo(self.owner.timezone) if self.owner.timezone else None
+
+    def mode_for(self, text: str) -> TopicMode | None:
+        """文本命中哪个话题模式；命中多个取触发词最长的那个。"""
+        lowered = text.lower()
+        best: tuple[int, TopicMode] | None = None
+        for mode in self.modes:
+            for trigger in mode.triggers:
+                if trigger.lower() in lowered and (best is None or len(trigger) > best[0]):
+                    best = (len(trigger), mode)
+        return best[1] if best else None
+
     def placeholders(self) -> list[str]:
         """返回仍含【待填】占位的字段名，供 ``check`` 命令提示。"""
         out = []
-        for name in ("background", "speaking_style", "relationship"):
+        for name in ("background", "voice", "relationship", "self_boundaries"):
             if "【待填】" in getattr(self, name):
                 out.append(name)
-        if "【待填】" in self.owner.notes:
-            out.append("owner.notes")
+        if "【待填】" in self.owner.knows:
+            out.append("owner.knows")
         return out
+
+
+Severity = Literal["error", "warning"]
+
+
+def validate_persona(persona: Persona) -> list[tuple[Severity, str]]:
+    """返回一组问题，供 ``check`` 命令展示。空列表表示没问题。"""
+    issues: list[tuple[Severity, str]] = []
+    if not persona.rhythm.variants:
+        issues.append(("warning", "rhythm.variants 为空：她每天的作息会一模一样，很容易看出是程序"))
+    if not persona.proactive.kinds:
+        issues.append(("warning", "proactive.kinds 为空：她永远不会主动说话"))
+    total = sum(v.weight for v in persona.rhythm.variants)
+    if persona.rhythm.variants and total <= 0:
+        issues.append(("error", "rhythm.variants 的权重之和必须大于 0"))
+    for name in persona.placeholders():
+        level: Severity = "error" if name in ("background", "voice") else "warning"
+        issues.append((level, f"{name} 还是【待填】占位"))
+    return issues
 
 
 def load_persona(path: str | Path) -> Persona:
