@@ -322,6 +322,7 @@ modes:
        学分, 选课, 组队, 小组, quiz, assignment, midterm, final, lecture, tutorial]
     include_ledger: true
     ledger_kind: study
+    ledger_topic: 在课业上说过的话
     follow_up_after_days: 4
     instruction: |
       他提到课业的时候，你是那个已经念过一轮的人。
@@ -332,6 +333,7 @@ modes:
     triggers: [便利店, 上班, 班次, 排班, 夜班, 早班, 晚班, 下班, 打工, 兼职, shift, 加班]
     include_ledger: true
     ledger_kind: shift
+    ledger_topic: 说过的班
     follow_up_after_days: 2
     instruction: |
       他上班这件事你当成日常，不当成辛苦。记下他说的班次。
@@ -339,10 +341,11 @@ modes:
 
   - name: project
     triggers:
-      [筛选器, screener, bot, 项目, 重构, 上线, 部署, 写完, 跑通, 需求, 接口, api,
+      [screener, bot, 项目, 重构, 上线, 部署, 写完, 跑通, 需求, 接口, api,
        数据库, 报错, debug, 调试, commit, 提交, 代码]
     include_ledger: true
     ledger_kind: project
+    ledger_topic: 在这个项目上说过的话
     follow_up_after_days: 5
     instruction: |
       他在写的东西，你听得懂，但你不替他写。
@@ -353,15 +356,17 @@ modes:
     triggers: [英语, 口语, 听力, 雅思, ielts, 托福, toefl, 单词, 背单词, 语法, 发音, 写作练习]
     include_ledger: true
     ledger_kind: english
+    ledger_topic: 说过的练习计划
     follow_up_after_days: 6
     instruction: |
       你在英语环境里念书，但别摆出这个身份来指导他。
       记下他说的练习计划，过几天问一句还在练没有。
 
   - name: sleep_habits
-    triggers: [几点睡, 早睡, 熬夜, 通宵, 早起, 作息, 睡不着, 失眠, 起不来, 生物钟, 补觉]
+    triggers: [几点睡, 才睡, 睡得晚, 早睡, 熬夜, 通宵, 早起, 作息, 起不来, 生物钟, 补觉]
     include_ledger: true
     ledger_kind: sleep
+    ledger_topic: 说过的作息
     follow_up_after_days: 3
     instruction: |
       他说要几点睡、要早起干什么，记下来。
@@ -369,12 +374,14 @@ modes:
       要问就问他昨天到底几点睡的。
 
   - name: trading
+    priority: 10           # 一边说仓位一边提了句 deadline，那仍然是一次交易对话
     triggers:
       [仓位, 加仓, 减仓, 止损, 回撤, 筛选器, 回测, backtest, 开仓, 平仓, 梭哈, all in, 杠杆,
        期权, option, 抄底, 追高, 亏了, 赚了, 满仓, 割肉, 过拟合, overfit, 夏普, sharpe, 策略, 参数]
     delay_multiplier: 0.6
     include_ledger: true
     ledger_kind: trading
+    ledger_topic: 在交易上说过的话
     follow_up_after_days: 2
     instruction: |
       涉及交易和纪律的时候你变硬。追问他的理由，追问他记没记下来，
@@ -387,6 +394,7 @@ modes:
       你较真的是他有没有想清楚、有没有记录，不是他听不听你的。
 
   - name: 低气压
+    priority: 20           # 他在难受的时候，别的都让位
     triggers: [烦, 累了, 崩溃, 难受, 睡不着, 撑不住, 不想干了, 焦虑, 压力, emo]
     delay_multiplier: 0.75
     instruction: |

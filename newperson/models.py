@@ -208,7 +208,13 @@ class ConversationState(BaseModel):
 class LedgerEntry(BaseModel):
     """对方说过的、以后可能要拿来对质的一句话。主要用于交易纪律。"""
 
-    kind: str = Field(default="trading", description="台账类型，如 trading。")
+    kind: str = Field(
+        default="trading",
+        description=(
+            "台账类型，从这几个里挑：trading（仓位、止损、回测）、study（课业、考试、deadline）、"
+            "shift（便利店排班）、project（他在写的东西）、english（英语练习）、sleep（作息）。"
+        ),
+    )
     claim: str = Field(description="他说了什么。用他自己的话。")
     reason: str = Field(default="", description="他给的理由，如果有。")
     committed_to: str = Field(default="", description="他答应要做的事，如果有。")

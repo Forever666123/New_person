@@ -372,8 +372,13 @@ class LifeEngine:
         for mode in self.persona.modes:
             if not mode.ledger_kind or mode.follow_up_after_days <= 0:
                 continue
+            cfg = self.persona.proactive
             found = await self.memory.due_ledger_entry(
-                mode.ledger_kind, now, mode.follow_up_after_days
+                mode.ledger_kind,
+                now,
+                mode.follow_up_after_days,
+                max_follow_ups=cfg.ledger_max_follow_ups,
+                max_age_days=cfg.ledger_max_age_days,
             )
             if found is None:
                 continue

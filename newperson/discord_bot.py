@@ -547,6 +547,7 @@ class App:
                 owner_facts=owner_facts,
                 self_facts=self_facts,
                 ledger=ledger,
+                ledger_topic=mode.ledger_topic if mode else "",
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
                 unread=unread,
@@ -778,12 +779,23 @@ class App:
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
+            await self._record_sent(blocked.result, now)
             return
+        except Exception as exc:
+            # 跟回复那条路一样：网络断在中间时前几条已经到他手机上了。
+            # 不记下来的话她自己的历史里就少一截，而重试会拿到同一条台账条目
+            # （asked_at 还没写），于是同一件事被问两遍，措辞还不一样——
+            # 因为第一次说的话根本不在她的 recent 里。
+            if partial := getattr(exc, "delivery_result", None):
+                await self._record_sent(partial, now)
+            raise
 
         await self._record_sent(result, now)
+        # 回访必须真的发出了**文字**才算问过。只发一张没配字的照片
+        # 不构成"问了一句"，却会把那条承诺沉到队尾，白白跳过一个周期。
+        asked = bool(result.sent_texts) if ledger_ref is not None else True
         if result.sent_texts or result.photo_sent:
-            # 问过了才记账。发不出去的话这条还该留在队列里，下次接着问。
-            if ledger_ref is not None:
+            if ledger_ref is not None and asked:
                 await self.memory.mark_ledger_asked(ledger_ref[0], now)
             await self.life.mark_proactive_sent(kind, day, CONVERSATION_ID)
             await self.memory.add_diary_note(

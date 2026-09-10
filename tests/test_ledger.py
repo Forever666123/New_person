@@ -234,3 +234,121 @@ async def test_no_category_starves_the_others(tmp_path: Path, persona: Persona) 
         assert all(a != b for a, b in zip(asked, asked[1:], strict=False)), asked
     finally:
         await memory.close()
+
+
+def test_trading_wins_when_a_message_mentions_both(persona: Persona) -> None:
+    """一边说仓位一边提了句 deadline，那仍然是一次交易对话。
+
+    原来 mode_for 取"触发词最长的那个"，**而长度不是跨语种可比的量**：
+    交易的触发词是"止损""加仓"这种两三个字的中文，课业里却有 assignment、
+    deadline 这种八到十个字母的英文。于是加了五个新模式之后，
+    "止损位我加仓了 assignment 还没交"被判成课业——她看不见他在交易上说过的话，
+    "你变硬、不给面子"那段人设整个丢掉，回复也不再变快。
+    而人设里写着交易纪律是"唯一一件你不让步的事"。
+    """
+    assert persona.mode_for("止损位我加仓了 assignment 还没交").name == "trading"
+    assert persona.mode_for("止损没设 明天有个 deadline").name == "trading"
+    # 他难受的时候，什么都让位
+    assert persona.mode_for("我睡不着 好烦").name == "低气压"
+
+
+def test_no_trigger_belongs_to_two_modes(persona: Persona) -> None:
+    """同一个词属于两个模式的话，命中谁全看优先级和顺序，很难想清楚。"""
+    from collections import Counter
+
+    counts = Counter(t for m in persona.modes for t in m.triggers)
+    assert not [t for t, n in counts.items() if n > 1]
+
+
+def test_every_category_has_its_own_heading(persona: Persona) -> None:
+    """台账在提示词里的小标题要跟着类别走。
+
+    写死成"他之前在交易上说过的话"的话，一条作息承诺会被摆进查账的框里，
+    而交易那段人设是"不给面子，也不安慰"、作息那段又明确禁止说教——
+    两层指令互相打架，输出会很怪。
+    """
+    for mode in persona.modes:
+        if mode.ledger_kind:
+            assert mode.ledger_topic, f"{mode.name} 没有 ledger_topic"
+
+
+def test_the_output_rules_name_all_six_kinds(persona: Persona) -> None:
+    """稳定层必须告诉她六类都要记，而且把合法值列出来。
+
+    原来那句话是"只记交易相关的，别的不用记"——写在 system prompt 里，
+    结果是新加的五类**一条都记不进去**：她被明确告知不要记。
+    这种失败没有任何症状，`!np ledger study` 永远是空的，
+    而你只会以为是自己聊得不够多。
+    """
+    from newperson.prompts import build_system
+
+    rules = build_system(persona)
+    assert "只记交易相关的" not in rules
+    for kind in ("trading", "study", "shift", "project", "english", "sleep"):
+        assert kind in rules, f"稳定层里没提到 {kind}，模型不会往这一类记"
+
+
+async def test_she_lets_a_promise_go_after_asking_twice(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """同一件事问过上限次数就放下。
+
+    没有这个上限的话，条目永远留在候选池里跟着队列无限轮回——
+    因为**没有任何代码把 resolved 置成 1**。三个月后她还会问
+    "你六月说要把止损规则写下来，写了吗"，每隔几天准时回来一次。
+    人不会这样，待办系统才会。
+    """
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="shift", claim="周六早班")], now - timedelta(days=3)
+        )
+        cap = persona.proactive.ledger_max_follow_ups
+        for round_no in range(cap):
+            due = await life.due_ledger_entry(now + timedelta(days=3 * round_no))
+            assert due is not None, f"第 {round_no + 1} 次就问不出来了"
+            await memory.mark_ledger_asked(due[0], now + timedelta(days=3 * round_no))
+        assert await life.due_ledger_entry(now + timedelta(days=90)) is None, "问够了还在问"
+    finally:
+        await memory.close()
+
+
+async def test_ancient_promises_are_not_dragged_up(tmp_path: Path, persona: Persona) -> None:
+    """太久以前的话就翻篇了。正常人不会追问三个月前的一句随口话。"""
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        old = now - timedelta(days=persona.proactive.ledger_max_age_days + 10)
+        await memory.add_ledger_entries([LedgerEntry(kind="study", claim="很久以前说的")], old)
+        assert await life.due_ledger_entry(now) is None
+    finally:
+        await memory.close()
+
+
+async def test_saying_the_same_thing_twice_does_not_queue_it_twice(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他为一件事连发三条消息是常态，那件事不该被问三遍。"""
+    life, memory, _clock, now = await build(tmp_path, persona)
+    try:
+        for _ in range(3):
+            await memory.add_ledger_entries(
+                [LedgerEntry(kind="project", claim="这周把回测跑完")], now - timedelta(days=6)
+            )
+        assert len(await memory.ledger("project")) == 1
+    finally:
+        await memory.close()
+
+
+def test_check_warns_when_a_category_would_be_silently_dead(persona: Persona) -> None:
+    """配错了要当场喊出来。
+
+    这套东西有两种"配错了但完全没有症状"的方式：没有 ledger_check（记了永远不问），
+    和 ledger_kind 少了 follow_up_after_days（只进不出）。
+    这个项目里"安静"和"正常"看起来一模一样，所以只能靠 check 说话。
+    """
+    from newperson.persona import validate_persona
+
+    assert not [m for _, m in validate_persona(persona) if "台账" in m or "ledger" in m]
+
+    persona.proactive.kinds = [k for k in persona.proactive.kinds if k.name != "ledger_check"]
+    assert any("ledger_check" in m for _, m in validate_persona(persona))

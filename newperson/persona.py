@@ -282,6 +282,11 @@ class TopicMode(BaseModel):
     name: str
     triggers: list[str] = Field(default_factory=list)
     """命中任一关键词就进入这个模式（大小写不敏感）。"""
+    priority: int = 0
+    """命中多个模式时谁说了算，大的赢。
+
+    有些话题压过别的：他一边说仓位一边提了句 deadline，那仍然是一次交易对话。
+    """
     instruction: str = ""
     """进入模式后追加到上下文的指令。"""
     delay_multiplier: float = 1.0
@@ -289,6 +294,12 @@ class TopicMode(BaseModel):
     include_ledger: bool = False
     """是否把对方过往的相关陈述（ledger）带进上下文，用来指出前后矛盾。"""
     ledger_kind: str = ""
+    ledger_topic: str = ""
+    """台账那一段在提示词里的小标题，比如"在交易上说过的话"。
+
+    写死成交易的话，一条作息承诺会被摆进查账的框里，
+    而作息那段人设又明确禁止说教——两层指令互相打架，输出会很怪。
+    """
     follow_up_after_days: float = 0.0
     """记下来多久之后才值得追问一句。0 表示这一类不追问。
 
@@ -364,6 +375,10 @@ class ProactiveConfig(BaseModel):
     kinds: list[ProactiveKind] = Field(default_factory=list)
     opener: OpenerConfig = Field(default_factory=lambda: OpenerConfig())
     """第一次上线时的那一句。"""
+    ledger_max_follow_ups: int = 2
+    """同一条承诺最多追问几次。问过就得放下，不然她成了催办机器人。"""
+    ledger_max_age_days: float = 45.0
+    """多久以前的承诺就不再提了。三个月前那句话，正常人早就翻篇了。"""
 
 
 # ---------------------------------------------------------------------------
@@ -472,14 +487,28 @@ class Persona(BaseModel):
         return ZoneInfo(self.owner.timezone) if self.owner.timezone else None
 
     def mode_for(self, text: str) -> TopicMode | None:
-        """文本命中哪个话题模式；命中多个取触发词最长的那个。"""
+        """文本命中哪个话题模式。
+
+        先看 ``priority``，同级再看命中了几个触发词，还平就按 yaml 里的顺序。
+
+        原来的规则是"取触发词最长的那个"，**而长度不是跨语种可比的量**：
+        交易的触发词是"止损""加仓"这种两三个字的中文，课业里却有
+        assignment、tutorial、deadline 这种八到十个字母的英文。
+        于是"止损位我加仓了 assignment 还没交"会被判成课业——
+        她看不见他在交易上说过的话，"你变硬、不给面子"那段人设整个丢掉，
+        回复速度也从 0.6 倍慢回常速。人设里写着交易纪律是"唯一一件你不让步的事"，
+        却能被任何一个更长的英文单词顶掉。
+        """
         lowered = text.lower()
-        best: tuple[int, TopicMode] | None = None
+        best: tuple[int, int, TopicMode] | None = None
         for mode in self.modes:
-            for trigger in mode.triggers:
-                if trigger.lower() in lowered and (best is None or len(trigger) > best[0]):
-                    best = (len(trigger), mode)
-        return best[1] if best else None
+            hits = sum(1 for t in mode.triggers if t.lower() in lowered)
+            if not hits:
+                continue
+            score = (mode.priority, hits)
+            if best is None or score > (best[0], best[1]):
+                best = (mode.priority, hits, mode)
+        return best[2] if best else None
 
     def placeholders(self) -> list[str]:
         """返回仍含【待填】占位的字段名，供 ``check`` 命令提示。"""
@@ -508,6 +537,32 @@ def validate_persona(persona: Persona) -> list[tuple[Severity, str]]:
     for name in persona.placeholders():
         level: Severity = "error" if name in ("background", "voice") else "warning"
         issues.append((level, f"{name} 还是【待填】占位"))
+
+    # 台账这套东西有两种"配错了但完全没有症状"的方式，而这个项目里
+    # "安静"和"正常"看起来一模一样，所以只能在这里当场喊出来。
+    if any(m.ledger_kind for m in persona.modes) and not any(
+        k.name == "ledger_check" for k in persona.proactive.kinds
+    ):
+        issues.append(
+            ("warning", "有台账但 proactive.kinds 里没有 ledger_check：她永远不会回头问你做了没有")
+        )
+    for mode in persona.modes:
+        if mode.ledger_kind and mode.follow_up_after_days <= 0:
+            issues.append(
+                ("warning", f"模式 {mode.name} 记台账但没设 follow_up_after_days：这一类只进不出")
+            )
+        if mode.ledger_kind and not mode.include_ledger:
+            issues.append(
+                ("warning", f"模式 {mode.name} 有 ledger_kind 但没打开 include_ledger：聊到时看不见旧账")
+            )
+    seen: dict[str, str] = {}
+    for mode in persona.modes:
+        for trigger in mode.triggers:
+            if trigger in seen and seen[trigger] != mode.name:
+                issues.append(
+                    ("warning", f"触发词「{trigger}」同时属于 {seen[trigger]} 和 {mode.name}，命中时谁赢要看 priority")
+                )
+            seen[trigger] = mode.name
     return issues
 
 

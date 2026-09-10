@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS ledger (
     committed_to TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0,
-    asked_at TEXT
+    asked_at TEXT,
+    asked_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_kind ON ledger(kind, resolved);
 
@@ -188,7 +189,7 @@ class Memory:
         在老库上永远不会出现——而这个项目的老库就是她的全部记忆，
         不可能推倒重来。每加一列就在这儿写一行，跑过就跳过。
         """
-        wanted = {"ledger": {"asked_at": "TEXT"}}
+        wanted = {"ledger": {"asked_at": "TEXT", "asked_count": "INTEGER NOT NULL DEFAULT 0"}}
         for table, columns in wanted.items():
             cur = await self._db.execute(f"PRAGMA table_info({table})")
             have = {row[1] for row in await cur.fetchall()}
@@ -538,8 +539,19 @@ class Memory:
     # ---- 台账（用来对质） -------------------------------------------------
 
     async def add_ledger_entries(self, entries: list[LedgerEntry], at: datetime) -> None:
+        """记下他说过的话。同一件事重复说不占多个位置。
+
+        他为一件事连发三条消息是常态，而每一条都入库的话，
+        这件事就在回访队列里占了三个位置，被问三遍。
+        """
         for entry in entries:
             if not entry.claim.strip():
+                continue
+            dupe = await self._fetch_one(
+                "SELECT id FROM ledger WHERE kind = ? AND claim = ? AND resolved = 0",
+                (entry.kind, entry.claim.strip()),
+            )
+            if dupe is not None:
                 continue
             await self.db.execute(
                 "INSERT INTO ledger (kind, claim, reason, committed_to, created_at)"
@@ -549,7 +561,13 @@ class Memory:
         await self.db.commit()
 
     async def due_ledger_entry(
-        self, kind: str, now: datetime, after_days: float
+        self,
+        kind: str,
+        now: datetime,
+        after_days: float,
+        *,
+        max_follow_ups: int = 2,
+        max_age_days: float = 45.0,
     ) -> tuple[int, datetime, LedgerEntry] | None:
         """这一类里最该被追问的那一条，没有就返回 None。
 
@@ -558,11 +576,14 @@ class Memory:
         期末考是几周的事，把它们挤在同一天问会像个待办清单，不像人。
         """
         cutoff = (now - timedelta(days=after_days)).isoformat()
+        oldest = (now - timedelta(days=max_age_days)).isoformat()
         row = await self._fetch_one(
             "SELECT * FROM ledger WHERE kind = ? AND resolved = 0"
+            " AND asked_count < ?"
+            " AND created_at >= ?"
             " AND COALESCE(asked_at, created_at) <= ?"
             " ORDER BY COALESCE(asked_at, created_at) LIMIT 1",
-            (kind, cutoff),
+            (kind, max_follow_ups, oldest, cutoff),
         )
         if row is None:
             return None
@@ -581,9 +602,16 @@ class Memory:
         )
 
     async def mark_ledger_asked(self, entry_id: int, at: datetime) -> None:
-        """记下"这条我问过了"，免得同一件事反复问。"""
+        """记下"这条我问过了"。
+
+        计数也加一。**问过几次就得放下**——没有这个上限的话，
+        没人会把 resolved 置成 1，于是每一条承诺都永远留在候选池里，
+        跟着队列无限轮回。三个月之后她会问"你六月说要把止损规则写下来，写了吗"，
+        而且每隔几天准时回来一次。人不会这样，待办系统才会。
+        """
         await self.db.execute(
-            "UPDATE ledger SET asked_at = ? WHERE id = ?", (at.isoformat(), entry_id)
+            "UPDATE ledger SET asked_at = ?, asked_count = asked_count + 1 WHERE id = ?",
+            (at.isoformat(), entry_id),
         )
         await self.db.commit()
 

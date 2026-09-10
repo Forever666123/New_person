@@ -89,8 +89,11 @@ _OUTPUT_RULES = """
 - `photo_request` 只在真的想给他看点什么的时候用，而且只能从"你手边有的照片"里挑 id。
   没有合适的就别提照片。文字里用 `{photo}` 标出配图的那一条。
 - `follow_up` 是你打算过一阵再说的事，比如"我查完告诉你"。别滥用。
-- `ledger_entries` 记他这次说的、以后你可能要拿来对质的话。只记交易相关的，
-  别的不用记。
+- `ledger_entries` 记他这次**主动说出口**的承诺和进展：他打算做什么、
+  什么时候做、给了什么理由。只记他自己说的，不要替他补，也不要记你的推测。
+  `kind` 从这几个里挑一个：trading（仓位、止损、回测）、study（课业、考试、deadline）、
+  shift（便利店排班）、project（他在写的东西）、english（英语练习）、sleep（作息）。
+  都不沾边就不用记。
 - `inner_note` 是你自己的状态，一句话，进你的日记，不会发给他。
 
 上下文里会告诉你此刻在干什么（在上课、刚醒、准备睡了）。
@@ -223,6 +226,7 @@ def build_reply_user(
     owner_facts: list[str],
     self_facts: list[str],
     ledger: list[tuple[datetime, LedgerEntry]],
+    ledger_topic: str = "",
     mode_instruction: str,
     recent: list[StoredMessage],
     unread: list[StoredMessage],
@@ -244,8 +248,10 @@ def build_reply_user(
         )
     ledger_text = format_ledger(ledger)
     if ledger_text:
+        # 小标题跟着类别走。写死"在交易上说过的话"的话，一条作息承诺
+        # 会被摆进查账的框里，而作息那段人设又明确禁止说教——两层指令打架。
         blocks.append(
-            _section("他之前在交易上说过的话", f"{ledger_text}\n对不上的时候，直接翻出来问他。")
+            _section(f"他之前{ledger_topic or '说过的话'}", f"{ledger_text}\n对不上的时候，直接翻出来问他。")
         )
     if mode_instruction:
         blocks.append(_section("这次的话题", mode_instruction))

@@ -90,6 +90,8 @@ class ReplyRequest:
     """对方发来的图片 ``[(media_type, 原始字节)]``，让她真的看得到。"""
     must_reply: bool = False
     """他问了问题或者说了件具体的事。这种不能不回。"""
+    ledger_topic: str = ""
+    """台账那一段的小标题，跟着话题类别走。"""
 
 
 @dataclass
@@ -292,6 +294,7 @@ class Brain:
             owner_facts=req.owner_facts,
             self_facts=req.self_facts,
             ledger=req.ledger,
+            ledger_topic=req.ledger_topic,
             mode_instruction=req.mode_instruction,
             recent=req.recent,
             unread=req.unread,
