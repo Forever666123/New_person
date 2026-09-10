@@ -20,17 +20,16 @@
 
 ## 先说结论
 
-你在 UNSW 在读，有 .edu.au 邮箱——**先用 Azure for Students**。不要钱，
-**不用绑卡**（这一条别的都做不到），机房能选 Australia East。
-一台 B1s（1 核 1G）每月免费 750 小时，一台机器 24 小时跑正好用满，
-另外白送 $100 额度当缓冲，基本花不掉。每年重新验证一次学籍就再续一年。
-
-不想把她挂在学生身份上，就买最便宜的 VPS，一个月两三美金，全程你自己控制。
+**一台最便宜的 VPS，用 systemd 跑。** 现在实际在用的是 Vultr 悉尼
+1 核 1G，$5 一个月，全程你自己控制。往下翻是完整步骤。
 
 理由：她要维持一条 Discord 长连接，不能休眠，所以 Vercel、Cloudflare Workers
 这类无服务器的全都不行；Render、Koyeb 的免费档根本不给后台任务用；
 Railway、Fly.io 的免费档 2023、2024 年就没了。她本身只是一个 Python 进程
 加一个 SQLite 文件，最低配的机器绰绰有余。
+
+下面那节"平替"列了更便宜甚至免费的路子，钱紧的话可以看，
+但记住大头是 API 那 $8，不是服务器这 $5。
 
 ## 平替：从免费到最便宜
 
@@ -108,36 +107,35 @@ Anthropic 的 https:443），家里的 NAT、CGNAT、动态 IP 全都无所谓�
 自建现在唯一站得住的理由是：`data/newperson.db` 是你们全部聊天的完整记录，
 放在自己手上是一个正当的隐私立场。这个理由跟价格无关。
 
-## 方案一：VPS
+## 方案一：VPS + systemd（推荐，也是现在实际在用的）
 
-任何一家都行，最低配就够。参考价：
+任何一家最低配都够。参考价：
 
 | 服务商 | 配置 | 月费 |
 |---|---|---|
+| Vultr | 1 核 1G | $5 |
 | DigitalOcean | 1 核 512M | $4 |
-| Vultr | 1 核 512M | $3.5（纯 IPv6 $2.5） |
 | 年付小厂（RackNerd 这类） | 1 核 1G | 折合 $1–2 |
 
-Azure for Students 开出来的 B1s 也是一台普通 Linux，下面的步骤一样能用。
+512M 那档也能跑（她实测 78 MB），但 1G 省得你去配 swap。
 
 原来这儿写的 Hetzner 现在不能用了：2026 年 4 月和 6 月两轮涨价，
-到 9 月所有共享 vCPU 机型（CX23 系列、ARM 的 CAX 系列）在官网上全部标着
-"not available"，跟内存涨价是同一件事。
+到 9 月所有共享 vCPU 机型在官网上全部标着 "not available"，跟内存涨价是同一件事。
 
-选机房的时候可以挑离她"人在的地方"近的，纯粹是心理作用，对功能没影响。
+选机房可以挑离她"人在的地方"近的，纯粹是心理作用，对功能没影响。
 
 ### 装
 
 ```bash
 ssh root@你的服务器
+apt update && apt install -y python3-venv git rclone gnupg sqlite3
 
-# Docker
-curl -fsSL https://get.docker.com | sh
-
-# 代码
-git clone https://github.com/Forever666123/New_person.git
-cd New_person
+git clone https://github.com/Forever666123/New_person.git /opt/New_person
+cd /opt/New_person
 git checkout claude/discord-virtual-character-qzc8a1
+
+python3 -m venv .venv
+.venv/bin/pip install -e .
 ```
 
 ### 配
@@ -158,11 +156,19 @@ DB_PATH=data/newperson.db
 **调试开关留在线上是最容易犯的错**：`DELAY_SCALE=0.05` 会让她秒回，
 `DEBUG_FORCE_AWAKE=1` 会让她不睡觉。这两个一开，这个项目就白做了。
 
-### 跑
+检查一遍：
 
 ```bash
-docker compose up -d --build
-docker compose logs -f          # 看日志，Ctrl+C 退出不影响她
+.venv/bin/python -m newperson check
+```
+
+### 起
+
+```bash
+cp scripts/chloe.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now chloe
+journalctl -u chloe -f          # 看日志，Ctrl+C 退出不影响她
 ```
 
 日志里认这几行：
@@ -171,17 +177,44 @@ docker compose logs -f          # 看日志，Ctrl+C 退出不影响她
 [app] 沈亦宁 上线了。她那边 09-11 08:47，有空（你那边 22:47）
 [app] 日志里的时间都是她那边的时间（America/New_York）
 [life] 2026-09-11 的日程好了，排了 1 个主动时刻
+[life] 第一次上线，开场排在 09-11 10:23
 ```
+
+最后那行只有第一次会有。她不会在你敲完命令那一刻就说话——那是程序开机的样子。
+
+**`scripts/chloe.service` 里的 `RestartSec=30` 不要改小。**
+Discord 给每个机器人每 24 小时 1000 次 IDENTIFY（断线重连走 RESUME 不算）。
+超了的后果是所有会话被终止**并且 bot token 被重置**，只发一封邮件通知你。
+崩溃后立刻重启的话，一个"连上就崩"的循环一小时就能烧掉上千次。
 
 ### 更新代码
 
 ```bash
-cd New_person && git pull && docker compose up -d --build
+cd /opt/New_person && git pull && .venv/bin/pip install -e . && systemctl restart chloe
 ```
 
-她的记忆在 `data/` 里，不受影响。
+她的记忆在 `data/` 里，不受影响。改了 `persona.yaml` 也要 restart 才生效。
 
-## 方案二：Fly.io
+## 方案二：Docker
+
+仓库里的 `Dockerfile` 和 `docker-compose.yml` 还在，想用容器就用：
+
+```bash
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/Forever666123/New_person.git && cd New_person
+cp .env.example .env && nano .env
+docker compose up -d --build
+```
+
+备份脚本两种跑法都支持，容器的话在 `scripts/backup.env` 里改两行：
+
+```
+PYTHON_BIN="docker compose exec -T newperson python"
+DB_PATH=/app/data/newperson.db
+```
+
+## 方案三：Fly.io
+
 
 不用管系统，但要学一点它自己的概念。它 2024 年 10 月起没有免费档了，
 这个配置（256M 机器 + 1G 卷）大概 $2.5 一个月。
@@ -248,8 +281,18 @@ chmod 600 /root/.chloe-backup-pass
 cat /root/.chloe-backup-pass
 
 # 4) 填配置
+cd /opt/New_person
 cp scripts/backup.env.example scripts/backup.env
-nano scripts/backup.env        # 至少改 RCLONE_REMOTE
+nano scripts/backup.env
+```
+
+`backup.env` 里至少确认这四行：
+
+```
+RCLONE_REMOTE=b2:你的bucket名/
+PYTHON_BIN=/opt/New_person/.venv/bin/python
+DB_PATH=/opt/New_person/data/newperson.db
+SERVICE_NAME=chloe
 ```
 
 **第 3 步是整段里最容易忽略的。** 口令跟备份存在同一台服务器上是没有意义的：
@@ -262,6 +305,8 @@ scripts/backup.sh              # 手动跑一次，确认能通
 scripts/restore.sh             # 演练：下载、解密、验，不碰线上那份
 ```
 
+**不用停服务。** 取快照走的是 SQLite 的在线备份接口，她一边写我们一边拷。
+
 演练会把里面有什么打给你看——多少条消息、从哪天到哪天、她记住了多少事。
 **看到数字对得上，才算你有备份。**
 
@@ -272,12 +317,16 @@ crontab -e
 ```
 
 ```
-0 4 * * * /root/New_person/scripts/backup.sh >> /var/log/chloe-backup.log 2>&1
-0 5 * * 0 /root/New_person/scripts/restore.sh >> /var/log/chloe-drill.log 2>&1
+0 4 * * * /opt/New_person/scripts/backup.sh >> /var/log/chloe-backup.log 2>&1
+0 5 * * 0 /opt/New_person/scripts/restore.sh >> /var/log/chloe-drill.log 2>&1
 ```
 
 第二条是每周一次的恢复演练。备份最常见的死法不是没备份，
 是**备了一年从来没人试过能不能恢复**。
+
+cron 的 `PATH` 通常只有 `/usr/bin:/bin`。`rclone` 要是装在 `/usr/local/bin`，
+在 `backup.env` 里加一行 `PATH=/usr/local/bin:/usr/bin:/bin`。
+脚本会在开头就检查并明确告诉你找不到什么，不会半夜静默失败。
 
 ### 它怎么防自己出事
 
@@ -288,7 +337,7 @@ crontab -e
   令牌过期了一切照旧——所以把它放进你每天都会看的那个命令里。
 - **拷出来当场跑 `integrity_check`**，坏了就删掉并退非零。一份坏备份比没有
   备份更危险，它让你以为自己有退路。
-- **空备份不会顶掉旧的**。如果哪天 `DB_PATH` 指错了或者 `data/` 没挂上，
+- **空备份不会顶掉旧的**。如果哪天 `DB_PATH` 指错了，
   拷出来的是个 0 条消息的完好数据库。这种时候它照传，但**不清理旧备份**、
   **不更新时间标记**，于是 `!np status` 会一直提醒你。否则一个月之后，
   三十份空备份就把所有真备份全顶掉了，全程没有一句报错。
@@ -301,7 +350,8 @@ scripts/restore.sh --at 20260912             # 先演练那一份
 scripts/restore.sh --install --at 20260912   # 确认没问题再装回去
 ```
 
-`--install` 会停容器、把当前那份改名留着（不删）、装上恢复的那份、再起来。
+`--install` 会停服务、把当前那份改名留着（不删）、装上恢复的那份、再起来。
+新库是先拷成临时文件再原子改名的——直接往上覆盖的话，拷到一半断电就两份都没了。
 她会以为中间那段时间自己没看手机。
 
 ## 跑起来之后
@@ -310,7 +360,7 @@ scripts/restore.sh --install --at 20260912   # 确认没问题再装回去
 
 | 命令 | 用途 |
 |---|---|
-| `!np status` | 她现在在干嘛、下一条回复排在几点、今天花了多少钱 |
+| `!np status` | 她现在在干嘛、下一条回复排在几点、今天花了多少钱、上次备份是什么时候 |
 | `!np ledger` | 她记下的、你在交易上说过的话 |
 | `!np pause` / `resume` | 你不想被打扰的时候 |
 | `!np away 出差 5` | 你出门几天，让她也安静点 |
@@ -321,7 +371,7 @@ scripts/restore.sh --install --at 20260912   # 确认没问题再装回去
 
 | 项目 | 月费 |
 |---|---|
-| 服务器 | $0（Azure 学生 / 家里的机器）到 $4 |
+| 服务器 | $5（Vultr 悉尼 1 核 1G）|
 | Claude API（中度聊天，Sonnet 5） | 约 $8 |
 
 **大头是 API，不是服务器。** 在服务器上省下的那几美金，
@@ -334,13 +384,15 @@ scripts/restore.sh --install --at 20260912   # 确认没问题再装回去
 
 **她一直显示离线。** 正常，她睡觉时就是离线的。`!np status` 看真实状态。
 
-**改了 persona.yaml 没生效。** 人设是只读挂载的，改完要
-`docker compose restart`。
+**改了 persona.yaml 没生效。** 人设是启动时读的，改完要 `systemctl restart chloe`。
 
-**容器一直重启。** `docker compose logs --tail 50` 看最后的报错。
+**服务一直重启。** `journalctl -u chloe -n 50` 看最后的报错。
 多半是 `.env` 里少了东西，或者 API key 过期。
+注意 `systemctl status chloe` 显示 `start-limit-hit` 是熔断生效了——
+那是在保护你的 bot token，先修问题再 `systemctl reset-failed chloe`。
 
 **她突然不说话了。** 先 `!np status` 看最近一次接口出错是什么，
 再看是不是撞到了 `MAX_CALLS_PER_DAY`。
 
 **换服务器。** 把 `data/` 目录整个拷过去就行，她的记忆全在里面。
+或者直接在新机器上 `scripts/restore.sh --install`。

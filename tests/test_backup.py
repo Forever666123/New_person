@@ -7,6 +7,7 @@ WAL 里还没落盘的话有没有拷到、有人正在写的时候拷会不会�
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -232,3 +233,56 @@ def test_backup_script_and_restore_script_are_valid_shell() -> None:
             ["bash", "-n", str(script)], capture_output=True, text=True, check=False
         )
         assert result.returncode == 0, f"{name} 语法错误：{result.stderr}"
+
+
+def test_the_systemd_unit_protects_the_bot_token() -> None:
+    """`RestartSec` 不是随手写的数。
+
+    Discord 每 24 小时只给 1000 次 IDENTIFY，超了会**重置 bot token**。
+    一个"连上就崩"的循环配上立刻重启，一小时就能烧光。
+    有人为了"让她快点恢复"把这个值调小的话，这条会先叫。
+    """
+    unit = (Path(__file__).resolve().parent.parent / "scripts" / "chloe.service").read_text(
+        encoding="utf-8"
+    )
+    restart_sec = int(re.search(r"^RestartSec=(\d+)", unit, re.M).group(1))
+    burst = int(re.search(r"^StartLimitBurst=(\d+)", unit, re.M).group(1))
+    interval = int(re.search(r"^StartLimitIntervalSec=(\d+)", unit, re.M).group(1))
+
+    assert restart_sec >= 20, "重启间隔太短，崩溃循环会烧掉 Discord 的登录次数"
+    # 熔断窗口里最多这么多次，换算成一天
+    per_day = burst * (86400 / interval)
+    assert per_day < 1000, f"一天最多可能重启 {per_day:.0f} 次，会撞上 Discord 的 1000 次上限"
+    assert "ReadWritePaths" in unit, "她只该能写 data/"
+
+
+def test_the_scripts_do_not_require_docker() -> None:
+    """线上是 systemd + venv，机器上根本没有 docker。
+
+    这两个脚本一度写死了 `docker compose`，结果是备份每天静默失败，
+    而"没有备份"这件事在出事之前是没有任何症状的。
+    """
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    for name in ("backup.sh", "restore.sh"):
+        body = scripts.joinpath(name).read_text(encoding="utf-8")
+        commands = [
+            line
+            for line in body.splitlines()
+            if "docker" in line and not line.lstrip().startswith("#")
+        ]
+        assert not commands, f"{name} 里还有依赖 docker 的命令：{commands}"
+
+
+def test_the_env_example_documents_every_knob_the_scripts_read() -> None:
+    """脚本读的每个变量，示例配置里都要提到。
+
+    漏一个的结果是它悄悄用默认值——而默认值在别人的机器上多半是错的。
+    """
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    example = scripts.joinpath("backup.env.example").read_text(encoding="utf-8")
+    for name in ("backup.sh", "restore.sh"):
+        body = scripts.joinpath(name).read_text(encoding="utf-8")
+        for var in re.findall(r'^(\w+)="\$\{\1:-', body, re.M):
+            if var in ("SERVICE_STOP", "SERVICE_START"):
+                continue  # 由 SERVICE_NAME 推出来的，不用单独配
+            assert var in example, f"{name} 会读 {var}，但 backup.env.example 里没写"

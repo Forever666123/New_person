@@ -1,0 +1,43 @@
+# 装到 /etc/systemd/system/chloe.service
+#   systemctl daemon-reload && systemctl enable --now chloe
+#
+# RestartSec 那一行不是随便写的，见下面的注释。
+
+[Unit]
+Description=Chloe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/New_person
+EnvironmentFile=/opt/New_person/.env
+ExecStart=/opt/New_person/.venv/bin/python -m newperson run
+
+# 她自己接 SIGTERM，会把数据库干净地关掉再退出。给足时间。
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+# **这三行是在保护你的 bot token。**
+# Discord 给每个机器人每 24 小时 1000 次 IDENTIFY（断线重连走 RESUME 不算）。
+# 超了的后果是所有会话被终止**并且 token 被重置**，只发一封邮件通知你。
+# 崩溃后立刻重启的话，一个"连上就崩"的循环一小时就能烧掉上千次。
+# 等 30 秒再拉起来，一天最多两千多次重启，配上下面的熔断就烧不到 1000。
+RestartSec=30
+StartLimitIntervalSec=3600
+StartLimitBurst=20
+
+# 日志进 journal，journalctl -u chloe -f 看
+StandardOutput=journal
+StandardError=journal
+
+# 她只需要读代码、写 data/。其余的按最小权限来。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/New_person/data
+
+[Install]
+WantedBy=multi-user.target
