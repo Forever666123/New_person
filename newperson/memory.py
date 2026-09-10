@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS ledger (
     reason TEXT NOT NULL DEFAULT '',
     committed_to TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    resolved INTEGER NOT NULL DEFAULT 0
+    resolved INTEGER NOT NULL DEFAULT 0,
+    asked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_kind ON ledger(kind, resolved);
 
@@ -177,7 +178,24 @@ class Memory:
             "PRAGMA foreign_keys=ON;"
         )
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """给已经存在的库补上后加的列。
+
+        ``CREATE TABLE IF NOT EXISTS`` 对已有的表什么都不做，所以新加的列
+        在老库上永远不会出现——而这个项目的老库就是她的全部记忆，
+        不可能推倒重来。每加一列就在这儿写一行，跑过就跳过。
+        """
+        wanted = {"ledger": {"asked_at": "TEXT"}}
+        for table, columns in wanted.items():
+            cur = await self._db.execute(f"PRAGMA table_info({table})")
+            have = {row[1] for row in await cur.fetchall()}
+            for name, decl in columns.items():
+                if name not in have:
+                    log.info("[db] 给 %s 补上 %s 列", table, name)
+                    await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -528,6 +546,45 @@ class Memory:
                 " VALUES (?, ?, ?, ?, ?)",
                 (entry.kind, entry.claim, entry.reason, entry.committed_to, at.isoformat()),
             )
+        await self.db.commit()
+
+    async def due_ledger_entry(
+        self, kind: str, now: datetime, after_days: float
+    ) -> tuple[int, datetime, LedgerEntry] | None:
+        """这一类里最该被追问的那一条，没有就返回 None。
+
+        "该被追问"= 还没了结、并且距离上次提起（没提过就算记下那天）
+        已经超过这一类自己的周期。周期按事情本身走：便利店的班次是几天的事，
+        期末考是几周的事，把它们挤在同一天问会像个待办清单，不像人。
+        """
+        cutoff = (now - timedelta(days=after_days)).isoformat()
+        row = await self._fetch_one(
+            "SELECT * FROM ledger WHERE kind = ? AND resolved = 0"
+            " AND COALESCE(asked_at, created_at) <= ?"
+            " ORDER BY COALESCE(asked_at, created_at) LIMIT 1",
+            (kind, cutoff),
+        )
+        if row is None:
+            return None
+        # 返回的是"上次碰它是什么时候"（问过就是问的那天，没问过就是记下那天），
+        # 不是 created_at。上层拿它来排序，用 created_at 的话同一天记下的几条
+        # 会永远平手，然后由遍历顺序决定谁赢——排在后面的类别一辈子问不到。
+        return (
+            int(row["id"]),
+            datetime.fromisoformat(row["asked_at"] or row["created_at"]),
+            LedgerEntry(
+                kind=row["kind"],
+                claim=row["claim"],
+                reason=row["reason"],
+                committed_to=row["committed_to"],
+            ),
+        )
+
+    async def mark_ledger_asked(self, entry_id: int, at: datetime) -> None:
+        """记下"这条我问过了"，免得同一件事反复问。"""
+        await self.db.execute(
+            "UPDATE ledger SET asked_at = ? WHERE id = ?", (at.isoformat(), entry_id)
+        )
         await self.db.commit()
 
     async def ledger(self, kind: str, limit: int = 25) -> list[tuple[datetime, LedgerEntry]]:

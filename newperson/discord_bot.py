@@ -32,10 +32,17 @@ from .calendar import AcademicCalendar
 from .clock import Clock, RealClock
 from .config import Settings
 from .delivery import Deliverer, DeliveryBlocked
-from .life import LifeEngine
+from .life import LEDGER_CHECK, LifeEngine
 from .media import CommandImageGenerator, MediaService, NullImageGenerator, PhotoLibrary
 from .memory import Memory
-from .models import IncomingMessage, Job, PhotoRequest, RhythmSnapshot, TimeOfDay
+from .models import (
+    IncomingMessage,
+    Job,
+    LedgerEntry,
+    PhotoRequest,
+    RhythmSnapshot,
+    TimeOfDay,
+)
 from .persona import Persona
 from .prompts import build_situation
 from .rhythm import Rhythm
@@ -721,10 +728,29 @@ class App:
             [t for t in (conv.last_user_message_at, conv.last_bot_message_at) if t],
             default=None,
         )
+
+        # 回访类的主动消息必须**带着他原话**去问。
+        # 原来 trading_check 只有一句"问一句他之前说要做的事"，而 ProactiveRequest
+        # 里根本没有台账——她被要求追问一件自己看不见的事，只能问得很空。
+        # 到期条目在发送那一刻才取，不在排期时取：中间隔着几个小时，他可能已经做了。
+        note = job.payload.get("note", "")
+        ledger_ref: tuple[int, str, LedgerEntry] | None = None
+        if job.payload.get("kind") == LEDGER_CHECK:
+            ledger_ref = await self.life.due_ledger_entry(now)
+            if ledger_ref is None:
+                log.info("[proactive] 本来要问一句，但已经没有到期的承诺了")
+                return
+            _entry_id, _kind, entry = ledger_ref
+            note = f"{note}\n他当时说的是：{entry.claim}"
+            if entry.reason:
+                note += f"\n他给的理由：{entry.reason}"
+            if entry.committed_to:
+                note += f"\n他答应要做的：{entry.committed_to}"
+
         plan = await self.brain.generate_proactive(
             ProactiveRequest(
                 situation=await self._build_situation(now),
-                trigger_note=job.payload.get("note", ""),
+                trigger_note=note,
                 summary=conv.summary,
                 owner_facts=owner_facts,
                 self_facts=self_facts,
@@ -756,6 +782,9 @@ class App:
 
         await self._record_sent(result, now)
         if result.sent_texts or result.photo_sent:
+            # 问过了才记账。发不出去的话这条还该留在队列里，下次接着问。
+            if ledger_ref is not None:
+                await self.memory.mark_ledger_asked(ledger_ref[0], now)
             await self.life.mark_proactive_sent(kind, day, CONVERSATION_ID)
             await self.memory.add_diary_note(
                 day, plan.inner_note or f"主动说了句（{kind}）", now

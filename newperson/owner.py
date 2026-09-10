@@ -32,7 +32,8 @@ HELP = """\
 `!np pause` / `!np resume` 暂停。暂停时她不回也不主动，但消息照常记着
 `!np away 出差 [天数]` / `!np back` 请假。这期间她话少，只保留最低限度的主动
 `!np chatty 0.5` 主动消息的频率倍率，0 到 2
-`!np ledger` 她记下的、你在交易上说过的话
+`!np ledger [类别]` 她记下的、你说过要做的事
+　　　类别：trading（默认）/ study / shift / project / english / sleep
 `!np plan` 看今天她给自己编的日程
 `!np help` 这些"""
 
@@ -208,7 +209,11 @@ async def _ledger(args: list[str], ctx: OwnerContext) -> str:
     kind = args[0] if args else "trading"
     entries = await ctx.memory.ledger(kind, limit=12)
     if not entries:
-        return "还没记下什么。跟她聊到仓位、止损、回测这些的时候她才会记。"
+        return (
+            f"「{kind}」这一类还没记下什么。\n"
+            "她只记你主动说出口的承诺和进展——聊到课业、班次、项目、英语、作息、仓位的时候。\n"
+            "别的类别：`!np ledger study` / `shift` / `project` / `english` / `sleep` / `trading`"
+        )
 
     lines = [f"**她记着这些**（{kind}，最近 {len(entries)} 条）"]
     for at, entry in entries:

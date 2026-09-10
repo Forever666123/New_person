@@ -612,7 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("photos", help="扫描照片目录生成索引草稿")
 
     led = sub.add_parser("ledger", help="打印她记下的、你在交易上说过的话")
-    led.add_argument("--kind", default="trading")
+    led.add_argument("--kind", default="trading", help="trading / study / shift / project / english / sleep")
     led.add_argument("--limit", type=int, default=50)
 
     bak = sub.add_parser("backup", help="把她的记忆拷一份出来（一致快照，拷完就验）")

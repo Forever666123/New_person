@@ -22,10 +22,13 @@ from .brain import Brain, DayPlanRequest
 from .calendar import AcademicCalendar
 from .clock import Clock
 from .memory import Memory
-from .models import DayPlan, Job, PlanEvent
+from .models import DayPlan, Job, LedgerEntry, PlanEvent
 from .persona import OpenerConfig, Persona, ProactiveKind, parse_hhmm
 from .rhythm import Rhythm
 from .scheduler import Scheduler
+
+LEDGER_CHECK = "ledger_check"
+"""回访台账的那种主动消息的名字。代码里要认它，所以不能只写在 yaml 里。"""
 
 OPENER_KEY = "opener"
 """排过开场没有。同时用作任务的去重键，所以它天然只会排上一次。"""
@@ -330,6 +333,10 @@ class LifeEngine:
                 continue
             if await self._days_since_last(kind.name, day) < kind.min_days_since_last:
                 continue
+            if kind.name == LEDGER_CHECK and await self.due_ledger_entry(now) is None:
+                # 没有到期的承诺就别安排"问一句做了没有"——
+                # 她会为了填这个坑去编一件他没说过的事。
+                continue
             eligible.append(kind)
         if not eligible:
             return []
@@ -352,6 +359,30 @@ class LifeEngine:
             candidates.append((moment, kind, self._with_plan_hint(kind.note, kind.name, shareable)))
 
         return sorted(candidates, key=lambda c: c[0])
+
+    async def due_ledger_entry(self, now: datetime) -> tuple[int, str, LedgerEntry] | None:
+        """所有台账类别里，此刻最该被追问的那一条。
+
+        每一类有自己的周期（``modes`` 里的 ``follow_up_after_days``），
+        谁先到期先问谁。**一次只问一件**：类别多了之后，如果每类各自抽签，
+        她会变成一份待办清单——今天问学习、明天问排班、后天问作息。
+        """
+        best: tuple[int, str, LedgerEntry] | None = None
+        best_at: datetime | None = None
+        for mode in self.persona.modes:
+            if not mode.ledger_kind or mode.follow_up_after_days <= 0:
+                continue
+            found = await self.memory.due_ledger_entry(
+                mode.ledger_kind, now, mode.follow_up_after_days
+            )
+            if found is None:
+                continue
+            entry_id, touched_at, entry = found
+            # 最久没被碰过的那条先问。问过一条它就排到队尾，
+            # 于是几个类别自然轮着来，而不是某一类一直压着别的。
+            if best_at is None or touched_at < best_at:
+                best_at, best = touched_at, (entry_id, mode.ledger_kind, entry)
+        return best
 
     def _with_plan_hint(self, note: str, kind_name: str, shareable: list[PlanEvent]) -> str:
         """给"说说自己"这类主动挂一件今天真发生的事。
