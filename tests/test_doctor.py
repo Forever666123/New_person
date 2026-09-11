@@ -14,22 +14,15 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from newperson import doctor
+from newperson import backup, doctor
+from newperson.memory import SCHEMA
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 
-SCHEMA = """
-CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT,
-  discord_message_id INTEGER, author_kind TEXT, author_id INTEGER DEFAULT 0,
-  author_name TEXT DEFAULT '', content TEXT DEFAULT '', attachments_json TEXT DEFAULT '[]',
-  created_at TEXT NOT NULL, read_at TEXT, edited_at TEXT, deleted INTEGER DEFAULT 0);
-CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, status TEXT,
-  run_at TEXT, reason TEXT DEFAULT '');
-CREATE TABLE facts (id INTEGER PRIMARY KEY, superseded INTEGER DEFAULT 0);
-CREATE TABLE ledger (id INTEGER PRIMARY KEY, resolved INTEGER DEFAULT 0,
-  asked_count INTEGER DEFAULT 0);
-CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
-"""
+# **用真的建表语句，不手抄一份。**
+# 手抄的那份会慢慢和真库对不上，而对不上的地方恰恰是不会被测到的地方：
+# `jobs.finished_at` 加进去之后，手抄的 schema 里没有它，
+# 于是"任务扎堆"那一项在测试里跑的是另一套数据形状。
 
 
 def make_db(path: Path, gaps: list[float], seed: int = 1) -> Path:
@@ -54,6 +47,29 @@ def make_db(path: Path, gaps: list[float], seed: int = 1) -> Path:
     conn.commit()
     conn.close()
     return path
+
+
+def add_job(
+    conn: sqlite3.Connection,
+    kind: str,
+    finished_at: datetime,
+    reason: str = "",
+    run_at: datetime | None = None,
+    status: str = "done",
+) -> None:
+    """往任务表里塞一条。``finished_at`` 是**真的执行完**的时刻，体检看的就是它。"""
+    conn.execute(
+        "INSERT INTO jobs (kind, status, run_at, finished_at, reason, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (
+            kind,
+            status,
+            (run_at or finished_at).isoformat(),
+            finished_at.isoformat(),
+            reason,
+            finished_at.isoformat(),
+        ),
+    )
 
 
 def rhythm_finding(report: doctor.Report) -> doctor.Finding:
@@ -108,20 +124,31 @@ def test_it_says_so_when_there_is_not_enough_to_judge(tmp_path: Path) -> None:
 
 
 def test_a_pile_of_jobs_in_one_minute_is_flagged(tmp_path: Path) -> None:
-    """重启之后积压一起涌出来，是最容易被一眼看穿的一幕。"""
+    """重启之后积压一起涌出来，是最容易被一眼看穿的一幕。
+
+    **看的必须是执行时刻，不是排期时刻。** 积压涌出来时这两个数差着几小时：
+    库里记的 run_at 恰好是分散的（06:00、06:15、06:30……），
+    而它们全在 09:05 那一分钟真的发出去。所以这里把 run_at 故意排得很开，
+    finished_at 挤在一起——按 run_at 判的话什么都报不出来。
+    """
     path = make_db(tmp_path / "burst.db", [5, 20, 60])
     conn = sqlite3.connect(path)
-    at = NOW - timedelta(days=2)
+    scheduled = NOW - timedelta(days=2, hours=3)
+    ran = NOW - timedelta(days=2)
     for i in range(6):
-        conn.execute(
-            "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('reply','done',?,'')",
-            ((at + timedelta(seconds=i * 15)).isoformat(),),
+        add_job(
+            conn,
+            "reply",
+            ran + timedelta(seconds=i * 15),
+            run_at=scheduled + timedelta(minutes=i * 15),
         )
     conn.commit()
     conn.close()
 
     report = doctor.run(path, NOW, days=40)
-    assert any("挤在两分钟内" in f.line for f in report.findings)
+    assert any("挤在两分钟内" in f.line for f in report.findings), (
+        f"没报出来：\n{report.render()}"
+    )
 
 
 def test_a_checklist_of_follow_ups_is_flagged(tmp_path: Path) -> None:
@@ -129,12 +156,7 @@ def test_a_checklist_of_follow_ups_is_flagged(tmp_path: Path) -> None:
     path = make_db(tmp_path / "nag.db", [5, 20, 60])
     conn = sqlite3.connect(path)
     for i in range(8):
-        at = NOW - timedelta(days=i + 1)
-        conn.execute(
-            "INSERT INTO jobs (kind, status, run_at, reason)"
-            " VALUES ('proactive','done',?,'ledger_check')",
-            (at.isoformat(),),
-        )
+        add_job(conn, "proactive", NOW - timedelta(days=i + 1), "ledger_check")
     conn.commit()
     conn.close()
 
@@ -247,9 +269,8 @@ def test_an_exception_in_a_job_reason_is_not_printed(tmp_path: Path) -> None:
     path = make_db(tmp_path / "reason.db", [5, 20, 60])
     conn = sqlite3.connect(path)
     for i in range(5):
-        conn.execute(
-            "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('proactive','done',?,?)",
-            ((NOW - timedelta(days=i + 1)).isoformat(), f"ValueError: 处理 {secret} 时出错"),
+        add_job(
+            conn, "proactive", NOW - timedelta(days=i + 1), f"ValueError: 处理 {secret} 时出错"
         )
     conn.commit()
     conn.close()
@@ -258,26 +279,35 @@ def test_an_exception_in_a_job_reason_is_not_printed(tmp_path: Path) -> None:
     assert secret not in text
 
 
-def test_silence_counts_replies_not_bubbles(tmp_path: Path) -> None:
-    """她一次回复分成几个气泡发，不能把每个气泡都算成一次回应。
+def test_silence_is_counted_in_turns_on_both_sides(tmp_path: Path) -> None:
+    """沉默比例要**两边都数轮次**，一边数轮次一边数条数是错的。
 
-    拿气泡数去比消息数的话，真实 40% 的沉默会被算成 0%，
-    于是这一项永远在报"她几乎有问必答"——一个永远响的警报等于没有警报。
+    气泡那一侧曾经数错过：她一次回复分三个气泡，拿气泡数比消息数，
+    真实 40% 的沉默会被算成 0%。但他那一侧同样不能数条数——
+    他连发三行是一轮，她回一次就是接住了。混着数的话，
+    这个比例实际测的是"他平均一轮打几行字"，而把未读并成一次回复
+    正是这个项目的设计，所以它必然大于 1：
+    他每轮三行、她**每轮都回**，会被报成"没接话的比例 67%"。
+
+    这里造的库两边都掺了：他有时一行、有时三行，她回的时候发两三个气泡。
+    十六轮里她接了九轮，最后那一轮她可能还没到点回、不算数，
+    于是十五轮里接了九轮，答案是 40%。
     """
-    path = tmp_path / "bubbles.db"
+    path = tmp_path / "turns.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
     at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
-    # 十条他的消息，她只回应了六次，但每次都发三个气泡
-    for i in range(10):
-        conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
-            " VALUES ('dm','user','x',?,?)",
-            (at.isoformat(), at.isoformat()),
-        )
+    for i in range(16):
+        for _ in range(3 if i % 2 else 1):  # 他一轮里打一到三行
+            conn.execute(
+                "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+                " VALUES ('dm','user','x',?,?)",
+                (at.isoformat(), at.isoformat()),
+            )
+            at += timedelta(seconds=40)
         at += timedelta(minutes=10)
-        if i < 6:
-            for _ in range(3):
+        if i < 9:  # 十五轮里接住九轮
+            for _ in range(2 + i % 2):  # 她一次回两三个气泡
                 conn.execute(
                     "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
                     " VALUES ('dm','bot','y',?)",
@@ -290,6 +320,60 @@ def test_silence_counts_replies_not_bubbles(tmp_path: Path) -> None:
 
     finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
     assert "40%" in finding.line, f"应该报 40% 沉默，实际：{finding.line}"
+
+
+def test_answering_every_single_turn_is_flagged_even_when_he_sends_three_lines(
+    tmp_path: Path,
+) -> None:
+    """他每轮打三行、她每轮都回——这是"有问必答"，不是"漏了三分之二"。"""
+    path = tmp_path / "every.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    for _ in range(15):
+        for _ in range(3):
+            conn.execute(
+                "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+                " VALUES ('dm','user','x',?,?)",
+                (at.isoformat(), at.isoformat()),
+            )
+            at += timedelta(seconds=40)
+        at += timedelta(minutes=10)
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+            " VALUES ('dm','bot','y',?)",
+            (at.isoformat(),),
+        )
+        at += timedelta(hours=3)
+    conn.commit()
+    conn.close()
+
+    finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
+    assert "有问必答" in finding.line, f"他连发三行被当成她漏了两条：{finding.line}"
+
+
+def test_days_of_total_silence_are_not_reported_as_normal(tmp_path: Path) -> None:
+    """她一句话没回的时候，报告不能是 ✓。
+
+    按条数算的那版会把"三天一句没回"读成"沉默 46%"，落在 OK 区间里。
+    """
+    path = tmp_path / "mute.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = NOW - timedelta(days=3)
+    for _ in range(20):
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+            " VALUES ('dm','user','x',?,?)",
+            (at.isoformat(), at.isoformat()),
+        )
+        at += timedelta(hours=3)
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=14)
+    finding = next(f for f in report.findings if "没接话" in f.line)
+    assert finding.level == doctor.WARN, f"她彻底哑了却没报：{report.render()}"
 
 
 def test_the_autumn_clock_change_does_not_fake_a_burst(tmp_path: Path) -> None:
@@ -307,10 +391,7 @@ def test_the_autumn_clock_change_does_not_fake_a_burst(tmp_path: Path) -> None:
         # fold 要在构造时就定下来——`+ timedelta(...)` 会把它丢掉，
         # 于是十二条全变成 -04:00，那个歧义小时根本没造出来。
         at = datetime(2026, 11, 1, 1, 8 * (i % 6), tzinfo=boston, fold=0 if i < 6 else 1)
-        conn.execute(
-            "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('reply','done',?,'')",
-            (at.isoformat(),),
-        )
+        add_job(conn, "reply", at)
     conn.commit()
     conn.close()
 
@@ -326,8 +407,12 @@ def test_it_stays_fast_with_a_lot_of_history(tmp_path: Path) -> None:
     conn = sqlite3.connect(path)
     at = NOW - timedelta(days=300)
     conn.executemany(
-        "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('reply','done',?,'')",
-        [((at + timedelta(minutes=8 * i)).isoformat(),) for i in range(20000)],
+        "INSERT INTO jobs (kind, status, run_at, finished_at, reason, created_at)"
+        " VALUES ('reply','done',?,?,'',?)",
+        [
+            ((at + timedelta(minutes=8 * i)).isoformat(),) * 3
+            for i in range(20000)
+        ],
     )
     conn.commit()
     conn.close()
@@ -370,3 +455,244 @@ def test_the_checkup_stays_quiet_when_she_is_healthy() -> None:
         assert report.worst == doctor.OK, (
             f"种子 {seed} 的正常作息被体检判成了 {report.worst}：\n{report.render()}"
         )
+
+
+def test_a_database_it_cannot_read_is_not_reported_as_healthy(tmp_path: Path) -> None:
+    """**读不出来的库不能印出一份全绿的体检单。**
+
+    每一项检查都把空结果当成"这段时间很安静"，所以只要查询失败被吞掉，
+    "打不开这个库"和"库里确实没事发生"就完全同形——
+    体检报假平安比没有体检更糟，因为你会信它。
+
+    真实触发方式不少：doctor 跑在和她不同的用户下、库所在目录不可写
+    （WAL 要建 -shm）、别的进程正握着独占锁。这里用最直接的一种：
+    文件在，但根本不是个 SQLite 库。
+    """
+    path = tmp_path / "junk.db"
+    path.write_bytes("这不是一个 sqlite 文件".encode() * 50)
+
+    report = doctor.run(path, NOW, days=14)
+    assert report.worst == doctor.BAD, f"读不了却报了 {report.worst}：\n{report.render()}"
+    assert "读不了" in report.findings[0].line
+
+
+def test_a_backup_stamp_in_the_future_is_not_taken_as_fresh(tmp_path: Path) -> None:
+    """未来的备份时间戳不能把整份报告里最该响的那个 BAD 按住。
+
+    时钟跳变、从别的机器搬过来的 data/、手写的标记文件都会造出这个。
+    算出来是负的小时数，正好绕过"停了 48 小时"那个判断，永久报 ✓。
+    """
+    path = make_db(tmp_path / "future.db", [5, 20, 60])
+    backup.touch_mark(path, NOW + timedelta(days=30))
+
+    report = doctor.run(path, NOW, days=40)
+    assert report.worst == doctor.BAD
+    assert any("未来" in f.line for f in report.findings), report.render()
+
+
+def test_an_unreadable_backup_mark_does_not_crash_the_checkup(tmp_path: Path) -> None:
+    """标记文件读不出来（比如变成了目录）时，体检要照常出结果。"""
+    path = make_db(tmp_path / "weird.db", [5, 20, 60])
+    backup.mark_path(path).mkdir()
+
+    report = doctor.run(path, NOW, days=40)  # 不能抛
+    assert any("异地备份" in f.line for f in report.findings)
+
+
+def test_an_api_error_that_has_not_cleared_is_loud(tmp_path: Path) -> None:
+    """还没恢复的接口报错是"坏了"，不是"看看就行"。
+
+    成功一次就会把这条清掉，所以它还在，就意味着最后一次调用是失败的——
+    密钥过期、余额用光、模型名写错，这些她不会自己好。
+    原来一律 WARN，而 WARN 的退出码是 0：接口两小时前还在报 401，
+    cron 里那行体检一声不吭。
+    """
+    path = make_db(tmp_path / "err.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES ('last_api_error', ?)",
+        (f"{(NOW - timedelta(hours=2)).isoformat()}\t接口返回 401",),
+    )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    finding = next(f for f in report.findings if "接口出过错" in f.line)
+    assert finding.level == doctor.BAD, f"两小时前还在报错却只是 {finding.level}"
+
+
+def test_messages_he_sent_yesterday_that_are_still_unread_are_the_loudest_thing(
+    tmp_path: Path,
+) -> None:
+    """他说的话躺了一天没人回——**这是唯一一种真正意义上的"她坏了"。**
+
+    报告里原来根本没有这一项。于是最该被喊出来的那件事是沉默的：
+    她三天一句没回、接口两小时前还在报 401，整份报告的退出码仍然是 0。
+    她隔二十分钟才回是设计好的，正因为如此，从外面看"正常"和"坏了"
+    一模一样，只有这一项分得开。
+    """
+    path = make_db(tmp_path / "stuck.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+        " VALUES ('dm','user','那个你看了吗',?)",
+        ((NOW - timedelta(hours=30)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert any(f.level == doctor.BAD and "还没回" in f.line for f in report.findings), (
+        report.render()
+    )
+
+
+def test_proactive_jobs_that_sent_nothing_are_not_counted_as_speaking_up(
+    tmp_path: Path,
+) -> None:
+    """排了六次、一句没说，不能报成"她主动开口 6 次"。
+
+    `handle_proactive_job` 有七八条提前 return（在睡觉、有未读、正热聊、请假、
+    没照片、没到期的承诺、"没什么要说的"），这些照样被标成 done。
+    任务表记的是排期，消息表记的才是她真的说了话。
+    """
+    path = make_db(tmp_path / "silentjobs.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    for i in range(6):
+        add_job(conn, "proactive", NOW - timedelta(days=i + 1), "own_life")
+    conn.commit()
+    conn.close()
+
+    finding = next(f for f in doctor.run(path, NOW, days=14).findings if "主动开口" in f.line)
+    assert "0.0 次/天" in finding.line, f"把没发出去的也数上了：{finding.line}"
+
+
+def test_a_new_proactive_kind_from_the_persona_is_named_not_lumped_into_other(
+    tmp_path: Path,
+) -> None:
+    """人设里新加的主动种类要按名字显示。
+
+    CLAUDE.md 写着"新的主动消息方式改 yaml，代码不用动"，而种类名原来是
+    写死在代码里的一份清单。加一个 `gym_note` 之后，报告会变成
+    "ledger_check 14　其它 14"——而这一项的全部价值就在种类分布这一行上。
+    """
+    path = make_db(tmp_path / "kinds.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    for i in range(5):
+        add_job(conn, "proactive", NOW - timedelta(days=i + 1), "gym_note")
+    conn.commit()
+    conn.close()
+
+    finding = next(
+        f for f in doctor.run(path, NOW, days=14, kinds_known=frozenset({"gym_note"})).findings
+        if "主动开口" in f.line
+    )
+    assert "gym_note" in finding.detail, f"人设里的种类被压成了'其它'：{finding.detail}"
+
+
+def test_follow_ups_count_towards_the_checklist_warning(tmp_path: Path) -> None:
+    """`follow_up` 也要算进主动消息的口味里。
+
+    她说"我查完告诉你"排的就是这种，而且它**没有每天的上限**——
+    "她变成一份待办清单"最可能就从这条路来，原来整类被漏掉了。
+    """
+    path = make_db(tmp_path / "fu.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    for i in range(8):
+        add_job(conn, "follow_up", NOW - timedelta(days=i + 1), "ledger_check")
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=14)
+    assert any("追问你做没做" in f.line for f in report.findings), report.render()
+
+
+def test_background_jobs_bunching_up_is_not_reported(tmp_path: Path) -> None:
+    """日程生成、记忆整理挤在一起他根本看不见，不该报。
+
+    这些后台任务的打散窗口只有 30–300 秒，三四个落进同一个两分钟窗口是常事。
+    把它们算进去的结果是：把"打散正常工作"报成了故障。
+    """
+    path = make_db(tmp_path / "bg.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    at = NOW - timedelta(days=2)
+    for i in range(6):
+        add_job(conn, "memory_update" if i % 2 else "day_plan", at + timedelta(seconds=i * 12))
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert not [f for f in report.findings if "挤在两分钟内" in f.line], report.render()
+
+
+def test_a_fast_but_long_tailed_median_is_not_called_instant_replies(tmp_path: Path) -> None:
+    """又快又**散**不是故障，是最像人的一种分布。
+
+    只看中位数的话，"多数半分钟、偶尔十小时"会拿到整份报告里最严厉的措辞。
+    真的秒回是又快又齐。
+    """
+    gaps = [0.2, 0.4, 0.5, 0.6, 0.3, 0.5, 0.4, 0.7, 0.3, 0.6,
+            3.0, 6.2, 26.4, 44.0, 90.0, 150.0, 300.0, 616.0, 40.0, 12.0]
+    report = doctor.run(make_db(tmp_path / "tail.db", gaps), NOW, days=60)
+    assert rhythm_finding(report).level != doctor.BAD, rhythm_finding(report).line
+
+
+def test_speaking_up_after_her_own_reply_still_counts_as_speaking_up(tmp_path: Path) -> None:
+    """她回完他之后、隔几小时又主动找他——那一次不能被漏掉。
+
+    只看"上一条是不是也是她说的"来合并气泡的话，这种主动开口
+    上一条恰好也是她说的，于是整类被吞掉：实测十四天里九次主动
+    报成了"0.0 次/天"。区分"同一次的下一个气泡"和"隔了几小时又开口"
+    靠的是时间间隔，不是说话人。
+    """
+    path = tmp_path / "speakup.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = NOW - timedelta(days=10)
+    for _ in range(10):
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+            " VALUES ('dm','user','x',?,?)",
+            (at.isoformat(), at.isoformat()),
+        )
+        at += timedelta(minutes=20)
+        for _ in range(2):  # 她回两个气泡
+            conn.execute(
+                "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+                " VALUES ('dm','bot','y',?)",
+                (at.isoformat(),),
+            )
+            at += timedelta(seconds=15)
+        at += timedelta(hours=5)
+        conn.execute(  # 隔五小时她自己又开口了
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+            " VALUES ('dm','bot','刚下课',?)",
+            (at.isoformat(),),
+        )
+        at += timedelta(hours=4)
+    conn.commit()
+    conn.close()
+
+    finding = next(f for f in doctor.run(path, NOW, days=10).findings if "主动开口" in f.line)
+    assert "1.0 次/天" in finding.line, f"十次主动一次都没数上：{finding.line}"
+
+
+def test_pausing_her_does_not_make_the_checkup_scream(tmp_path: Path) -> None:
+    """`!np pause` 期间未读堆着是他自己要求的，不是故障。
+
+    天天喊 BAD 的警报等于没有警报。
+    """
+    path = make_db(tmp_path / "paused.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO kv (key, value) VALUES ('paused', '1')")
+    conn.execute(
+        "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+        " VALUES ('dm','user','在吗',?)",
+        ((NOW - timedelta(days=2)).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert not [f for f in report.findings if "还没回" in f.line], report.render()
+    assert any("pause" in f.line for f in report.findings)

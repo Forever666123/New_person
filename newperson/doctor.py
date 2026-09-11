@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from . import backup
+
 OK, WARN, BAD = "✓", "!", "✗"
 
 
@@ -57,10 +59,32 @@ class Report:
 
 
 def _rows(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-    try:
-        return conn.execute(sql, args).fetchall()
-    except sqlite3.DatabaseError:
-        return []
+    """**故意不吞异常。**
+
+    原来这里 `except sqlite3.DatabaseError: return []`，而每一项检查都把空结果
+    当成"这段时间很安静"。于是"打不开这个库"和"库里确实没事发生"完全同形：
+    doctor 跑在别的用户下、库被 `BEGIN EXCLUSIVE` 握着、目录不可写——
+    任何一种都会印出一份全绿的体检单，退出码 0。
+    体检报假平安比没有体检更糟，所以让它炸出来，由 run() 统一说明白。
+    """
+    return conn.execute(sql, args).fetchall()
+
+
+def _timeline(conn: sqlite3.Connection, since: datetime) -> list[tuple[str, datetime]]:
+    """窗口内的消息，``(谁说的, 什么时候)``，**按时间排**。
+
+    不按 id 排：补抓是一个频道一个频道整段写库的，插入顺序不等于说话顺序。
+    也不在 SQL 里按 created_at 排：那是带偏移量的 ISO 字符串，
+    她那边一年换两次夏令时，换季那天字符串序和时间序对不上。
+    """
+    rows = _rows(
+        conn,
+        "SELECT author_kind, created_at FROM messages"
+        " WHERE created_at >= ? AND deleted = 0 ORDER BY id",
+        (since.isoformat(),),
+    )
+    out = [(r["author_kind"], _parse(r["created_at"])) for r in rows]
+    return sorted(((k, t) for k, t in out if t is not None), key=lambda kt: kt[1])
 
 
 def _parse(raw: str | None) -> datetime | None:
@@ -83,6 +107,12 @@ SAFE_REASONS = {
     "opener", "own_life", "callback", "ledger_check", "travel_note", "window_photo",
     "follow_up", "sign_off", "day_plan", "memory_update", "reply", "proactive",
 }
+"""内置的种类名。**人设里新加的种类由 run() 传进来并进这个集合。**
+
+写死一份清单和 CLAUDE.md 那条"新的主动消息方式改 yaml，代码不用动"是冲突的：
+加一个 `gym_note` 之后报告会写成"ledger_check 14　其它 14"，
+而这一项的全部价值就在种类分布这一行上。
+"""
 MAX_DETAIL = 60
 
 
@@ -103,8 +133,9 @@ def _safe_detail(raw: str) -> str:
     return text
 
 
-def _safe_reason(raw: str | None) -> str:
-    return (raw or "?") if (raw or "?") in SAFE_REASONS else "其它"
+def _safe_reason(raw: str | None, known: frozenset[str] = frozenset()) -> str:
+    name = raw or "?"
+    return name if (name in SAFE_REASONS or name in known) else "其它"
 
 
 def _span(minutes: float) -> str:
@@ -125,19 +156,10 @@ def reply_gaps(conn: sqlite3.Connection, since: datetime) -> list[float]:
     一来一回中间他连发三条的话，只算最早那条到她回复的间隔——
     那才是"他等了多久"。
     """
-    rows = _rows(
-        conn,
-        "SELECT author_kind, created_at FROM messages"
-        " WHERE created_at >= ? AND deleted = 0 ORDER BY id",
-        (since.isoformat(),),
-    )
     gaps: list[float] = []
     waiting: datetime | None = None
-    for row in rows:
-        at = _parse(row["created_at"])
-        if at is None:
-            continue
-        if row["author_kind"] == "user":
+    for kind, at in _timeline(conn, since):
+        if kind == "user":
             if waiting is None:
                 waiting = at
         elif waiting is not None:
@@ -153,7 +175,10 @@ def check_rhythm(report: Report, gaps: list[float]) -> None:
     程序的间隔会挤成一团。用四分位距比中位数（一个抗离群值的离散度指标），
     太小就说明她变规律了。
     """
-    if len(gaps) < 8:
+    # 门槛从 8 提到 20：八个样本里，真实的长尾（0.4 分钟到 10 小时）
+    # 也能让中位数落到 2 分钟以下，于是最严厉的那句话被判给一条完全健康的曲线。
+    # 两百个种子里 n=8 误判两次，n=20 一次都没有。
+    if len(gaps) < 20:
         report.add(OK, f"回复间隔样本还不够（{len(gaps)} 次），再聊几天才看得出规律")
         return
 
@@ -167,7 +192,10 @@ def check_rhythm(report: Report, gaps: list[float]) -> None:
         f"最快 {_span(ordered[0])}，最慢 {_span(ordered[-1])}"
     )
 
-    if median < 2:
+    # "秒回"要**同时**看离散度。只看中位数的话，长尾数据（中位两分钟、
+    # 最慢十小时）会被判成秒回——而那恰恰是最像人的一种分布。
+    # 真的秒回是"又快又齐"，快而散不是故障。
+    if median < 2 and spread < 0.7:
         report.add(
             BAD,
             "她几乎是秒回的",
@@ -186,41 +214,47 @@ def check_rhythm(report: Report, gaps: list[float]) -> None:
         report.add(OK, "回复间隔够散", shape)
 
 
+TURN_GAP = timedelta(minutes=30)
+"""他连着打的几行算一轮；隔了这么久再开口，就是另一次搭话了。"""
+
+
 def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
     """她有多少次看见了但没接话。
 
     一次都不沉默，说明"有问必答"——那是助手，不是人。
     但沉默太多也不对，多半是模型在判"这条不用回"。
     """
-    rows = _rows(
-        conn,
-        "SELECT COUNT(*) AS n FROM messages WHERE author_kind = 'user'"
-        " AND created_at >= ? AND read_at IS NOT NULL AND deleted = 0",
-        (since.isoformat(),),
-    )
-    read = rows[0]["n"] if rows else 0
-    # **不能数气泡。** 她一次回复会分成两三个气泡，每个气泡一行；
-    # 主动消息和开场白也在里面。拿气泡数去比消息数，40% 的沉默会被算成 0%，
-    # 于是这一项永远在报"她几乎有问必答"——一个永远响的警报等于没有警报。
-    # 数的是"有多少条他的消息被回应了"：他发完之后、下一条他发之前，她说过话。
-    rows = _rows(
-        conn,
-        "SELECT author_kind, created_at FROM messages"
-        " WHERE created_at >= ? AND deleted = 0 ORDER BY id",
-        (since.isoformat(),),
-    )
+    # **两边都要数"轮次"，不能一边数轮次一边数条数。**
+    #
+    # 气泡那一侧曾经数错过：她一次回复分两三个气泡，拿气泡数去比消息数，
+    # 四成的沉默会被算成 0%。但他那一侧同样不能数条数——他连发三行是一轮，
+    # 她回一次就是接住了。混着数的话，这个比例实际测的是"他平均一轮打几行字"，
+    # 而这个项目的设计（把未读并成一次回复）保证了它大于 1。
+    # 实测：他每轮三行、她**每轮都回**，报出来是"没接话的比例 67%"；
+    # 她三天一句没回，报出来是"沉默 46%"，还是 ✓。两个方向都错。
+    turns = 0
     answered = 0
-    pending_user = False
-    for row in rows:
-        if row["author_kind"] == "user":
-            pending_user = True
-        elif pending_user:
+    pending = False
+    last_his: datetime | None = None
+    for kind, at in _timeline(conn, since):
+        if kind == "user":
+            # 隔得远就是**另一次**搭话，不是同一轮的下一行。
+            # 不分开的话，她一直不回的那一整段会被并成一轮，
+            # "三天一句没回"于是只算一次没接话——最该响的时候最安静。
+            fresh = not pending or (last_his is not None and at - last_his > TURN_GAP)
+            if fresh:
+                turns += 1
+            pending = True
+            last_his = at
+        elif pending:
             answered += 1
-            pending_user = False
-    hers = answered
-    if read < 10:
+            pending = False
+    if pending:
+        # 最后那一轮她可能还没到点回。只有这一轮是悬而未决的，不算进去。
+        turns -= 1
+    if turns < 10:
         return
-    ratio = max(0.0, 1 - hers / read)
+    ratio = max(0.0, 1 - answered / turns)
     if ratio > 0.5:
         report.add(WARN, f"她看了却没接话的比例 {ratio:.0%}，偏高", "多半是模型老在判'这条不用回'")
     elif ratio < 0.02:
@@ -229,27 +263,57 @@ def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> 
         report.add(OK, f"沉默比例 {ratio:.0%}")
 
 
-def check_proactive(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
+def check_proactive(
+    report: Report,
+    conn: sqlite3.Connection,
+    since: datetime,
+    max_per_day: float = 2.0,
+    kinds_known: frozenset[str] = frozenset(),
+) -> None:
     """她主动开口的频率和花样。
 
     全是回访（"那件事做了吗"）的话，她就成了一份待办清单。
+
+    **频率从消息表数，不从任务表数。** 任务表记的是排期，而
+    ``handle_proactive_job`` 有七八条提前 return（在睡觉、有未读、正热聊、
+    请假、没照片、没到期的承诺、"没什么要说的"），这些照样被标成 done。
+    实测六个什么都没发的任务，任务表里是 6 条 done——报告会说她开口了 6 次。
+    真正的"她主动开口"是消息表里她**说在他前面**的那些轮。
     """
+    # 她**说在他前面**就是主动开口。连着几个气泡算一次，
+    # 靠时间间隔区分"同一次的下一个气泡"和"隔了几小时又开口"——
+    # 只看"上一条是不是也是她说的"是不够的：她回完他之后过三小时主动找他，
+    # 上一条同样是她说的，那一次会被整个漏掉（实测九次主动报成 0.0 次/天）。
+    opened = 0
+    pending = False
+    last_hers: datetime | None = None
+    for kind, at in _timeline(conn, since):
+        if kind == "user":
+            pending = True
+            continue
+        if not pending and (last_hers is None or at - last_hers > TURN_GAP):
+            opened += 1
+        pending = False
+        last_hers = at
+    per_day = opened / max(report.days, 1)
+
+    # 口味只看任务表。follow_up 也算——她说"我查完告诉你"排的就是这种，
+    # 而且它**没有每天的上限**，"她变成一份待办清单"最可能就从这条路来。
     rows = _rows(
         conn,
-        "SELECT reason, run_at FROM jobs WHERE kind = 'proactive'"
-        " AND status = 'done' AND run_at >= ? ORDER BY run_at",
+        "SELECT reason FROM jobs WHERE kind IN ('proactive', 'follow_up')"
+        " AND status = 'done' AND run_at >= ?",
         (since.isoformat(),),
     )
-    if not rows:
-        report.add(OK, "这段时间她没主动开过口")
-        return
-
     kinds: dict[str, int] = {}
     for row in rows:
-        name = _safe_reason(row["reason"])
+        name = _safe_reason(row["reason"], kinds_known)
         kinds[name] = kinds.get(name, 0) + 1
     mix = "　".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))
-    per_day = len(rows) / max(report.days, 1)
+
+    if not opened and not rows:
+        report.add(OK, "这段时间她没主动开过口")
+        return
 
     checks = kinds.get("ledger_check", 0)
     if len(rows) >= 4 and checks / len(rows) > 0.6:
@@ -258,41 +322,59 @@ def check_proactive(report: Report, conn: sqlite3.Connection, since: datetime) -
             f"她主动说的话里 {checks / len(rows):.0%} 是在追问你做没做",
             f"{mix}\n再高就像待办清单了，不像朋友。",
         )
-    elif per_day > 2:
-        report.add(WARN, f"主动开口 {per_day:.1f} 次/天，偏黏", mix)
+    elif per_day >= max_per_day - 0.05:
+        # 上限是人设里的 proactive.max_per_day，代码里写死一个数的话
+        # 这一项永远够不着（上限 2，判据是 > 2）：黏了四倍也还是 ✓。
+        # 天天顶着上限本身就是信号——真人不会每天都正好想起你两次。
+        report.add(
+            WARN,
+            f"主动开口 {per_day:.1f} 次/天，天天顶着上限（{max_per_day:g}）",
+            mix,
+        )
     else:
         report.add(OK, f"主动开口 {per_day:.1f} 次/天", mix)
 
 
 def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
-    """有没有一堆任务挤在同一分钟执行。
+    """有没有一堆**对着他的**事挤在同一分钟发生。
 
     那是"重启之后积压一起涌出来"的样子：她会在进程起来三十秒后
     回一条你三小时前发的消息。这是最容易被一眼看穿的一幕。
+
+    两个地方原来是错的：
+
+    - 看的是 ``run_at``，那是**排期时刻**，执行时从不回写。积压涌出来的时候，
+      库里那几条的 run_at 恰好是分散的（06:00、06:15、06:30……），
+      而它们全在 09:05 这一分钟执行——该报的一声不吭。现在看 ``finished_at``。
+    - 不分种类。日程生成、记忆整理这些后台任务挤在一起他根本看不见，
+      而它们的打散窗口只有 30–300 秒，三四个落进同一个两分钟窗口是常事——
+      于是把"打散正常工作"报成了故障。现在只数他看得见的那几种。
     """
     rows = _rows(
         conn,
-        "SELECT run_at FROM jobs WHERE status = 'done' AND run_at >= ? ORDER BY run_at",
+        "SELECT finished_at FROM jobs"
+        " WHERE kind IN ('reply', 'proactive', 'follow_up', 'sign_off')"
+        " AND status = 'done' AND finished_at IS NOT NULL AND finished_at >= ?",
         (since.isoformat(),),
     )
-    # **在 Python 里排序，不靠 SQL 的字符串序。** run_at 存的是带偏移量的 ISO 串，
-    # 字典序在夏令时切换那一小时会把顺序弄反（-04:00 和 -05:00 的串比大小没有意义），
-    # 于是秋天回拨的那晚会凭空报出一堆"任务挤在两分钟内"。
-    stamps = sorted(t for t in (_parse(r["run_at"]) for r in rows) if t is not None)
-    # 滑动窗口，线性。原来是 O(n²) 且每轮复制一次列表，
-    # --days 放大之后两万条要跑七十秒。
+    # **在 Python 里排序，不靠 SQL 的字符串序。** 存的是带偏移量的 ISO 串，
+    # 字典序在夏令时切换那一小时会把顺序弄反，于是秋天回拨的那晚会凭空报一批扎堆。
+    stamps = sorted(t for t in (_parse(r["finished_at"]) for r in rows) if t is not None)
+    # 滑动窗口，线性。原来是 O(n²) 且每轮复制一次列表，两万条要跑七十秒。
     worst = 0
     left = 0
     for right, at in enumerate(stamps):
         while (at - stamps[left]).total_seconds() > 120:
             left += 1
         worst = max(worst, right - left + 1)
-    if worst >= 4:
+    if worst >= 3:
         report.add(
             WARN,
-            f"有 {worst} 个任务挤在两分钟内执行",
+            f"有 {worst} 件对着他的事挤在两分钟内发生",
             "像是重启之后积压一起涌出来的。正常情况下它们该被打散。",
         )
+    elif stamps:
+        report.add(OK, f"{len(stamps)} 件事分布正常（同一两分钟里最多 {worst} 件）")
 
 
 def check_health(
@@ -316,19 +398,68 @@ def check_health(
     if rows:
         stamp, _, detail = str(rows[0]["value"]).partition("\t")
         when = _parse(stamp)
-        ago = f"{(now - when).total_seconds() / 3600:.0f} 小时前" if when else "时间不明"
-        report.add(WARN, f"接口出过错（{ago}）", _safe_detail(detail or stamp))
+        hours = (now - when).total_seconds() / 3600 if when else None
+        ago = f"{hours:.0f} 小时前" if hours is not None else "时间不明"
+        # **还没恢复的接口报错是 BAD，不是 WARN。** 成功一次就会把这条清掉，
+        # 所以它还在，就意味着最后一次调用是失败的——密钥过期、余额用光、
+        # 模型名写错，这些她不会自己好。半年前那次抖动才是"看看就行"。
+        level = BAD if hours is None or hours < 6 else WARN
+        report.add(level, f"接口出过错（{ago}）", _safe_detail(detail or stamp))
 
-    mark = db_path.parent / ".last_backup_at"
-    when = _parse(mark.read_text(encoding="utf-8").strip()) if mark.exists() else None
+    # 复用 backup 模块：它已经处理过读不出来（OSError）和内容不是时间（ValueError），
+    # 而这里原来是 `mark.read_text()` 裸调——标记文件变成目录就直接把体检打崩。
+    when = backup.last_backup_at(db_path)
     if when is None:
         report.add(BAD, "没有异地备份", "她的记忆只存在这一台机器上。看 DEPLOY.md。")
     else:
         hours = (now - when).total_seconds() / 3600
-        if hours > 48:
+        if hours < -1:
+            # 未来的标记（时钟跳变、从别的机器搬过来的 data/、手写的文件）
+            # 原来会算出负的小时数，一路走到 `hours > 48` 那个分支的反面，
+            # 把整份报告里最该响的那个 BAD 永久按住。
+            report.add(
+                BAD,
+                f"备份的时间戳在未来（{-hours / 24:.0f} 天后）",
+                "这台机器的时钟不对，或者这份 data/ 是从别处搬来的。"
+                "在查清楚之前，别把这个当成备份正常。",
+            )
+        elif hours > 48:
             report.add(BAD, f"备份停了 {hours / 24:.0f} 天", "去看 cron 和 /var/log/chloe-backup.log")
         else:
-            report.add(OK, f"上次备份 {hours:.0f} 小时前")
+            report.add(OK, f"上次备份 {max(hours, 0):.0f} 小时前")
+
+
+def check_stuck(report: Report, conn: sqlite3.Connection, now: datetime) -> None:
+    """他说的话有没有躺在那儿没人回。**这是唯一一种真正意义上的"她坏了"。**
+
+    报告里原来根本没有这一项，于是最该被喊出来的那件事是沉默的：
+    她三天一句没回、接口两小时前还在报 401，整份报告的退出码是 0。
+    而她隔二十分钟才回是设计好的——正因为如此，"正常"和"坏了"
+    从外面看一模一样，只有这一项分得开。
+    """
+    if _rows(conn, "SELECT 1 FROM kv WHERE key = 'paused'"):
+        # `!np pause` 期间她本来就不回，未读堆着是**他自己要求的**。
+        # 不排掉的话这一项会天天喊 BAD，而一个天天喊的警报等于没有警报。
+        report.add(OK, "她被 `!np pause` 停着，这期间不回消息")
+        return
+    rows = _rows(
+        conn,
+        "SELECT created_at FROM messages WHERE author_kind = 'user'"
+        " AND read_at IS NULL AND deleted = 0 ORDER BY id",
+        (),
+    )
+    stamps = sorted(t for t in (_parse(r["created_at"]) for r in rows) if t is not None)
+    if not stamps:
+        return
+    hours = (now - stamps[0]).total_seconds() / 3600
+    if hours > 24:
+        report.add(
+            BAD,
+            f"他 {_span(hours * 60)} 前说的话还没回（一共 {len(stamps)} 条未读）",
+            "她睡得再久也不会超过一天。查 journalctl，看是不是卡在某个任务上。",
+        )
+    elif hours > 12:
+        report.add(WARN, f"有 {len(stamps)} 条未读，最早那条是 {_span(hours * 60)} 前的")
 
 
 def check_memory(report: Report, conn: sqlite3.Connection) -> None:
@@ -357,23 +488,53 @@ def check_memory(report: Report, conn: sqlite3.Connection) -> None:
         )
 
 
-def run(db_path: Path, now: datetime, days: int = 14) -> Report:
-    """跑一遍体检。**全程只读，不改任何东西。**"""
+def run(
+    db_path: Path,
+    now: datetime,
+    days: int = 14,
+    max_per_day: float = 2.0,
+    kinds_known: frozenset[str] = frozenset(),
+) -> Report:
+    """跑一遍体检。**全程只读，不改任何东西。**
+
+    ``max_per_day`` 和 ``kinds_known`` 从人设里来：判据和种类名都不该写死在代码里。
+    """
     report = Report(days=days)
     if not db_path.exists():
         report.add(BAD, f"找不到数据库 {db_path}")
         return report
 
     since = now - timedelta(days=days)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
     try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        # 先探一下。不探的话，"打不开这个库"的报错会等到第一条检查才冒出来，
+        # 而更早以前它被 _rows 整个吞掉——印出一份全绿的体检单，退出码 0。
+        conn.execute("SELECT 1 FROM messages LIMIT 1").fetchall()
+    except sqlite3.DatabaseError as exc:
+        report.add(
+            BAD,
+            f"读不了 {db_path}",
+            f"{_safe_detail(str(exc))}\n"
+            "**这份报告什么都没检查。** 常见原因：doctor 跑在和她不同的用户下、"
+            "库所在的目录不可写（WAL 要建 -shm）、或者别的进程正握着独占锁。",
+        )
+        return report
+
+    try:
+        check_stuck(report, conn, now)
         check_rhythm(report, reply_gaps(conn, since))
         check_silence(report, conn, since)
-        check_proactive(report, conn, since)
+        check_proactive(report, conn, since, max_per_day, kinds_known)
         check_bursts(report, conn, since)
         check_memory(report, conn)
         check_health(report, conn, db_path, now, since)
+    except sqlite3.DatabaseError as exc:
+        report.add(
+            BAD,
+            "查到一半读不下去了，**下面这份报告不完整**",
+            _safe_detail(str(exc)),
+        )
     finally:
         conn.close()
     return report

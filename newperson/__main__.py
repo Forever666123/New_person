@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import os
 import random
@@ -580,12 +579,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     settings = load_settings()
     persona = None
-    with contextlib.suppress(Exception):
+    load_error = ""
+    try:
         persona = load_persona(settings.persona_path)
+    except Exception as exc:  # noqa: BLE001 - 人设读不了也要能体检
+        load_error = str(exc)
     tz = persona.tz if persona else UTC
     db = Path(args.db) if args.db else settings.db_path
 
-    report = doctor.run(db, datetime.now(tz), days=args.days)
+    report = doctor.run(
+        db,
+        datetime.now(tz),
+        days=args.days,
+        max_per_day=persona.proactive.max_per_day if persona else 2.0,
+        kinds_known=frozenset(k.name for k in persona.proactive.kinds) if persona else frozenset(),
+    )
+    if persona is None:
+        # **不能不吭声。** 读不到人设就退回 UTC，而窗口的两端会整体挪一个时区偏移
+        # （她在波士顿，就是四五个小时）。`--days 14` 无所谓，`--days 1` 是六分之一，
+        # 而报告长得和正常时逐字一样——你会拿它当真。
+        report.findings.insert(
+            0,
+            doctor.Finding(
+                doctor.WARN,
+                "读不到人设，时区按 UTC 算，窗口的两端都偏了",
+                f"{doctor._safe_detail(load_error)}\n判据也退回了内置默认值。",
+            ),
+        )
     print(report.render())
     return 0 if report.worst != doctor.BAD else 1
 

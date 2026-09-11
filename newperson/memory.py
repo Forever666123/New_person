@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     covers_upto_message_id INTEGER NOT NULL DEFAULT 0,
     original_run_at TEXT,
     reason TEXT NOT NULL DEFAULT '',
+    finished_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, run_at);
@@ -189,7 +190,12 @@ class Memory:
         在老库上永远不会出现——而这个项目的老库就是她的全部记忆，
         不可能推倒重来。每加一列就在这儿写一行，跑过就跳过。
         """
-        wanted = {"ledger": {"asked_at": "TEXT", "asked_count": "INTEGER NOT NULL DEFAULT 0"}}
+        wanted = {
+            "ledger": {"asked_at": "TEXT", "asked_count": "INTEGER NOT NULL DEFAULT 0"},
+            # 任务**真的执行完**是几点。`run_at` 记的是排期时刻，
+            # 崩溃恢复之后那两个数差着几小时，而体检要看的恰恰是"一堆事挤在同一分钟发生"。
+            "jobs": {"finished_at": "TEXT"},
+        }
         for table, columns in wanted.items():
             cur = await self._db.execute(f"PRAGMA table_info({table})")
             have = {row[1] for row in await cur.fetchall()}
@@ -918,13 +924,25 @@ class Memory:
         await self.db.commit()
 
     async def set_job_status(
-        self, job_id: int, status: JobStatus, reason: str | None = None
+        self, job_id: int, status: JobStatus, reason: str | None = None, at: datetime | None = None
     ) -> None:
+        """改任务状态。**终态要记下真的是几点结束的。**
+
+        `run_at` 是排期时刻，崩溃恢复之后它和实际执行时刻差着几小时，
+        而体检要看的恰恰是"一堆事挤在同一分钟发生"——那是最容易露馅的一幕。
+        """
+        done = status in ("done", "failed", "cancelled")
+        stamp = (at or datetime.now(UTC)).isoformat() if done else None
         if reason is None:
-            await self.db.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+            await self.db.execute(
+                "UPDATE jobs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
+                (status, stamp, job_id),
+            )
         else:
             await self.db.execute(
-                "UPDATE jobs SET status = ?, reason = ? WHERE id = ?", (status, reason, job_id)
+                "UPDATE jobs SET status = ?, reason = ?,"
+                " finished_at = COALESCE(?, finished_at) WHERE id = ?",
+                (status, reason, stamp, job_id),
             )
         await self.db.commit()
 

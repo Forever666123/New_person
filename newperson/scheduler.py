@@ -108,7 +108,7 @@ class Scheduler:
         self._wake.set()
 
     async def cancel(self, job_id: int, reason: str = "") -> None:
-        await self.memory.set_job_status(job_id, "cancelled", reason or None)
+        await self.memory.set_job_status(job_id, "cancelled", reason or None, at=self.clock.now())
         self._wake.set()
 
     # -- 启动与执行 ---------------------------------------------------------
@@ -166,7 +166,7 @@ class Scheduler:
         for job in await self.memory.pending_jobs():
             limit = STALE_AFTER.get(job.kind)
             if limit and now - (job.original_run_at or job.run_at) > limit:
-                await self.memory.set_job_status(job.id or 0, "cancelled", "停机太久，作废")
+                await self.memory.set_job_status(job.id or 0, "cancelled", "停机太久，作废", at=now)
                 # dedupe_key 是全表唯一的，作废的那一行照样占着这个键，
                 # 所以同一个键**永远排不进来第二次**。对那种"一辈子一次"的任务
                 # （开场就是），作废等于永久销毁：kv 里的标记还在，
@@ -211,7 +211,7 @@ class Scheduler:
             handler = self._handlers.get(claimed.kind)
             if handler is None:
                 log.warning("[job] %s 没有注册 handler，跳过", claimed.kind)
-                await self.memory.set_job_status(job_id, "cancelled", "没有 handler")
+                await self.memory.set_job_status(job_id, "cancelled", "没有 handler", at=self.clock.now())
                 return False
 
             try:
@@ -228,7 +228,7 @@ class Scheduler:
             current = await self.memory.get_job(job_id)
             if current is not None and current.status != "running":
                 return False
-            await self.memory.set_job_status(job_id, "done")
+            await self.memory.set_job_status(job_id, "done", at=self.clock.now())
             return True
 
     async def _handle_failure(self, job: Job, exc: Exception) -> None:
@@ -236,7 +236,7 @@ class Scheduler:
         job_id = job.id or 0
         if job.attempts >= MAX_ATTEMPTS:
             log.error("[job] %s#%s 试了 %d 次都失败：%s", job.kind, job_id, job.attempts, exc)
-            await self.memory.set_job_status(job_id, "failed", str(exc)[:200])
+            await self.memory.set_job_status(job_id, "failed", str(exc)[:200], at=self.clock.now())
             return
 
         backoff = RETRY_BACKOFF_SECONDS[min(job.attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
