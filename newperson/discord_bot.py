@@ -104,6 +104,8 @@ class App:
         self._default_channel: Any = None
         self._channels: dict[int, Any] = {}
         self._started = False
+        self._catching_up = False
+        """补抓正在跑。重连风暴时两个 on_ready 会重叠。"""
         self._tasks: set[asyncio.Task] = set()
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
 
@@ -251,7 +253,7 @@ class App:
 
     # -- 收消息 -------------------------------------------------------------
 
-    async def catch_up(self, limit: int = 50) -> int:
+    async def catch_up(self, page: int = 100, max_pages: int = 10) -> int:
         """把停机期间漏掉的消息补回来。
 
         **Discord 不补发新会话之前的事件。** 进程每重启一次就是一个新会话，
@@ -259,59 +261,118 @@ class App:
         原来是不入库、不进未读、她永远不会回——而且他不会收到任何提示。
         一次部署要好几分钟，这个窗口一点都不小。
 
-        两条重要的细节：
+        几条关键细节：
 
-        - **用消息本身的时间，不用现在的时间。** 正常收消息那条路存的是
-          ``clock.now()``，实时收的时候两者差不多；补抓时差的是几小时，
-          存成"刚刚"的话她会按"刚收到"去算回复时机，于是三小时前的话
-          被当成刚说的，秒回过去。
+        - **按"他会在哪说话"去找，不是"她主动消息发去哪"。**
+          ``resolve_channel()`` 不带参数返回的是主动消息的目的地——配了
+          ``PROACTIVE_CHANNEL_ID`` 就是那个公开频道。拿它去补抓的话，
+          他在私聊里说的话一条都找不回来，而游标还会被公开频道的消息推过去，
+          于是那些私聊消息**永久**跳过。所以这里两个入口都翻。
+        - **翻页翻到底。** 只翻一页的话，超出的部分不但这次补不到，
+          游标推进之后就再也补不到了——而分页是从旧往新走的，
+          被丢掉的恰恰是他**最后说的**那几条。
+        - **用消息本身的时间。** 正常收消息存的是 ``clock.now()``，
+          实时收时两者差不多；补抓时差好几个小时，存成"刚刚"的话
+          她会按"刚收到"算回复时机，三小时前的话被秒回过去。
         - **库是空的就什么都不做。** 不然第一次上线会把整段历史拉进来，
           而那正是"她不该知道的事"。
         """
         newest = await self.memory.newest_discord_message_id(CONVERSATION_ID)
         if newest is None:
             return 0
+        if self._catching_up:
+            return 0  # 重连风暴时两个 on_ready 会重叠，别让它们互相数重复
 
+        self._catching_up = True
         try:
-            channel = await self.resolve_channel()
-        except Exception:  # noqa: BLE001 - 拿不到频道不该让启动失败
-            log.warning("[inbox] 补抓时拿不到频道，跳过")
-            return 0
+            return await self._catch_up_channels(newest, page, max_pages)
+        finally:
+            self._catching_up = False
 
-        try:
-            missed = [
-                m
-                async for m in channel.history(
-                    limit=limit, after=discord.Object(id=newest), oldest_first=True
+    async def _inbound_channels(self) -> list[Any]:
+        """他可能说话的所有地方。私聊永远算一个。"""
+        found: list[Any] = []
+        seen: set[int] = set()
+        targets = [None]
+        if self.settings.proactive_channel_id:
+            targets.append(self.settings.proactive_channel_id)
+        for target in targets:
+            try:
+                channel = (
+                    await self.resolve_channel(target)
+                    if target is not None
+                    else await self._owner_dm()
                 )
-            ]
-        except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
-            log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
-            return 0
-
-        recovered = 0
-        for message in missed:
-            if not self._should_handle(message):
+            except Exception:  # noqa: BLE001 - 拿不到一个不该拖垮另一个
+                log.warning("[inbox] 补抓时拿不到频道 %s，跳过", target)
                 continue
-            if owner_cmds.is_command(message.content):
-                continue  # !np 是给程序看的，补抓时更不该执行
-            stored = await self.memory.add_user_message(
-                IncomingMessage(
-                    conversation_id=CONVERSATION_ID,
-                    discord_message_id=message.id,
-                    author_id=message.author.id,
-                    author_name=message.author.display_name,
-                    content=message.content,
-                    attachments=await self._download_images(message),
-                    created_at=message.created_at.astimezone(self.persona.tz),
+            # 按频道 id 去重，不按对象身份：私聊和 PROACTIVE_CHANNEL_ID
+            # 指同一个地方时，两条路径未必拿到同一个对象，重了就会数两遍。
+            key = getattr(channel, "id", None)
+            key = key if isinstance(key, int) else id(channel)
+            if channel is not None and key not in seen:
+                seen.add(key)
+                found.append(channel)
+        return found
+
+    async def _owner_dm(self) -> Any:
+        """他的私聊。**不走 resolve_channel()**，那个无参分支返回的是主动消息的去处。"""
+        if self.client is None:
+            raise RuntimeError("Discord 还没连上")
+        user = self.client.get_user(self.settings.owner_user_id) or await self.client.fetch_user(
+            self.settings.owner_user_id
+        )
+        return user.dm_channel or await user.create_dm()
+
+    async def _catch_up_channels(self, newest: int, page: int, max_pages: int) -> int:
+        recovered = 0
+        last_channel_id: int | None = None
+        for channel in await self._inbound_channels():
+            cursor = newest
+            for _ in range(max_pages):
+                try:
+                    batch = [
+                        m
+                        async for m in channel.history(
+                            limit=page, after=discord.Object(id=cursor), oldest_first=True
+                        )
+                    ]
+                except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
+                    log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
+                    break
+                if not batch:
+                    break
+                for message in batch:
+                    cursor = max(cursor, message.id)
+                    if not self._should_handle(message):
+                        continue
+                    if owner_cmds.is_command(message.content):
+                        continue  # !np 是给程序看的，补抓时更不该执行
+                    stored = await self.memory.add_user_message(
+                        IncomingMessage(
+                            conversation_id=CONVERSATION_ID,
+                            discord_message_id=message.id,
+                            author_id=message.author.id,
+                            author_name=message.author.display_name,
+                            content=message.content,
+                            attachments=await self._download_images(message),
+                            created_at=message.created_at.astimezone(self.persona.tz),
+                        )
+                    )
+                    if stored:
+                        recovered += 1
+                        last_channel_id = getattr(message.channel, "id", None)
+                if len(batch) < page:
+                    break
+            else:
+                log.error(
+                    "[inbox] 补抓翻了 %d 页还没到底，剩下的这次补不了（下次重连继续）", max_pages
                 )
-            )
-            if stored:
-                recovered += 1
 
         if recovered:
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
-            await self._schedule_reply(self.clock.now())
+            # 回到他说话的那个地方，不是默认频道
+            await self._schedule_reply(self.clock.now(), channel_id=last_channel_id)
         return recovered
 
     def _should_handle(self, message: discord.Message) -> bool:
@@ -388,12 +449,29 @@ class App:
             self.persona.timing.warm_seconds,
         )
 
+        # 消息本身已经放了很久（补抓、长时间停机）的话，这段对话现在就不热了。
+        # heat 问的是"这批消息到来时对话有多热"，那是对的；但她三小时后才看到，
+        # 不该再用"手机就在手上"的速度回——那正好跟进程重启对上，很显眼。
+        staleness = (now - unread[-1].created_at).total_seconds()
+        if staleness > self.persona.timing.warm_seconds:
+            heat = "cold"
+        elif staleness > self.persona.timing.hot_seconds and heat == "hot":
+            heat = "warm"
+
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
             # 他还在连着发，就等他说完再一起回，但不会无限等下去
             job = pending[0]
             new_at = self.attention.merge_pending(job.run_at, now, heat, self.rng)
-            await self.scheduler.reschedule(job.id or 0, new_at)
+            # 并进已排的那条时，**目的地要跟着最新这条消息走**。
+            # 不更新的话，先前那条任务记的还是旧频道（或者根本没记），
+            # 于是他在私聊说的话会被回到公开频道去。
+            payload = dict(job.payload)
+            if channel_id is not None and payload.get("channel_id") != channel_id:
+                payload["channel_id"] = channel_id
+                await self.scheduler.reschedule(job.id or 0, new_at, payload)
+            else:
+                await self.scheduler.reschedule(job.id or 0, new_at)
             log.info("[timing] 他还在打字，回复推到 %s", new_at.strftime("%H:%M"))
             return
 

@@ -159,7 +159,9 @@ class AttentionPolicy:
         # 先按真实时长算处境提示，再缩放。
         # DELAY_SCALE 是调试用的加速器，不该改变她说什么：
         # 压缩之后"隔了六小时"变成"隔了十几秒"，她就不知道自己该不该提这件事了。
-        hints = self._context_hints(reply, now, snapshot, defers, fatigue)
+        hints = self._context_hints(
+            reply, now, last_user_message_at, snapshot, defers, fatigue
+        )
         notice, reply = self._scale(now, notice, reply)
         return TimingDecision(
             notice_at=notice,
@@ -280,13 +282,21 @@ class AttentionPolicy:
         self,
         reply: datetime,
         now: datetime,
+        last_user_message_at: datetime,
         snapshot: RhythmSnapshot,
         defers: int,
         fatigue: float,
     ) -> list[str]:
-        """给模型的处境提示。这些会进上下文，不会直接发出去。"""
+        """给模型的处境提示。这些会进上下文，不会直接发出去。
+
+        "他等了多久"要从**他发消息那一刻**算起，不是从"现在"算起。
+        原来用的是 ``reply - now``，正常收消息时两者几乎一样，
+        但补抓停机期间的消息时差着好几个小时：一条三小时前的话，
+        提示里会写成"20 分钟前发的"，甚至因为没超过阈值而整条不出现——
+        于是那句"别解释这段时间你在干嘛"没了，她就真的会解释。
+        """
         hints: list[str] = []
-        waited = (reply - now).total_seconds() / 60
+        waited = (reply - min(now, last_user_message_at)).total_seconds() / 60
         if waited > 10:
             hints.append(
                 f"他这条消息是 {self._pretty(waited * 60)} 前发的。"
@@ -312,10 +322,18 @@ class AttentionPolicy:
     def merge_pending(
         self, existing_reply_at: datetime, now: datetime, heat: Heat, rng: random.Random
     ) -> datetime:
-        """已经排好队要回了，对方又发一条：往后挪一点，等他说完，但有上限。"""
+        """已经排好队要回了，对方又发一条：往后挪一点，等他说完，但有上限。
+
+        **基准要取"已排的时刻"和"现在"里靠后的那个。**
+        原来上限是 ``existing_reply_at + 90 秒``，而那条任务可能已经过期了
+        （重启之后、或者调度器还没轮到它）。已排时刻在五分钟前的话，
+        上限就是"四分半钟前"——外层的 min 会挑中它，于是回复被排到过去，
+        调度器下一拍立刻发出去。那就是实打实的秒回，这个项目最不能出的事。
+        """
+        base = max(existing_reply_at, now)
         gap = self._lognormal(25 if heat == "hot" else 40, 0.4, rng)
-        cap = existing_reply_at + timedelta(seconds=90 if heat == "hot" else 180)
-        return min(max(existing_reply_at, now + timedelta(seconds=gap)), cap)
+        cap = base + timedelta(seconds=90 if heat == "hot" else 180)
+        return min(max(base, now + timedelta(seconds=gap)), cap)
 
     def typing_duration(self, text: str, rng: random.Random) -> float:
         """打这条话要多久。手机打字比键盘慢。"""

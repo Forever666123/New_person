@@ -47,10 +47,18 @@ async def test_stores_and_reads_back(memory: Memory) -> None:
 
 
 async def test_gateway_replay_does_not_duplicate(memory: Memory) -> None:
-    """Discord 断线重连会重发事件，插重了就当没发生。"""
+    """Discord 断线重连会重发事件，插重了就当没发生。
+
+    **重复的那次必须返回 0，不能返回已有那条的 id。**
+    调用方靠的就是这个：`discord_bot.on_user_message` 里写着
+    `if not stored_id: return  # 网关重发，已经处理过了`。
+    返回已有 id 的话那道防线永远不生效——同一条消息会被再排一次回复，
+    而补抓跟实时消息撞上时还会被算成"补回来了 N 条"。
+    """
     first = await memory.add_user_message(incoming(1))
     second = await memory.add_user_message(incoming(1))
-    assert first == second
+    assert first, "第一次要返回真实的 id"
+    assert second == 0, "重复的那次要返回 0，否则上层的去重判断形同虚设"
     assert len(await memory.unread_messages(CONV)) == 1
 
 

@@ -228,7 +228,7 @@ class Memory:
         )
 
     async def add_user_message(self, msg: IncomingMessage) -> int:
-        """存一条对方的消息。网关重发导致的重复插入会被忽略，返回已有的 id。"""
+        """存一条对方的消息。**新存的返回 id，重复的返回 0。**"""
         await self.get_conversation(msg.conversation_id)
         cur = await self.db.execute(
             "INSERT OR IGNORE INTO messages"
@@ -245,12 +245,13 @@ class Memory:
                 msg.created_at.isoformat(),
             ),
         )
-        if cur.rowcount == 0:  # 重复事件，什么都不做
-            row = await self._fetch_one(
-                "SELECT id FROM messages WHERE discord_message_id = ?", (msg.discord_message_id,)
-            )
+        if cur.rowcount == 0:
+            # **重复事件返回 0。** 早先这里返回的是已有那条的 id，于是
+            # on_user_message 里 `if not stored_id: return` 那道防线永远不生效：
+            # 网关重发一次，同一条消息就再排一次回复；补抓跟实时消息撞上时
+            # 也会被算成"补回来了 N 条"。行本身照旧不动。
             await self.db.commit()
-            return int(row["id"]) if row else 0
+            return 0
 
         await self.db.execute(
             "UPDATE conversations SET last_user_message_at = ?,"
