@@ -239,10 +239,10 @@ async def _chatty(args: list[str], ctx: OwnerContext) -> str:
 
 
 async def _ledger(args: list[str], ctx: OwnerContext) -> str:
-    """她记下的、你在交易上说过的话。
+    """她记下的、你主动说出口的承诺和进展。一次看一类，默认交易。
 
-    这是她拿来指出你前后矛盾的依据，也顺便是你自己的交易日志：
-    说过的理由、答应过要做的事，都在这儿。
+    她拿这个回头问你做了没有。**只有你自己说出口的才在这儿**——
+    关于你的事她不预先知道任何东西，要靠问。
     """
     kind = args[0] if args else "trading"
     entries = await ctx.memory.ledger(kind, limit=12)

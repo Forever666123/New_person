@@ -444,10 +444,11 @@ def cmd_photos(args: argparse.Namespace) -> int:
 
 
 def cmd_ledger(args: argparse.Namespace) -> int:
-    """把她记下的交易陈述打出来。
+    """把她记下的、你主动说出口的承诺和进展打出来。
 
-    她拿这个指出你前后矛盾，你可以拿它当自己的交易日志：
-    每一笔当时的理由、答应过要做的事，都在里面。
+    六类：学习／排班／项目／英语／作息／交易，``--kind`` 一次看一类。
+    她拿这个回头问你做了没有，你也可以拿它当自己的记录：
+    当时的理由、答应过要做的事，都在里面。
     """
     loaded = load_all(args)
     if loaded is None:
@@ -462,7 +463,10 @@ def cmd_ledger(args: argparse.Namespace) -> int:
         try:
             entries = await memory.ledger(args.kind, limit=args.limit)
             if not entries:
-                print("还没记下什么。跟她聊到仓位、止损、回测这些的时候她才会记。")
+                print(
+                    f"「{args.kind}」这一类还没记下什么。\n"
+                    "她只记你主动说出口的承诺和进展——关于你的事她不预先知道，要靠问。"
+                )
                 return 0
             print(f"她记着这些（{args.kind}，{len(entries)} 条，最近的在前）\n")
             for _entry_id, at, entry in entries:
@@ -633,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("photos", help="扫描照片目录生成索引草稿")
 
-    led = sub.add_parser("ledger", help="打印她记下的、你在交易上说过的话")
+    led = sub.add_parser("ledger", help="打印她记下的、你主动说出口的承诺和进展")
     led.add_argument("--kind", default="trading", help="trading / study / shift / project / english / sleep")
     led.add_argument("--limit", type=int, default=50)
 
