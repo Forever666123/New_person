@@ -397,7 +397,9 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
     # 迟到多久在 Python 里算，不用 SQL 的日期函数：存的是带偏移量的 ISO 串，
     # 而这个文件里其它地方也都是自己 parse 的，口径统一。
     late: list[datetime] = []
+    looked_at = 0
     for row in rows:
+        looked_at += 1
         done_at, due = _parse(row["finished_at"]), _parse(row["due"])
         if done_at is not None and due is not None and (done_at - due).total_seconds() > LATE_SECONDS:
             late.append(done_at)
@@ -417,8 +419,17 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
             f"有 {worst} 件对着他的事挤在两分钟内发生",
             "像是重启之后积压一起涌出来的。正常情况下它们该被打散。",
         )
-    elif stamps:
-        report.add(OK, f"{len(stamps)} 件事分布正常（同一两分钟里最多 {worst} 件）")
+    elif looked_at:
+        # `stamps` 只装**迟到的**那些，所以这两句要分开说清楚：
+        # 一件都没迟到是最正常的样子，不能印成"没数据"。
+        # 改成只数迟到的那次，我把这两句忘了跟着改——于是一切正常的时候，
+        # 报告里印的是一句假话（"没有带执行时刻的任务"，而它们明明都带着）。
+        report.add(
+            OK,
+            f"{looked_at} 件事没有一件积压"
+            if not stamps
+            else f"{looked_at} 件事里 {len(stamps)} 件迟到了，但没挤在一起",
+        )
     else:
         # **没数据也要说一声。** 别的每一项都会说"样本还不够"，
         # 只有这一项原来是直接蒸发的——报告里少一行，谁也不会注意到。

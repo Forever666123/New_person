@@ -976,3 +976,28 @@ def test_a_real_restart_pile_up_is_still_caught(tmp_path: Path) -> None:
 
     report = doctor.run(path, NOW, days=40)
     assert any("挤在两分钟内" in f.line for f in report.findings), report.render()
+
+
+def test_the_burst_line_does_not_claim_there_is_no_data_when_everything_is_fine(
+    tmp_path: Path,
+) -> None:
+    """一件都没迟到是最正常的样子，不能印成"没有带执行时刻的任务"。
+
+    改成只数"迟到的"之后，没有任何任务迟到就落进了那句为"迁移前的老库"
+    准备的话——而库里那些任务明明都带着执行时刻。
+    报告里印一句假话，比少印一行更糟。
+    """
+    path = make_db(tmp_path / "allfine.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    at = NOW - timedelta(days=1)
+    for _ in range(12):  # 排期和执行只差一秒
+        add_job(conn, "reply", at + timedelta(seconds=1), "reply", run_at=at)
+        at += timedelta(minutes=30)
+    conn.commit()
+    conn.close()
+
+    finding = next(
+        f for f in doctor.run(path, NOW, days=40).findings if "件事" in f.line or "挤" in f.line
+    )
+    assert "没有带执行时刻" not in finding.line, f"库里十二个都带着，却说没有：{finding.line}"
+    assert "12" in finding.line, finding.line

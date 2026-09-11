@@ -76,6 +76,8 @@ class DeliveryResult:
     sent_message_ids: list[int] = field(default_factory=list)
     photo_sent: ResolvedPhoto | None = None
     reacted: bool = False
+    reaction_forbidden: bool = False
+    """表情被 Discord 拒了（403）。只有"这一轮她一个字都没发"时才当成会话发不出去。"""
     interrupted: bool = False
     """发到一半发现对方又发了新消息，剩余气泡没发。"""
     next_index: int = 0
@@ -284,6 +286,12 @@ class Deliverer:
             _attach_partial(exc, result)
             raise
 
+        if result.reaction_forbidden and not result.sent_texts and not result.photo_sent:
+            # 这一轮她一个字都没发出去，而唯一试过的那件事被 Discord 拒了。
+            # 不报的话这一轮就悄无声息地过去了：消息照样 mark_read，
+            # 未读清空，`deliverable` 还是 true。
+            log.error("私聊被拒绝（只加表情那一轮）：%s", BLOCKED_HINT)
+            raise DeliveryBlocked(result)
         return result
 
     async def deliver_reply(
@@ -355,6 +363,11 @@ class Deliverer:
             await react_to.add_reaction(reaction)
         except Exception as exc:
             log.warning("表情反应 %s 加不上，跳过：%s", reaction, exc)
+            if _is_forbidden(exc):
+                # 记一笔。这一轮要是只有表情没有文字（模型判"点个赞就够了"），
+                # `_send` 根本不会被调到，403 就没人看见——而她那一轮
+                # 一个字都没到他手里，报告却是绿的。见 deliver() 末尾。
+                result.reaction_forbidden = True
             return
         result.reacted = True
 

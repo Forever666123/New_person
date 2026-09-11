@@ -399,6 +399,11 @@ class Memory:
         )
         return parse_dt(row["created_at"]) if row else None
 
+    async def batch_of(self, message_id: int) -> datetime | None:
+        """这条消息属于哪一批（返回那一批的 ``read_at``）。还没读过就是 None。"""
+        row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (message_id,))
+        return parse_dt(row["read_at"]) if row else None
+
     async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
         """把**那一批**消息放回未读。
 

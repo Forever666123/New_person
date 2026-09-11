@@ -559,3 +559,44 @@ async def test_a_forbidden_reaction_does_not_mute_her(deliverer, channel) -> Non
     assert not result.reacted
     assert result.sent_texts == ["在的", "刚下课"], "表情加不上就把话也咽回去了"
     assert [s.content for s in channel.sends] == ["在的", "刚下课"]
+
+
+async def test_a_turn_that_is_only_a_forbidden_reaction_is_not_silently_lost(
+    deliverer, channel
+) -> None:
+    """她那一轮只打算点个赞，而那个赞被 Discord 拒了——这一轮她一个字都没到他手里。
+
+    表情失败不再往上抛（那会让"没有加表情权限"变成"永久说不出话"），
+    但只有表情、没有文字的那一轮，`_send` 根本不会被调到，403 就没人看见：
+    消息照样 mark_read、未读清空、会话还标着"发得出去"，报告一片绿。
+    """
+    from newperson.delivery import DeliveryBlocked
+
+    class Refusing(Exception):
+        status = 403
+
+    class NoReactions:
+        async def add_reaction(self, _emoji: str) -> None:
+            raise Refusing()
+
+    with pytest.raises(DeliveryBlocked):
+        await deliverer.deliver(channel, [], None, reaction="👍", react_to=NoReactions())
+
+
+async def test_a_forbidden_reaction_alongside_text_is_still_just_skipped(
+    deliverer, channel
+) -> None:
+    """但只要文字发得出去，那一轮就不算发不出去——表情失败就是跳过。"""
+
+    class Refusing(Exception):
+        status = 403
+
+    class NoReactions:
+        async def add_reaction(self, _emoji: str) -> None:
+            raise Refusing()
+
+    result = await deliverer.deliver(
+        channel, [ReplyPart(text="在的")], None, reaction="👍", react_to=NoReactions()
+    )
+    assert result.sent_texts == ["在的"]
+    assert not result.reacted

@@ -1969,3 +1969,51 @@ async def test_the_dm_baseline_is_pinned_from_a_realtime_message(
 
     ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
     assert 150 in ids, f"私聊那一轮拿不到，它的消息就永久没了：{sorted(ids)}"
+
+
+async def test_a_message_sent_while_a_delivery_is_retrying_still_gets_answered(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他在"投递失败、等着重试"那个窗口里说的话，不能没人回。
+
+    那句话会被 `merge_pending` 并进这条**已经带着旧 plan** 的任务。
+    任务恢复后续发的是老 plan，而发到最后一条时 `interrupted()` 根本不问
+    （最后一条之后没有"剩下的"了），任务就此判 done——
+    那句新话没人排回复，她会一直沉默到下次重连补抓。
+    """
+    first = ReplyPlan(parts=[ReplyPart(text="A1"), ReplyPart(text="A2")])
+    second = ReplyPlan(parts=[ReplyPart(text="B1")])
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [first, second])
+
+    boom = {"on": True}
+    real_send = channel.send
+
+    async def flaky(*args, **kwargs):
+        # A2 一直发不出去，直到我们把 boom 关掉——模拟"网络断着，任务等重试"
+        if boom["on"] and len(channel.texts) >= 1:
+            raise RuntimeError("网络断了")
+        return await real_send(*args, **kwargs)
+
+    channel.send = flaky
+    await send(app, "第一句", at=EVENING, msg_id=100)
+    await drain(app, clock, hops=3)
+    assert channel.texts == ["A1"], "前提不成立：没在中间断掉"
+
+    # 等重试的窗口里他又说了一句
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID,
+            discord_message_id=101,
+            author_id=42,
+            author_name="Leo",
+            content="第二句",
+            created_at=clock.now(),
+        )
+    )
+    await app._schedule_reply(clock.now(), channel_id=None)
+    boom["on"] = False  # 网络回来了
+    await drain(app, clock, hops=10)
+
+    assert "A2" in channel.texts, "前提不成立：没续发完"
+    leftover = [m.content for m in await memory.unread_messages(CONVERSATION_ID)]
+    assert "B1" in channel.texts, f"「第二句」没人回，还躺在未读里：{leftover}"

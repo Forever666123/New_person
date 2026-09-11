@@ -886,11 +886,15 @@ class App:
         channel_id = job.payload.get("channel_id")
         # 这一批的身份：一批一个 read_at（mark_read 一批一条 UPDATE）。
         #
-        # 头一次发的时候这些 StoredMessage 是在 `mark_read` **之前**取出来的，
-        # 它们手里的 read_at 还是 None——所以退回 `now`，而那正是
-        # `mark_read` 刚写进去的那个值。续发那条路上消息是从库里重新读的，
-        # read_at 有了，而 `now` 和它差着几分钟到几小时，所以不能拿 `now` 顶。
-        batch = max((m.read_at for m in unread if m.read_at), default=now)
+        # **从库里按 covers 直接取**，不从 `unread` 里凑。续发那条路上
+        # `unread` 是 `recent_messages(40)` 再按 id 过滤出来的，那一批只要被
+        # 后来的消息挤出最近四十行，列表就是空的——她回两三个气泡的话，
+        # 四十行只够十来个来回。那时候退回 `now` 写进去的是**重试那一刻**，
+        # 对不上任何一批，于是这一批在体检里永远算"没接住"。
+        #
+        # 头一次发的时候这些消息刚被 `mark_read` 标上，库里读回来就是对的；
+        # 万一还没写下（理论上不会），退回 `now`——那正是 mark_read 用的值。
+        batch = await self.memory.batch_of(covers) or now
         channel = await self.resolve_channel(channel_id)
         photo = await self._resolve_photo(plan.photo_request, now)
         react_to = (
@@ -945,6 +949,14 @@ class App:
 
         if result.interrupted:
             log.info("[delivery] 他又发了，剩下的不发了，重新排一次")
+            await self._schedule_reply(self.clock.now(), channel_id=channel_id)
+        elif await self.memory.unread_messages(CONVERSATION_ID):
+            # 顺路的时候这里是空的：`mark_read` 已经把这一批清掉了。
+            # 剩下的只有一种情形——他在"投递失败、等着重试"那个窗口里又说了话，
+            # 被 `merge_pending` 并进了这条**已经带着旧 plan** 的任务。
+            # 续发走的是老 plan，而发到最后一条时 `interrupted()` 根本不问，
+            # 任务就此判 done：那句新话没人排回复，她会一直沉默到下次重连补抓。
+            log.info("[delivery] 发完之后还有未读（重试窗口里进来的），补排一条")
             await self._schedule_reply(self.clock.now(), channel_id=channel_id)
 
     async def _fetch_message(self, message_id: int | None, channel: Any = None):
