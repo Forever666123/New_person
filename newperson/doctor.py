@@ -117,6 +117,9 @@ SAFE_REASONS = {
 """
 MAX_DETAIL = 60
 
+LATE_SECONDS = 300.0
+"""任务比排期晚这么多秒才算"迟到"。见 :func:`check_bursts` 为什么不能只看密度。"""
+
 
 def _safe_detail(raw: str) -> str:
     """把诊断文本压成不会夹带聊天内容的形状。
@@ -379,16 +382,28 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
       而它们的打散窗口只有 30–300 秒，三四个落进同一个两分钟窗口是常事——
       于是把"打散正常工作"报成了故障。现在只数他看得见的那几种。
     """
+    # **只数"迟到的"。** 光看密度的话，积压涌出和热聊长得一模一样：
+    # 他在她回完两秒后接话、来回三十轮，同样是"两分钟内三件事"，
+    # 而那是最正常不过的一段对话。分得开两者的信号库里现成就有——
+    # 积压的特征是**排期早就过了才执行**：run_at 在几小时前，
+    # finished_at 挤在重启后的那一分钟。实时的那些两者只差几秒。
     rows = _rows(
         conn,
-        "SELECT finished_at FROM jobs"
+        "SELECT finished_at, COALESCE(original_run_at, run_at) AS due FROM jobs"
         " WHERE kind IN ('reply', 'proactive', 'follow_up', 'sign_off')"
         " AND status = 'done' AND finished_at IS NOT NULL AND finished_at >= ?",
         (since.isoformat(),),
     )
+    # 迟到多久在 Python 里算，不用 SQL 的日期函数：存的是带偏移量的 ISO 串，
+    # 而这个文件里其它地方也都是自己 parse 的，口径统一。
+    late: list[datetime] = []
+    for row in rows:
+        done_at, due = _parse(row["finished_at"]), _parse(row["due"])
+        if done_at is not None and due is not None and (done_at - due).total_seconds() > LATE_SECONDS:
+            late.append(done_at)
     # **在 Python 里排序，不靠 SQL 的字符串序。** 存的是带偏移量的 ISO 串，
     # 字典序在夏令时切换那一小时会把顺序弄反，于是秋天回拨的那晚会凭空报一批扎堆。
-    stamps = sorted(t for t in (_parse(r["finished_at"]) for r in rows) if t is not None)
+    stamps = sorted(late)
     # 滑动窗口，线性。原来是 O(n²) 且每轮复制一次列表，两万条要跑七十秒。
     worst = 0
     left = 0

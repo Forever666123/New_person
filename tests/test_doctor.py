@@ -935,3 +935,44 @@ async def test_an_old_database_is_not_read_as_her_talking_to_herself(
         f"老数据被当成她在自说自话：{opened.line if opened else ''}\n{report.render()}"
     )
     assert not [f for f in report.findings if "沉默" in f.line], "老数据段不该报沉默比例"
+
+
+def test_a_fast_conversation_is_not_reported_as_a_restart_pile_up(tmp_path: Path) -> None:
+    """他在她回完两秒后就接话，来回三十轮——那不是积压涌出来。
+
+    光看密度的话，这两件事长得一模一样。分得开的信号库里现成就有：
+    积压的特征是**排期早就过了才执行**（run_at 在几小时前，finished_at
+    挤在重启后那一分钟），实时的那些两者只差几秒。
+    """
+    path = make_db(tmp_path / "fastjobs.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    at = NOW - timedelta(days=1)
+    for _ in range(30):  # 排期和执行只差两秒——实时
+        add_job(conn, "reply", at + timedelta(seconds=2), "reply", run_at=at)
+        at += timedelta(seconds=25)
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert not [f for f in report.findings if "挤在两分钟内" in f.line], report.render()
+
+
+def test_a_real_restart_pile_up_is_still_caught(tmp_path: Path) -> None:
+    """而真的积压涌出来要照样报：排期在几小时前，全在同一分钟执行。"""
+    path = make_db(tmp_path / "pileup.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    scheduled = NOW - timedelta(days=1, hours=3)
+    ran = NOW - timedelta(days=1)
+    for i in range(5):
+        add_job(
+            conn,
+            "reply",
+            ran + timedelta(seconds=i * 10),
+            "reply",
+            run_at=scheduled + timedelta(minutes=i * 20),
+        )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert any("挤在两分钟内" in f.line for f in report.findings), report.render()

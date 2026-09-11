@@ -301,9 +301,24 @@ class App:
             self._catching_up = False
 
     async def _remember_inbound(self, channel_id: int | None) -> None:
-        """记下他最后一次说话的地方。消息表里不存频道，只能单独记一份。"""
-        if isinstance(channel_id, int):
-            await self.memory.kv_set(LAST_INBOUND, str(channel_id))
+        """记下他最后一次说话的地方。消息表里不存频道，只能单独记一份。
+
+        顺手记进 ``CATCHUP_SEEN``。**私聊的 id 只能从这儿知道**——
+        它不在配置里（配置里只有公开频道那个），而 `_pin_baselines`
+        只钉得住"已知"的频道。私聊第一次解析失败的那一轮
+        （`on_ready` 正是最容易撞限流的时刻），它连基线都不会建，
+        而同一轮公开频道补抓成功会把全库最大编号推上去——
+        下一轮私聊恢复，起点就落在被推过去的位置，中间的话永久跳过。
+        实测两百个随机场景里有十一个这样丢消息，丢的全是私聊的。
+        """
+        if not isinstance(channel_id, int):
+            return
+        await self.memory.kv_set(LAST_INBOUND, str(channel_id))
+        raw = await self.memory.kv_get(CATCHUP_SEEN) or ""
+        known = {int(x) for x in raw.split(",") if x.strip().isdigit()}
+        if channel_id not in known:
+            known.add(channel_id)
+            await self.memory.kv_set(CATCHUP_SEEN, ",".join(str(i) for i in sorted(known)))
 
     async def _pin_baselines(self, newest: int) -> None:
         """**开始翻之前**就把每个已知入口的游标基线钉住。

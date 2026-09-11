@@ -129,7 +129,7 @@ async def build(tmp_path: Path, persona: Persona, script: list, *, now=EVENING):
     _OPEN.append(memory)
     scheduler = Scheduler(memory, clock, settings.delay_scale)
     llm = ScriptedLLM(script)
-    brain = Brain(SimpleNamespace(messages=llm), settings, persona, memory)
+    brain = Brain(SimpleNamespace(messages=llm), settings, persona, memory, clock)
     library = PhotoLibrary(settings.photos_index)
     library.load()
     media = MediaService(library, NullImageGenerator(), settings.generated_dir)
@@ -1922,3 +1922,50 @@ async def test_pausing_her_does_not_eat_the_retry_budget(
     job = await memory.get_job(job_id)
     assert job is not None and job.status == "pending", "暂停期间这条任务不该被判死"
     assert job.attempts == 0, f"暂停吃掉了 {job.attempts} 次重试预算"
+
+
+async def test_the_dm_baseline_is_pinned_from_a_realtime_message(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """私聊的频道 id 只能从实时消息里知道，而基线必须在它拿不到之前就钉好。
+
+    公开频道的 id 在配置里就有，私聊的没有。`on_ready` 又正是最容易撞限流的
+    时刻——`get_user` 缓存冷 + `fetch_user` 429 就够了。那一轮私聊连游标基线
+    都不会建，而同一轮公开频道补抓成功会把全库最大编号推上去；
+    下一轮私聊恢复，起点就落在被推过去的位置，中间的话永久跳过。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    app._should_handle = lambda _m: True
+    app.settings.proactive_channel_id = 777
+
+    # 他先在私聊里说过话——这是我们唯一能知道私聊 id 的地方
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    await app._remember_inbound(999)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done", at=EVENING)
+
+    public = FakeHistoryChannel(
+        [fake_incoming(200, "公开频道里的", EVENING + timedelta(minutes=10), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(150, "私聊里漏掉的", EVENING + timedelta(minutes=5), channel_id=999)],
+        channel_id=999,
+    )
+    dm_up = {"ok": False}
+
+    def get_user(_id):
+        if not dm_up["ok"]:
+            raise RuntimeError("429 限流")
+        return SimpleNamespace(dm_channel=dm)
+
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999), get_user=get_user, get_channel=lambda _c: public
+    )
+
+    assert await app.catch_up() == 1, "公开频道那条这一轮就该补回来"
+    dm_up["ok"] = True
+    assert await app.catch_up() == 1, "私聊那条要在这一轮补回来"
+
+    ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert 150 in ids, f"私聊那一轮拿不到，它的消息就永久没了：{sorted(ids)}"
