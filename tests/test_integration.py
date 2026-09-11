@@ -1472,3 +1472,128 @@ async def test_messages_left_unanswered_by_a_crashed_catch_up_get_a_reply_later(
     wire_inbound(app, FakeHistoryChannel([], channel_id=999))
     assert await app.catch_up() == 0, "这一轮确实什么都没补到"
     assert await memory.pending_jobs("reply", CONVERSATION_ID), "躺在库里的那条没人管了"
+
+
+async def test_a_resent_message_with_no_pending_reply_gets_one(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """消息进了库但没排上回复时，网关重发是唯一的补救，不能被挡在门外。
+
+    `add_user_message` 提交之后还要再往 jobs 表写一次；备份正在跑的时候
+    SQLite 可能 `database is locked`，而 `on_message` 把异常吞成一行日志。
+    于是这条消息进了库、没人回；又因为它还未读，她连主动消息都发不出来
+    （未读挡着）——整个人哑掉，一直到下次重连补抓才救得回来。
+
+    原来这里无条件 `return`（"网关重发，已经处理过了"），
+    把这道天然的补救也挡掉了。重发只在**已经排着回复**时才该短路。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app._should_handle = lambda _m: True
+    clock.set(EVENING)
+    incoming = fake_incoming(100, "在吗 那个作业", EVENING)
+
+    boom = {"on": True}
+    original = app._schedule_reply
+
+    async def flaky(*args, **kwargs):
+        if boom["on"]:
+            boom["on"] = False
+            raise RuntimeError("database is locked")
+        return await original(*args, **kwargs)
+
+    app._schedule_reply = flaky
+    with contextlib.suppress(RuntimeError):
+        await app.on_user_message(incoming)
+
+    assert await memory.unread_messages(CONVERSATION_ID), "前提不成立：消息没进库"
+    assert not await memory.pending_jobs("reply", CONVERSATION_ID), "前提不成立：回复排上了"
+
+    await app.on_user_message(incoming)  # 网关重发同一条
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "重发也救不回来，她就这么哑了"
+
+
+async def test_a_resent_message_does_not_push_the_reply_back_again(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """正常的网关重发还是要短路，不能每重发一次就把回复往后推一点。"""
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app._should_handle = lambda _m: True
+    clock.set(EVENING)
+    incoming = fake_incoming(100, "第一句", EVENING)
+
+    await app.on_user_message(incoming)
+    before = (await memory.pending_jobs("reply", CONVERSATION_ID))[0].run_at
+
+    for _ in range(3):
+        await app.on_user_message(incoming)
+
+    jobs = await memory.pending_jobs("reply", CONVERSATION_ID)
+    assert len(jobs) == 1
+    assert jobs[0].run_at == before, "重发把回复往后推了"
+
+
+async def test_a_backlog_bigger_than_the_page_budget_keeps_making_progress(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """积压超过一次能翻的量时，下次重连要**接着翻**，不能从头重来。
+
+    页数用满不是出错——那些页是好好处理完的。把它当成出错、不推进游标的话，
+    这个频道在每一次重连都从同一个位置重翻同样的内容，全是重复，
+    于是永远翻不过去，而且每次重连还白烧 max_pages 次 history 调用。
+
+    卡死的门槛比想象中低：被过滤掉的消息照样吃预算（游标在过滤之前推进，
+    一页数的是整页），所以公开频道里别人的闲聊、她自己发的话全都算数。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    dm = FakeHistoryChannel(
+        [
+            fake_incoming(101 + i, f"第 {i} 句", EVENING + timedelta(minutes=i), channel_id=999)
+            for i in range(10)
+        ],
+        channel_id=999,
+    )
+    wire_inbound(app, dm)
+
+    # 一次只够翻 4 条，10 条要翻三轮
+    seen: set[int] = set()
+    for _ in range(3):
+        await app.catch_up(page=2, max_pages=2)
+        seen = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert len(seen) >= 11, f"翻不动了，三轮只补回 {len(seen) - 1} 条：{sorted(seen)}"
+
+
+async def test_a_channel_that_only_has_other_peoples_chatter_still_advances(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """整页都是该跳过的消息时，游标也必须往前走。
+
+    不走的话，一个有人气的公开频道能把补抓永远钉在原地：
+    每次重连翻回同样那几页闲聊，他真正说的那句永远排在预算之外。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    chatter = [
+        fake_incoming(101 + i, f"路人 {i}", EVENING + timedelta(minutes=i), channel_id=999)
+        for i in range(8)
+    ]
+    his = fake_incoming(200, "他真正说的那句", EVENING + timedelta(minutes=30), channel_id=999)
+    dm = FakeHistoryChannel([*chatter, his], channel_id=999)
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_user=lambda _id: SimpleNamespace(dm_channel=dm),
+        get_channel=lambda _cid: None,
+    )
+    # 只认他那条，别的全是路人
+    app._should_handle = lambda m: m.id == 200
+
+    for _ in range(5):
+        await app.catch_up(page=2, max_pages=2)
+    ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert 200 in ids, f"闲聊把补抓卡死了，他那句永远补不到：{sorted(ids)}"

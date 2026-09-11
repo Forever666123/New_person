@@ -357,7 +357,15 @@ class App:
                 start = newest
                 await self.memory.kv_set(key, str(start))
             cursor = start
-            complete = True
+            safe = start
+            """确认**全部处理妥当**的位置，只有它会被写回去。
+
+            和 ``cursor`` 分开是因为两件事不一样：翻页要往前走，
+            记账只能记到"这之前都没问题"为止。中间抛了异常、某一条处理不了，
+            ``safe`` 就停在那儿，下次从那里重来；页数用满不是出错，
+            那些页是好好处理完的，``safe`` 照常跟到底。
+            """
+            stuck = False
             for _ in range(max_pages):
                 try:
                     batch = [
@@ -368,16 +376,18 @@ class App:
                     ]
                 except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
                     log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
-                    complete = False
                     break
                 if not batch:
                     break
                 for message in batch:
                     cursor = max(cursor, message.id)
-                    if not self._should_handle(message):
+                    if not self._should_handle(message) or owner_cmds.is_command(message.content):
+                        # 不该处理的、以及 !np（给程序看的，补抓时更不该执行）：
+                        # 跳过不等于没处理妥当，游标照常跟上，否则别人的闲聊
+                        # 会把这个频道永远卡在原地。
+                        if not stuck:
+                            safe = cursor
                         continue
-                    if owner_cmds.is_command(message.content):
-                        continue  # !np 是给程序看的，补抓时更不该执行
                     at = message.created_at.astimezone(self.persona.tz)
                     # **一条处理不了不能连累整批。** 下附件要联网、要写盘，
                     # 磁盘满了或者 aiohttp 抛一下就够了。往外抛的后果不是少补几条：
@@ -398,8 +408,10 @@ class App:
                         )
                     except Exception:  # noqa: BLE001 - 单条失败，跳过它，别停下
                         log.warning("[inbox] 补抓时这条处理不了，跳过 %s", message.id, exc_info=True)
-                        complete = False  # 这一条没补成，游标不能推过它
+                        stuck = True  # 从这条起都不算数了，下次重来
                         continue
+                    if not stuck:
+                        safe = cursor
                     if stored:
                         recovered += 1
                         if latest is None or at > latest[0]:
@@ -407,12 +419,15 @@ class App:
                 if len(batch) < page:
                     break
             else:
-                complete = False
-                log.error(
-                    "[inbox] 补抓翻了 %d 页还没到底，剩下的这次补不了（下次重连继续）", max_pages
+                # 页数用满**不是出错**。这些页是好好处理完的，游标必须跟上，
+                # 否则下次重连从同一个位置重翻同样这些，全是重复，
+                # 于是永远翻不过去——"下次重连继续"就成了一句空话，
+                # 而且每次重连都白烧 max_pages 次 history 调用。
+                log.info(
+                    "[inbox] 补抓翻满 %d 页，剩下的下次重连接着翻", max_pages
                 )
-            if complete and cursor > start:
-                await self.memory.kv_set(key, str(cursor))
+            if safe > start:
+                await self.memory.kv_set(key, str(safe))
 
         if recovered:
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
@@ -476,8 +491,17 @@ class App:
                 created_at=now,
             )
         )
+        if not stored_id and await self.memory.pending_jobs("reply", CONVERSATION_ID):
+            return  # 网关重发，而且这条已经排着回复了，不用再动
         if not stored_id:
-            return  # 网关重发，已经处理过了
+            # 重发，但**没有任何排着的回复**——说明上一次在"已入库"和"已排期"
+            # 之间断了（`_schedule_reply` 那一步要再写一次 jobs 表，
+            # 备份正在跑的时候 SQLite 可能 `database is locked`），
+            # 而上层把异常吞成一行日志。原来这里无条件 return，
+            # 网关重发这道天然的补救就被挡在门外：那条消息进了库没人回，
+            # 又因为它还未读，她连主动消息都发不出来——整个人哑掉，
+            # 一直到下次重连补抓才救得回来。
+            log.warning("[inbox] 重发的这条没有排着回复，补排一次")
 
         log.info(
             "[inbox] %d 字%s", len(message.content), " 带图" if attachments else ""

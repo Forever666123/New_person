@@ -331,7 +331,7 @@ class AttentionPolicy:
         调度器下一拍立刻发出去。那就是实打实的秒回，这个项目最不能出的事。
         """
         base = max(existing_reply_at, now)
-        gap = self._lognormal(25 if heat == "hot" else 40, 0.4, rng)
+        gap = max(MIN_DELAY_SECONDS, self._lognormal(25 if heat == "hot" else 40, 0.4, rng))
         cap = base + timedelta(seconds=90 if heat == "hot" else 180)
         return min(max(base, now + timedelta(seconds=gap)), cap)
 
@@ -343,8 +343,16 @@ class AttentionPolicy:
 
     @staticmethod
     def _pretty(seconds: float) -> str:
+        """这句原样进模型上下文，所以要说人话。
+
+        停机几天之后 ``waited`` 可以是任意大，而原来最大的一档是小时——
+        提示里会写"168.1 小时前发的"，没有人是这么说话的，
+        而她很可能照着复述一遍。
+        """
         if seconds < 90:
             return f"{seconds:.0f} 秒"
         if seconds < 90 * 60:
             return f"{seconds / 60:.0f} 分钟"
-        return f"{seconds / 3600:.1f} 小时"
+        if seconds < 36 * 3600:
+            return f"{seconds / 3600:.1f} 小时"
+        return f"{seconds / 86400:.0f} 天"
