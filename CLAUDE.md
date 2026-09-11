@@ -48,19 +48,32 @@ python -m newperson check                # 检查配置和人设
 
 ## 关键不变量
 
-改代码时不要打破这些，每条都有测试守着：
+改代码时不要打破这些。每条后面是守着它的那条测试——改之前先去看它，
+它的 docstring 里写着上一次是怎么破的。
 
 1. **模型调用失败绝不能被对方看见。** 任何异常都返回 `None`，
    调度器当作"这会儿没看手机"重试。绝不发错误文本。
+   → `test_any_failure_becomes_silence`
 2. **消息不能凭空消失。** `mark_read` 必须在模型成功返回**之后**。
    放在前面的话，失败重试时未读是空的，整批消息就永远回不出去。
+   → `test_a_model_failure_does_not_swallow_the_message`
 3. **system prompt 字节级固定。** 里面出现时间、日期、随机内容，
    prompt cache 就永远不命中，成本翻好几倍。易变内容全部放 user 消息。
+   → `test_the_system_prompt_is_the_same_bytes_in_a_fresh_process`
 4. **每会话单飞。** 同一段对话同时只跑一个任务，
    否则回复和主动消息会在同一个频道里交错发出。
+   → `test_one_conversation_runs_one_job_at_a_time`
 5. **`!np` 开头的消息不入库、不进模型。** 她不知道你在操控她。
+   → `test_owner_commands_never_reach_her`
 6. **风格约束用预算不用开关。** 偶尔一个 emoji 是正常的，满屏才不正常。
    频率交给提示词描述，`style_guard` 只管上限。
+   → `tests/test_style_guard.py` 整个文件
+
+还有一条不是不变量、但这几天反复咬人的经验：
+**合成的库测的是"我以为她怎么工作"。** 体检那两个计数器合成数据全过，
+接上真实流量整个反了——她一条没漏被算成沉默 35%。
+凡是"数她做了什么"的判据，都要有一条走完整条路的测试去对
+（`test_the_counters_match_what_the_real_app_actually_did`）。
 
 ## 文件职责
 
