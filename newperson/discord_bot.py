@@ -60,6 +60,9 @@ PHOTO_SHORTLIST = 20
 CATCHUP_CURSOR = "catchup_cursor:"
 """补抓的游标前缀，后面接频道 id。**一个频道一个**，见 _catch_up_channels。"""
 
+MEMORY_RETRY_BACKOFF = timedelta(hours=6)
+"""记忆整理失败之后隔这么久才再试。见 _maybe_summarize 为什么不能不退避。"""
+
 CATCHUP_SEEN = "catchup_channels"
 """见过的入口频道 id，逗号分隔。用来在开始翻之前就把每个入口的基线钉住。"""
 
@@ -1023,6 +1026,14 @@ class App:
             return
         if await self.memory.pending_jobs("memory_update", CONVERSATION_ID):
             return
+        # **上一次整理失败之后要退避。** 这道闸原来只看 pending：
+        # 重试用尽变成 failed 之后它就看不见了，而游标因为失败没推进、
+        # 落后条数永远压着阈值——于是每回一条消息就新建一个任务、再烧三次调用。
+        # 实测 45 轮来回烧掉 93 次模型调用（该是 48），撞上日限额之后
+        # 她在当天中途毫无征兆地不说话了：频道里看不出任何原因。
+        failed_at = await self.memory.last_failed_at("memory_update", CONVERSATION_ID)
+        if failed_at is not None and self.clock.now() - failed_at < MEMORY_RETRY_BACKOFF:
+            return
         await self.scheduler.schedule(
             "memory_update",
             self.clock.now() + timedelta(seconds=30),
@@ -1171,8 +1182,16 @@ class App:
     async def handle_memory_update_job(self, job: Job) -> None:
         now = self.clock.now()
         conv = await self.memory.get_conversation(CONVERSATION_ID)
-        messages = await self.memory.recent_messages(
-            CONVERSATION_ID, 200, after_id=conv.summary_upto_message_id
+        # **从最老的一批开始。** 原来用的是 `recent_messages`，那取的是
+        # **最新的** 200 条，而游标却推到了全库最大 id——等于宣称中间那些
+        # 也整理过了。它们同时早就掉出"最近 40 条"的窗口，于是那一段
+        # 从她的记忆里彻底消失，落后计数归零，以后再也没有哪一次整理
+        # 会回头看它们。而这不会有任何症状：facts 有、摘要有、体检印 OK。
+        #
+        # 够得着这条路的场景很常规：她几天没能回话（长时间停机、私聊被挡、
+        # 请假），重连时补抓一次最多灌进来一千条。
+        messages = await self.memory.messages_after(
+            CONVERSATION_ID, conv.summary_upto_message_id, 200
         )
         if not messages:
             return
@@ -1189,6 +1208,12 @@ class App:
             self.rhythm.local_date(now),
         )
         if update is None:
+            if await self.brain.over_budget(self.rhythm.local_date(now)):
+                # 和回复那条路对齐：额度用完不是故障，别拿三次重试把它烧掉。
+                # 原来一律 raise，于是额度一紧就三次全废，任务变 failed——
+                # 而下面那道闸看不见 failed，每回一条消息就再排一个、再烧三次。
+                await self._defer_to_tomorrow(job, now, "今天的模型额度用完了")
+                return
             raise RuntimeError("记忆整理失败")
 
         await self.memory.update_conversation(
@@ -1202,6 +1227,8 @@ class App:
             "[memory] 摘要更新了，新记住 %d 条关于他的",
             len(update.owner_facts),
         )
+        # 积压超过一趟（200 条）时接着排下一趟，别等他下次说话才想起来。
+        await self._maybe_summarize()
 
 
 class PresenceManager:

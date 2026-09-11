@@ -368,6 +368,34 @@ class Memory:
         )
         return [self._row_to_message(r) for r in rows]
 
+    async def messages_after(
+        self, conversation_id: str, after_id: int, limit: int
+    ) -> list[StoredMessage]:
+        """游标之后**最老的** limit 条，升序。
+
+        和 :meth:`recent_messages` 正好相反，别弄混：那个取的是**最新的** N 条
+        （给提示词用最近的对话，那是对的）。记忆整理要的是"从上次整理的地方
+        往后接着看"，必须从最老的那一批开始——拿最新的 200 条去整理、
+        再把游标推到全库最大 id，等于宣称中间那些也整理过了，
+        而它们同时早就掉出"最近 40 条"的窗口：那一段就此从她的记忆里消失，
+        落后计数归零，以后再也没有任何一次整理会回头看它们。
+        """
+        rows = await self._fetch_all(
+            "SELECT * FROM messages WHERE conversation_id = ? AND id > ?"
+            " AND deleted = 0 ORDER BY id LIMIT ?",
+            (conversation_id, after_id, limit),
+        )
+        return [self._row_to_message(r) for r in rows]
+
+    async def last_failed_at(self, kind: str, conversation_id: str) -> datetime | None:
+        """这一类任务最近一次**重试到放弃**是什么时候。没有就是 None。"""
+        row = await self._fetch_one(
+            "SELECT MAX(finished_at) AS last FROM jobs WHERE kind = ?"
+            " AND conversation_id = ? AND status = 'failed'",
+            (kind, conversation_id),
+        )
+        return parse_dt(row["last"]) if row else None
+
     async def count_messages_after(self, conversation_id: str, after_id: int) -> int:
         row = await self._fetch_one(
             "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ? AND id > ?",

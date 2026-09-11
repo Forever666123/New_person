@@ -2017,3 +2017,107 @@ async def test_a_message_sent_while_a_delivery_is_retrying_still_gets_answered(
     assert "A2" in channel.texts, "前提不成立：没续发完"
     leftover = [m.content for m in await memory.unread_messages(CONVERSATION_ID)]
     assert "B1" in channel.texts, f"「第二句」没人回，还躺在未读里：{leftover}"
+
+
+async def test_a_backlog_bigger_than_one_pass_is_not_silently_written_off(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """积压超过一趟能吃下的量时，最老的那批**不能**被当成整理过。
+
+    整理原来用 `recent_messages(200, after_id=...)`——那取的是**最新的** 200 条，
+    而游标却推到全库最大 id，等于宣称中间那些也整理过了。它们同时早就掉出
+    "最近 40 条"的窗口，于是那一段从她的记忆里彻底消失，落后计数归零，
+    以后再也没有哪一次整理会回头看它们。
+
+    而这不会有任何症状：facts 有、摘要有、`!np status` 干净、体检印 OK。
+    够得着的场景也很常规——她几天没能回话，重连时补抓一次最多灌一千条。
+    """
+    from newperson.models import MemoryUpdate
+
+    seen: list[list[str]] = []
+
+    class RecordingBrain:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def update_memory(self, request, _day):
+            seen.append([m.content for m in request.messages])
+            return MemoryUpdate(summary="摘要", owner_facts=[], self_facts=[])
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app.brain = RecordingBrain(app.brain)
+
+    for i in range(260):
+        await memory.add_user_message(
+            IncomingMessage(
+                conversation_id=CONVERSATION_ID,
+                discord_message_id=9000 + i,
+                author_id=42,
+                author_name="Leo",
+                content=f"第{i:03d}句",
+                created_at=EVENING + timedelta(minutes=i),
+            )
+        )
+
+    await app._maybe_summarize()
+    await drain(app, clock, hops=12)
+
+    assert seen, "一趟都没跑起来"
+    first_pass = seen[0]
+    assert first_pass[0] == "第000句", f"第一趟从 {first_pass[0]} 开始，不是最老的那条"
+
+    everything = {m for batch in seen for m in batch}
+    missing = [f"第{i:03d}句" for i in range(260) if f"第{i:03d}句" not in everything]
+    assert not missing, f"{len(missing)} 条从没进过模型，却被当成整理过了：{missing[:3]}…"
+
+
+async def test_a_failing_memory_update_does_not_burn_the_daily_budget(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """记忆整理一直失败时，不能每回一条消息就再排一个、再烧三次模型调用。
+
+    那道闸只看 `pending`，而重试用尽之后任务变 `failed`——闸看不见它；
+    同时游标因为失败从没推进，落后条数永远压着阈值。于是每一次回复
+    都新建一个任务，既没退避也没上限。实测 45 轮来回烧掉 93 次调用（该是 48），
+    撞上日限额之后她在当天中途毫无征兆地不说话了。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+
+    class AlwaysFails:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def update_memory(self, _request, _day):
+            return None
+
+        async def over_budget(self, _day):
+            return False
+
+    app.brain = AlwaysFails(app.brain)
+
+    for i in range(70):
+        await memory.add_user_message(
+            IncomingMessage(
+                conversation_id=CONVERSATION_ID,
+                discord_message_id=7000 + i,
+                author_id=42,
+                author_name="Leo",
+                content=f"第{i}句",
+                created_at=EVENING + timedelta(minutes=i),
+            )
+        )
+
+    # 模拟接下来的二十次回复：每次都会走到 _after_reply 末尾那道闸
+    for _ in range(20):
+        await app._maybe_summarize()
+        await drain(app, clock, hops=6)
+        clock.advance(60)
+
+    jobs = await memory.failed_jobs(CONVERSATION_ID)
+    assert len(jobs) <= 2, f"排了 {len(jobs)} 个注定失败的整理任务，每个烧三次调用"
