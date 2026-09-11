@@ -16,6 +16,9 @@ from pathlib import Path
 
 from newperson import backup, doctor
 from newperson.memory import SCHEMA
+from newperson.persona import load_persona
+
+PERSONA = load_persona(Path(__file__).resolve().parent.parent / "persona" / "persona.yaml")
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 
@@ -774,4 +777,66 @@ def test_her_words_not_reaching_him_at_all_is_the_loudest_thing(tmp_path: Path) 
     report = doctor.run(path, NOW, days=40)
     assert any(f.level == doctor.BAD and "发不出去" in f.line for f in report.findings), (
         report.render()
+    )
+
+
+async def test_the_counters_match_what_the_real_app_actually_did(tmp_path: Path) -> None:
+    """**跑一遍真的她，再用体检去数，两边必须对得上。**
+
+    上一版的沉默比例和主动开口都是照着"他说了几轮"手推出来的，
+    合成数据全过，接上真实流量就整个反了：她一条没漏被算成沉默 35%。
+    合成的库测的是"我以为她怎么工作"，这条测的是"她实际怎么工作"。
+
+    这里走完整条路——`on_user_message` → 排回复 → 模型 → `mark_read` →
+    真的投递——他连发、隔几小时再说、她有时不接。
+    然后拿 doctor 去数，跟真实发生的事对。
+    """
+    import random
+    from types import SimpleNamespace
+
+    from newperson.models import ReplyPart, ReplyPlan
+    from tests.test_integration import _OPEN, EVENING, build, drain
+
+    # 十二批：他一到三句连发，她接住其中八批
+    answers = [
+        ReplyPlan(parts=[ReplyPart(text="嗯"), ReplyPart(text="知道了")]) if i < 8
+        else ReplyPlan(parts=[])
+        for i in range(12)
+    ]
+    app, channel, _llm, clock, memory = await build(tmp_path, PERSONA, answers)
+    app._should_handle = lambda _m: True
+    app.client = SimpleNamespace(user=SimpleNamespace(id=999))
+    app._default_channel = channel
+    app._channels[555] = channel
+
+    rng = random.Random(5)
+    at = EVENING
+    for i in range(12):
+        for j in range(1 + i % 3):  # 他一轮里连发一到三句，中间隔几十分钟
+            clock.set(at)
+            await app.on_user_message(
+                SimpleNamespace(
+                    id=1000 + i * 10 + j,
+                    content=f"第 {i}-{j} 句",
+                    created_at=at,
+                    author=SimpleNamespace(id=42, display_name="Leo", bot=False),
+                    channel=SimpleNamespace(id=555),
+                    attachments=[],
+                )
+            )
+            at += timedelta(minutes=rng.choice([40, 55, 70]))
+        await drain(app, clock, hops=12)
+        at = clock.now() + timedelta(hours=rng.uniform(3, 9))
+
+    await memory.close()
+    _OPEN.remove(memory)
+
+    report = doctor.run(app.settings.db_path, clock.now() + timedelta(minutes=1), days=30)
+    silence = next(f for f in report.findings if "沉默" in f.line or "没接话" in f.line)
+    # 十二批接住八批 = 沉默 33%
+    assert "33%" in silence.line, f"真实跑出来是 8/12，体检说：{silence.line}\n{report.render()}"
+
+    opened = next((f for f in report.findings if "主动开口" in f.line), None)
+    assert opened is None or "0.0 次/天" in opened.line, (
+        f"她一次都没主动开口，体检却说：{opened.line if opened else ''}"
     )
