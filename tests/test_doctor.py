@@ -335,3 +335,38 @@ def test_it_stays_fast_with_a_lot_of_history(tmp_path: Path) -> None:
     started = time.monotonic()
     doctor.run(path, NOW, days=400)
     assert time.monotonic() - started < 5, "两万条任务跑太久了"
+
+
+def test_the_checkup_stays_quiet_when_she_is_healthy() -> None:
+    """**体检在她正常的时候不能报警。** 永远响的警报等于没有警报。
+
+    这里不造数据，用 `simulate` 真跑出来的回复延迟去喂规律性那一项——
+    也就是把这个项目里唯一的"她像不像人"判据，接到唯一的"她像不像人"检查上。
+    任何一次把延迟调窄的改动（提示词、参数、DELAY_SCALE 忘了关）
+    都会让这条先失败，而不是等到体检报告里出现一条谁也不敢信的 BAD。
+    """
+    import re
+    import subprocess
+    import sys
+
+    pattern = re.compile(r"（([\d.]+) (秒|分钟|小时)）\s*$")
+    per_minute = {"秒": 1 / 60, "分钟": 1.0, "小时": 60.0}
+    root = Path(__file__).resolve().parent.parent
+
+    for seed in (1, 2, 3):
+        out = subprocess.run(
+            [sys.executable, "-m", "newperson", "simulate", "--days", "60", "--seed", str(seed)],
+            capture_output=True, text=True, check=True, cwd=root,
+        ).stdout
+        gaps = [
+            float(m.group(1)) * per_minute[m.group(2)]
+            for line in out.splitlines()
+            if (m := pattern.search(line))
+        ]
+        assert len(gaps) > 150, f"种子 {seed} 只解析出 {len(gaps)} 条延迟，simulate 的输出格式变了？"
+
+        report = doctor.Report(days=60)
+        doctor.check_rhythm(report, gaps)
+        assert report.worst == doctor.OK, (
+            f"种子 {seed} 的正常作息被体检判成了 {report.worst}：\n{report.render()}"
+        )
