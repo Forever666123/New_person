@@ -55,6 +55,9 @@ CONVERSATION_ID = "owner"
 PHOTO_SHORTLIST = 20
 """进上下文的照片最多这么多条，免得库大了把提示词撑爆。"""
 
+CATCHUP_CURSOR = "catchup_cursor:"
+"""补抓的游标前缀，后面接频道 id。**一个频道一个**，见 _catch_up_channels。"""
+
 
 def time_of_day_at(dt: datetime) -> TimeOfDay:
     """给照片挑选用的时段。半夜不该发白天拍的照片。"""
@@ -325,10 +328,36 @@ class App:
         return user.dm_channel or await user.create_dm()
 
     async def _catch_up_channels(self, newest: int, page: int, max_pages: int) -> int:
+        """逐个频道往回翻。**每个频道各有各的游标。**
+
+        共用一个全局游标（库里最大的那个 discord_message_id）会永久丢消息：
+        私聊补抓成功、公开频道正好限流，游标就被私聊那条推了过去，
+        下次重连时公开频道从那个位置往后翻——中间他在公开频道说的话
+        **再也不会被翻到**。两个频道的编号各走各的，一个共用的高水位管不住它们。
+
+        而且游标只在**整条翻完**之后才推进。中途出错就停在原地，
+        下次从头再翻一遍；重复的那些 ``add_user_message`` 返回 0，不会重复排队。
+        """
         recovered = 0
-        last_channel_id: int | None = None
+        latest: tuple[datetime, int | None] | None = None
+        """他最后说话的时刻和地方。按时间取最大，**不是按遍历顺序取最后一个**——
+        私聊先翻、公开频道后翻的话，取遍历顺序会把他在私聊里说的最后一句
+        回到公开频道去。"""
+
         for channel in await self._inbound_channels():
-            cursor = newest
+            key = f"{CATCHUP_CURSOR}{getattr(channel, 'id', 0)}"
+            stored_cursor = await self.memory.kv_get(key)
+            if (stored_cursor or "").isdigit():
+                start = int(stored_cursor)
+            else:
+                # 第一次见到这个频道：**当场把基线钉住**，别等翻成功了才记。
+                # 不钉的话，这个频道只要一次没翻成（限流、权限没给全），
+                # 下次它的起点就变成了"全库最大编号"——而那个编号已经被
+                # 另一个频道推过去了，中间的消息就此永久跳过。
+                start = newest
+                await self.memory.kv_set(key, str(start))
+            cursor = start
+            complete = True
             for _ in range(max_pages):
                 try:
                     batch = [
@@ -339,6 +368,7 @@ class App:
                     ]
                 except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
                     log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
+                    complete = False
                     break
                 if not batch:
                     break
@@ -348,6 +378,7 @@ class App:
                         continue
                     if owner_cmds.is_command(message.content):
                         continue  # !np 是给程序看的，补抓时更不该执行
+                    at = message.created_at.astimezone(self.persona.tz)
                     stored = await self.memory.add_user_message(
                         IncomingMessage(
                             conversation_id=CONVERSATION_ID,
@@ -356,23 +387,27 @@ class App:
                             author_name=message.author.display_name,
                             content=message.content,
                             attachments=await self._download_images(message),
-                            created_at=message.created_at.astimezone(self.persona.tz),
+                            created_at=at,
                         )
                     )
                     if stored:
                         recovered += 1
-                        last_channel_id = getattr(message.channel, "id", None)
+                        if latest is None or at > latest[0]:
+                            latest = (at, getattr(message.channel, "id", None))
                 if len(batch) < page:
                     break
             else:
+                complete = False
                 log.error(
                     "[inbox] 补抓翻了 %d 页还没到底，剩下的这次补不了（下次重连继续）", max_pages
                 )
+            if complete and cursor > start:
+                await self.memory.kv_set(key, str(cursor))
 
         if recovered:
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
             # 回到他说话的那个地方，不是默认频道
-            await self._schedule_reply(self.clock.now(), channel_id=last_channel_id)
+            await self._schedule_reply(self.clock.now(), channel_id=latest[1] if latest else None)
         return recovered
 
     def _should_handle(self, message: discord.Message) -> bool:
@@ -458,17 +493,31 @@ class App:
         elif staleness > self.persona.timing.hot_seconds and heat == "hot":
             heat = "warm"
 
+        # 特征要按**整批未读**重新算，合并那条路上尤其重要。
+        features = extract_features(
+            [m.content for m in unread],
+            self.persona,
+            has_image=any(m.attachments for m in unread),
+        )
+
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
             # 他还在连着发，就等他说完再一起回，但不会无限等下去
             job = pending[0]
             new_at = self.attention.merge_pending(job.run_at, now, heat, self.rng)
-            # 并进已排的那条时，**目的地要跟着最新这条消息走**。
-            # 不更新的话，先前那条任务记的还是旧频道（或者根本没记），
-            # 于是他在私聊说的话会被回到公开频道去。
+            # 并进已排的那条时，payload 要跟着整批未读走：
+            #
+            # - **目的地**：不更新的话任务记的还是旧频道，他在私聊说的话会被回到公开频道去。
+            # - **is_question / mode**：原来只更新频道，这两个留着第一条消息算出来的。
+            #   "刚到家"后面接一句"你明天有空吗"，任务里还记着 is_question=False、
+            #   mode=None——于是那个问题按闲聊处理，该换的口吻也没换。
+            #   他连发的时候后一条往往才是正事，这一条恰好最常发生。
             payload = dict(job.payload)
-            if channel_id is not None and payload.get("channel_id") != channel_id:
-                payload["channel_id"] = channel_id
+            fresh = {"mode": features.mode, "is_question": features.is_question}
+            if channel_id is not None:
+                fresh["channel_id"] = channel_id
+            if any(payload.get(k) != v for k, v in fresh.items()):
+                payload.update(fresh)
                 await self.scheduler.reschedule(job.id or 0, new_at, payload)
             else:
                 await self.scheduler.reschedule(job.id or 0, new_at)
@@ -480,11 +529,6 @@ class App:
         elif heat == "cold":
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
-        features = extract_features(
-            [m.content for m in unread],
-            self.persona,
-            has_image=any(m.attachments for m in unread),
-        )
         decision = self.attention.plan_reply(
             now,
             heat,

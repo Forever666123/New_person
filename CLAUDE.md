@@ -7,7 +7,7 @@
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q                  # 239 个测试，不联网，10 秒跑完
+python -m pytest -q                  # 380 个测试，不联网，二十秒跑完
 ruff check newperson tests
 python -m newperson simulate --days 3   # 看作息和回复时机，不联网
 python -m newperson check                # 检查配置和人设
@@ -77,7 +77,9 @@ python -m newperson check                # 检查配置和人设
 | `life.py` | 每日日程、主动消息候选 |
 | `delivery.py` | 气泡、打字、发图、被打断 |
 | `owner.py` | `!np` 命令 |
-| `discord_bot.py` | Discord 适配与组合根 |
+| `discord_bot.py` | Discord 适配与组合根（含停机后补抓漏掉的消息）|
+| `backup.py` | 一致快照、完整性校验、上次备份的时间 |
+| `doctor.py` | 体检：**只读元数据，绝不碰聊天内容**，盯的是她变得有规律 |
 
 ## 加新东西的位置
 

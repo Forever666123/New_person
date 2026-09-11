@@ -1288,3 +1288,111 @@ async def test_a_broken_history_call_does_not_stop_her_starting(
 
     wire_inbound(app, Exploding())
     assert await app.catch_up() == 0
+
+
+async def test_the_reply_goes_to_where_he_spoke_last_not_where_we_looked_last(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓完排的那条回复，要回到他**最后说话**的地方。
+
+    两个频道是挨个翻的，而"最后遍历到的那条"和"他最后说的那条"不是一回事：
+    他先在公开频道说了一句、半小时后回私聊里说了最后一句，
+    翻的顺序却是私聊在前、公开频道在后。按遍历顺序取的话，
+    她会把私聊里那句话回到公开频道去——那是当着别人的面。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    public = FakeHistoryChannel(
+        [fake_incoming(101, "公开频道里的", EVENING + timedelta(minutes=5), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(102, "私聊里最后说的", EVENING + timedelta(minutes=30), channel_id=999)],
+        channel_id=999,
+    )
+    wire_inbound(app, dm, public)
+
+    assert await app.catch_up() == 2
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert job.payload.get("channel_id") == dm.id, (
+        f"回到了 {job.payload.get('channel_id')}，但他最后说话在私聊 {dm.id}"
+    )
+
+
+async def test_one_channel_failing_does_not_skip_the_other_forever(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """一个频道翻失败，不能把另一个频道的消息永久跳过。
+
+    两个频道原来共用一个游标——库里最大的那个 discord_message_id。
+    私聊补抓成功、公开频道正好限流的话，游标被私聊那条推了过去；
+    下次重连时公开频道从那个位置往后翻，中间他说的话**再也不会被翻到**。
+    这是最坏的一种 bug：消息进不了库，没有报错，没有任何症状，
+    你只会觉得她那天没理你。
+
+    所以每个频道各记各的游标，而且只在整条翻完之后才推进。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    class Flaky(FakeHistoryChannel):
+        boom = True
+
+        def history(self, **kw):
+            if Flaky.boom:
+                raise RuntimeError("429 限流")
+            return super().history(**kw)
+
+    public = Flaky(
+        [fake_incoming(101, "公开频道里漏掉的", EVENING + timedelta(minutes=5), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(102, "私聊里漏掉的", EVENING + timedelta(minutes=10), channel_id=999)],
+        channel_id=999,
+    )
+    wire_inbound(app, dm, public)
+
+    assert await app.catch_up() == 1, "私聊那条这次就该补回来"
+    Flaky.boom = False  # 限流过去了，下次重连再补
+    assert await app.catch_up() == 1, "公开频道那条要在下一次补回来"
+
+    ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert {101, 102} <= ids, f"少了：{ {101, 102} - ids}"
+
+
+async def test_a_question_sent_while_a_reply_is_pending_is_seen_as_a_question(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """并进已排的回复时，特征要按**整批未读**重新算。
+
+    原来合并那条路只更新目的地，`is_question` 和 `mode` 留着第一条消息算出来的。
+    "刚到家"后面接一句"你明天有空吗？"，任务里还记着 is_question=False，
+    于是那个问题按闲聊处理，该换的口吻也没换——
+    而他连发的时候，往往后一条才是正事。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "刚到家", at=EVENING, msg_id=100)
+    first = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert first.payload.get("is_question") is False, "前提不成立：第一条本来就被当成问句了"
+
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID,
+            discord_message_id=101,
+            author_id=42,
+            author_name="Leo",
+            content="你明天有空吗？帮我看下那个合同行不行？",
+            created_at=EVENING + timedelta(seconds=30),
+        )
+    )
+    await app._schedule_reply(EVENING + timedelta(seconds=30), channel_id=555)
+
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert job.id == first.id, "前提不成立：没有走合并那条路"
+    assert job.payload.get("is_question") is True, "他问了问题，但任务里还记着 is_question=False"
