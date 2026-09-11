@@ -104,9 +104,52 @@ def test_the_system_prompt_never_changes(persona: Persona) -> None:
     assert build_system(persona) == build_system(persona)
 
 
+def test_the_system_prompt_is_the_same_bytes_in_a_fresh_process() -> None:
+    """**字节级固定，跨进程也要一样。**
+
+    同一个进程里调两次相同，不能证明什么：真正会咬人的是那种
+    "重启之后变了一点点"的不确定性——遍历 set 的顺序、字典的插入顺序、
+    任何跟哈希种子有关的东西。稳定层只要差一个字节，prompt cache
+    就永远不命中，成本翻好几倍，而**账单之外没有任何症状**。
+
+    所以这里开两个子进程，给不同的 PYTHONHASHSEED，比字节。
+    """
+    import hashlib
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    code = (
+        "from pathlib import Path;"
+        "from newperson.persona import load_persona;"
+        "from newperson.prompts import build_system;"
+        "import sys;"
+        f"sys.stdout.write(build_system(load_persona(Path({str(root / 'persona' / 'persona.yaml')!r}))))"
+    )
+    digests = []
+    for seed in ("0", "1", "12345"):
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, check=True, cwd=root,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout
+        digests.append(hashlib.sha256(out).hexdigest())
+    assert len(set(digests)) == 1, f"换个哈希种子稳定层就变了：{digests}"
+
+
 def test_the_system_prompt_carries_no_clock(persona: Persona) -> None:
+    """稳定层里不能有今年、明年、或者任何钟点。
+
+    年份从当前时间算，不写死：写死的话这条测试会在某一年悄悄失效，
+    而失效的那天正是有人往稳定层里塞了 `datetime.now().year` 的那天。
+    """
+    from datetime import datetime
+
     text = build_system(persona)
-    for token in ("2026", "2027", "现在是", ":00"):
+    this_year = datetime.now().year
+    tokens = [str(this_year), str(this_year + 1), "现在是", ":00"]
+    for token in tokens:
         assert token not in text, f"稳定层里混进了 {token}"
 
 
