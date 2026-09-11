@@ -50,4 +50,10 @@ systemctl is-active --quiet "$SERVICE_NAME" || {
     exit 1
 }
 
+# 顺手体检一遍。**故意不让它决定退出码**：她刚起来，
+# 重启前那几条还没回的消息会让 doctor 判 BAD，而那不是这次更新的问题，
+# 一个会误报的收尾只会让你以后不敢看它。有事它自己会说出来。
+say "体检"
+"$PYTHON_BIN" -m newperson doctor 2>&1 | sed 's/^/    /' || true
+
 say "✓ 好了。看日志：journalctl -u $SERVICE_NAME -f"
