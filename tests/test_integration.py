@@ -1865,3 +1865,35 @@ async def test_a_hanging_image_download_does_not_stall_the_catch_up(
     stored = await memory.unread_messages(CONVERSATION_ID)
     assert any(m.discord_message_id == 101 for m in stored)
     assert await memory.pending_jobs("reply", CONVERSATION_ID), "补回来了却没人排回复"
+
+
+async def test_np_status_says_it_out_loud_when_she_is_actually_stuck(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """有未读、又没有排着的回复——这是"她坏了"唯一说得清的样子，要写出来。
+
+    `!np status` 原来把"未读 N 条"和"没有排着的任务"分两行列着，
+    得他自己把两行对起来看。而她隔二十分钟才回本来就是设计好的，
+    从外面看"正常"和"卡住了"一模一样，唯一分得开的就是这个组合。
+    """
+    from newperson import owner as owner_cmds
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    ctx = owner_cmds.OwnerContext(
+        memory=memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=EVENING,
+    )
+    await send(app, "在吗", at=EVENING, msg_id=100)
+    assert "卡住" not in await owner_cmds.handle("!np status", ctx), "排着回复的时候不该说卡住"
+
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "cancelled", "模拟丢了", at=EVENING)
+    assert "卡住" in await owner_cmds.handle("!np status", ctx), "真卡住了却一声不吭"
+
+    # 暂停期间未读堆着是他自己要求的，不算卡住
+    await memory.kv_set("paused", "1")
+    assert "卡住" not in await owner_cmds.handle("!np status", ctx)

@@ -95,8 +95,13 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
     )
 
     unread = await ctx.memory.unread_messages(ctx.conversation_id)
+    pending_reply = await ctx.memory.pending_jobs("reply", ctx.conversation_id)
     if unread:
         lines.append(f"未读 {len(unread)} 条，最早一条 {unread[0].created_at.strftime('%m-%d %H:%M')}")
+        if not pending_reply and not await ctx.memory.kv_get("paused"):
+            # "有未读"和"没有排着的回复"分开写的话，得你自己把两行对起来看——
+            # 而这正是"她坏了"唯一说得清的样子。说出来。
+            lines.append("**这些没人排回复**：她不是在等时间，是真的卡住了")
 
     # 重试用尽的任务会变成 failed，而 pending_jobs 只查 pending，
     # 于是它从所有你看得见的地方消失：消息还挂在未读里、她永远不会回，
