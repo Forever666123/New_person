@@ -51,6 +51,8 @@ from .scheduler import Scheduler
 log = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+IMAGE_DOWNLOAD_TIMEOUT = 20.0
+"""下一张图最多等这么久（秒）。见 _download_images 里为什么不能不设。"""
 CONVERSATION_ID = "owner"
 PHOTO_SHORTLIST = 20
 """进上下文的照片最多这么多条，免得库大了把提示词撑爆。"""
@@ -682,7 +684,12 @@ class App:
                 target = self.settings.downloads_dir / f"{message.id}-{safe}"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    await att.save(target)
+                    # **必须有超时。** aiohttp 默认等 300 秒，而这段代码
+                    # 在补抓的循环里：一千条消息里有几张图卡住，补抓就停在那儿，
+                    # 她一条都不会回，而日志里什么都看不出来。
+                    # 下不下来就当没这张图——她照样回，只是看不见图。
+                    async with asyncio.timeout(IMAGE_DOWNLOAD_TIMEOUT):
+                        await att.save(target)
                     item.local_path = str(target)
                 except Exception as exc:  # noqa: BLE001 - 下不下来就当没这张图
                     log.warning("[inbox] 图片没存下来：%s", exc)

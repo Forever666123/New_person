@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import random
 from datetime import datetime, timedelta
@@ -1821,3 +1822,46 @@ async def test_catching_up_out_of_id_order_does_not_fake_a_cold_conversation(
     assert "cold" not in job.reason, (
         f"他两分钟前还在说话，却被判成冷了：{job.reason}"
     )
+
+
+async def test_a_hanging_image_download_does_not_stall_the_catch_up(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """一张下不动的图不能把整个补抓卡死。
+
+    aiohttp 默认等 300 秒，而这段代码在补抓的循环里：
+    停机期间他发的几百条里有几张图卡住，补抓就停在那儿，
+    她一条都不会回，而日志里什么都看不出来。
+    下不下来就当没这张图——她照样回，只是看不见图。
+    """
+    import newperson.discord_bot as db
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done", at=EVENING)
+
+    class Hanging:
+        url = "https://cdn.example/x.png"
+        filename = "x.png"
+        content_type = "image/png"
+        size = 1024
+
+        async def save(self, _target):
+            await asyncio.sleep(3600)  # 永远下不完
+
+    incoming = fake_incoming(101, "看这个", EVENING + timedelta(minutes=5), channel_id=999)
+    incoming.attachments = [Hanging()]
+    wire_inbound(app, FakeHistoryChannel([incoming], channel_id=999))
+
+    original = db.IMAGE_DOWNLOAD_TIMEOUT
+    db.IMAGE_DOWNLOAD_TIMEOUT = 0.05
+    try:
+        recovered = await asyncio.wait_for(app.catch_up(), timeout=5)
+    finally:
+        db.IMAGE_DOWNLOAD_TIMEOUT = original
+
+    assert recovered == 1, "那条消息本身要补回来，只是没有图"
+    stored = await memory.unread_messages(CONVERSATION_ID)
+    assert any(m.discord_message_id == 101 for m in stored)
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "补回来了却没人排回复"
