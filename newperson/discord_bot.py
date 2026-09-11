@@ -379,17 +379,27 @@ class App:
                     if owner_cmds.is_command(message.content):
                         continue  # !np 是给程序看的，补抓时更不该执行
                     at = message.created_at.astimezone(self.persona.tz)
-                    stored = await self.memory.add_user_message(
-                        IncomingMessage(
-                            conversation_id=CONVERSATION_ID,
-                            discord_message_id=message.id,
-                            author_id=message.author.id,
-                            author_name=message.author.display_name,
-                            content=message.content,
-                            attachments=await self._download_images(message),
-                            created_at=at,
+                    # **一条处理不了不能连累整批。** 下附件要联网、要写盘，
+                    # 磁盘满了或者 aiohttp 抛一下就够了。往外抛的后果不是少补几条：
+                    # 前面几条已经进库，而函数在排回复之前退出，没人给它们排；
+                    # 下次重连全是重复（返回 0），recovered 还是 0，还是没人排。
+                    # 那些话就永远躺在库里没人回。
+                    try:
+                        stored = await self.memory.add_user_message(
+                            IncomingMessage(
+                                conversation_id=CONVERSATION_ID,
+                                discord_message_id=message.id,
+                                author_id=message.author.id,
+                                author_name=message.author.display_name,
+                                content=message.content,
+                                attachments=await self._download_images(message),
+                                created_at=at,
+                            )
                         )
-                    )
+                    except Exception:  # noqa: BLE001 - 单条失败，跳过它，别停下
+                        log.warning("[inbox] 补抓时这条处理不了，跳过 %s", message.id, exc_info=True)
+                        complete = False  # 这一条没补成，游标不能推过它
+                        continue
                     if stored:
                         recovered += 1
                         if latest is None or at > latest[0]:
@@ -408,6 +418,14 @@ class App:
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
             # 回到他说话的那个地方，不是默认频道
             await self._schedule_reply(self.clock.now(), channel_id=latest[1] if latest else None)
+        elif await self.memory.unread_messages(CONVERSATION_ID) and not await self.memory.pending_jobs(
+            "reply", CONVERSATION_ID
+        ):
+            # 上一轮补抓半途出了事：消息已经进库，那一轮却没走到排回复这一步。
+            # 这一轮它们全是重复，recovered 是 0——光看 recovered 的话，
+            # 永远没人给它们排，那些话就永远没人回。
+            log.warning("[inbox] 有未读却没有排着的回复，补排一条")
+            await self._schedule_reply(self.clock.now())
         return recovered
 
     def _should_handle(self, message: discord.Message) -> bool:

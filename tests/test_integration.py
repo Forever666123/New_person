@@ -1396,3 +1396,79 @@ async def test_a_question_sent_while_a_reply_is_pending_is_seen_as_a_question(
     job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
     assert job.id == first.id, "前提不成立：没有走合并那条路"
     assert job.payload.get("is_question") is True, "他问了问题，但任务里还记着 is_question=False"
+
+
+async def test_one_bad_attachment_does_not_swallow_the_whole_catch_up(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓时某一条处理不了，剩下的还要补回来，而且**必须排上回复**。
+
+    逐条处理那段（下附件、入库）原来在 try 外面。`_download_images` 要下载、
+    要写盘，磁盘满了或者 aiohttp 抛一下就把整个补抓炸掉——
+
+    而炸掉的后果不是"少补几条"：前面几条**已经进库了**，
+    但函数是在排回复之前退出的，所以没人给它们排。下次重连再补抓时，
+    那几条全是重复（add_user_message 返回 0），recovered 还是 0，
+    还是没人排——那些话就永远躺在库里，她永远不会回。
+    这正是"消息不能凭空消失"那条不变量要挡的事。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    calls = {"n": 0}
+    original = app._download_images
+
+    async def flaky(message):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("[Errno 28] No space left on device")
+        return await original(message)
+
+    app._download_images = flaky
+    dm = FakeHistoryChannel(
+        [
+            fake_incoming(101 + i, f"第 {i} 句", EVENING + timedelta(minutes=i), channel_id=999)
+            for i in range(3)
+        ],
+        channel_id=999,
+    )
+    wire_inbound(app, dm)
+
+    await app.catch_up()  # 不能往外抛
+
+    ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert {101, 103} <= ids, f"坏的那条不该连累别的：{sorted(ids)}"
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "补回来了却没人排回复，她永远不会回"
+
+
+async def test_messages_left_unanswered_by_a_crashed_catch_up_get_a_reply_later(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """上一轮补抓中途没走完，下一轮要把没排上的回复补排。
+
+    重复的消息 add_user_message 返回 0，所以下一轮的 recovered 是 0——
+    光看 recovered 的话，永远没人给它们排回复。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    # 模拟上一轮的残局：消息进库了，但没有排着的回复
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID,
+            discord_message_id=101,
+            author_id=42,
+            author_name="Leo",
+            content="上一轮补进来但没排上的",
+            created_at=EVENING + timedelta(minutes=5),
+        )
+    )
+    assert not await memory.pending_jobs("reply", CONVERSATION_ID)
+
+    wire_inbound(app, FakeHistoryChannel([], channel_id=999))
+    assert await app.catch_up() == 0, "这一轮确实什么都没补到"
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "躺在库里的那条没人管了"
