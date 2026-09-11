@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL,
     read_at TEXT,
     edited_at TEXT,
-    deleted INTEGER NOT NULL DEFAULT 0
+    deleted INTEGER NOT NULL DEFAULT 0,
+    reply_batch TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(conversation_id, read_at);
@@ -195,6 +196,10 @@ class Memory:
             # 任务**真的执行完**是几点。`run_at` 记的是排期时刻，
             # 崩溃恢复之后那两个数差着几小时，而体检要看的恰恰是"一堆事挤在同一分钟发生"。
             "jobs": {"finished_at": "TEXT"},
+            # 她这条消息在回哪一批未读（存那一批的 read_at）。主动开口是 NULL。
+            # 体检靠它把"回复"和"主动开口"分开——**不能靠时间去猜**，
+            # 靠时间猜过两轮，两轮都把真实流量算反了。
+            "messages": {"reply_batch": "TEXT"},
         }
         for table, columns in wanted.items():
             cur = await self._db.execute(f"PRAGMA table_info({table})")
@@ -203,6 +208,17 @@ class Memory:
                 if name not in have:
                     log.info("[db] 给 %s 补上 %s 列", table, name)
                     await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                    if (table, name) == ("messages", "reply_batch"):
+                        # **记下分界线。** 这条线之前的消息没有批次信息，
+                        # 分不出哪句是回复、哪句是主动开口。体检必须把那一段排除掉，
+                        # 否则她过去所有的回复都会被当成主动开口。
+                        # 靠数据自己猜是猜不准的：一个只主动开口、从没回过话的库，
+                        # 和一个迁移前的老库长得一模一样。
+                        await self._db.execute(
+                            "INSERT OR REPLACE INTO kv (key, value)"
+                            " SELECT 'reply_batch_since', COALESCE(MAX(created_at), '')"
+                            " FROM messages"
+                        )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -274,20 +290,30 @@ class Memory:
         created_at: datetime,
         discord_message_id: int | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        reply_batch: datetime | None = None,
     ) -> int:
+        """存一条她说的话。
+
+        ``reply_batch`` 是她在回的那一批未读的 ``read_at``；主动开口传 None。
+        体检靠它把"回复"和"主动开口"分开——**不能靠时间去猜**：
+        猜过两轮，两轮都把真实流量算反了（一次是把他的连发切成多轮，
+        一次是把她两次独立的回复并成一次）。
+        """
         await self.get_conversation(conversation_id)
         # 用 OR IGNORE：消息已经真的发到对方手机上了，这里再因为主键冲突抛异常
         # 会让整个回复任务失败重试，后面的日记、台账、跟进全部跳过。
         cur = await self.db.execute(
             "INSERT OR IGNORE INTO messages"
-            " (conversation_id, discord_message_id, author_kind, content, attachments_json, created_at)"
-            " VALUES (?, ?, 'bot', ?, ?, ?)",
+            " (conversation_id, discord_message_id, author_kind, content, attachments_json,"
+            "  created_at, reply_batch)"
+            " VALUES (?, ?, 'bot', ?, ?, ?, ?)",
             (
                 conversation_id,
                 discord_message_id,
                 content,
                 json.dumps(attachments or [], ensure_ascii=False),
                 created_at.isoformat(),
+                reply_batch.isoformat() if reply_batch else None,
             ),
         )
         await self.db.execute(

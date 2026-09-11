@@ -42,13 +42,23 @@ def say(conn: sqlite3.Connection, at: datetime, read_at: datetime | None = None)
     )
 
 
-def she_says(conn: sqlite3.Connection, at: datetime, bubbles: int = 1) -> None:
-    """她说一次话。几个气泡共用同一个时刻，线上就是这么记的。"""
+def she_says(
+    conn: sqlite3.Connection,
+    at: datetime,
+    bubbles: int = 1,
+    batch: datetime | None = None,
+) -> None:
+    """她说一次话。几个气泡共用同一个时刻，线上就是这么记的。
+
+    ``batch`` 是她在回的那一批的 ``read_at``；**不传就是主动开口**。
+    线上由 `_record_sent` 写进 `reply_batch` 列，体检靠它分回复和主动，
+    不靠时间去猜——猜过两轮，两轮都把真实流量算反了。
+    """
     for _ in range(bubbles):
         conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-            " VALUES ('dm','bot','她说的话',?)",
-            (at.isoformat(),),
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at, reply_batch)"
+            " VALUES ('dm','bot','她说的话',?,?)",
+            (at.isoformat(), batch.isoformat() if batch else None),
         )
 
 
@@ -62,7 +72,7 @@ def make_db(path: Path, gaps: list[float], seed: int = 1) -> Path:
         spoke = at
         at += timedelta(minutes=gap)
         say(conn, spoke, read_at=at)
-        she_says(conn, at)
+        she_says(conn, at, batch=at)
         at += timedelta(hours=rng.uniform(2, 20))
     conn.commit()
     conn.close()
@@ -321,7 +331,7 @@ def test_silence_is_counted_per_batch_she_processed(tmp_path: Path) -> None:
         for one in spoke:
             say(conn, one, read_at=read_at)
         if i < 12:
-            she_says(conn, read_at, bubbles=1 + i % 3)
+            she_says(conn, read_at, bubbles=1 + i % 3, batch=read_at)
         at = read_at + timedelta(hours=4)
     conn.commit()
     conn.close()
@@ -347,7 +357,7 @@ def test_answering_every_batch_is_flagged_even_when_he_spreads_it_over_hours(
         read_at = spoke[-1] + timedelta(minutes=12)
         for one in spoke:
             say(conn, one, read_at=read_at)
-        she_says(conn, read_at, bubbles=2)
+        she_says(conn, read_at, bubbles=2, batch=read_at)
         at = read_at + timedelta(hours=5)
     conn.commit()
     conn.close()
@@ -658,7 +668,7 @@ def test_speaking_up_soon_after_her_own_reply_still_counts_as_speaking_up(
     for _ in range(10):
         read_at = at + timedelta(minutes=20)
         say(conn, at, read_at=read_at)
-        she_says(conn, read_at, bubbles=2)
+        she_says(conn, read_at, bubbles=2, batch=read_at)
         she_says(conn, read_at + timedelta(minutes=5))  # 隔五分钟她自己又开口
         at = read_at + timedelta(hours=8)
     conn.commit()
@@ -840,3 +850,88 @@ async def test_the_counters_match_what_the_real_app_actually_did(tmp_path: Path)
     assert opened is None or "0.0 次/天" in opened.line, (
         f"她一次都没主动开口，体检却说：{opened.line if opened else ''}"
     )
+
+
+async def test_a_fast_back_and_forth_is_not_reported_as_silence(tmp_path: Path) -> None:
+    """热聊时她两次回复天然挨得很近，**不能把它们并成一次**。
+
+    上一版按三分钟的间隔把她的气泡聚成"一轮"。可一次投递的每个气泡在库里
+    是同一个时刻，那个间隔唯一能做的事就是把两次**独立的**回复并掉——
+    而人设里 `hot_reply_median_seconds` 是 75 秒。
+    实测：十二轮全接住的对话被报成"没接话 83%"。
+
+    这条走完整条路：他在她回完二十秒后就接话，她一条没漏。
+    """
+    from types import SimpleNamespace
+
+    from newperson.models import ReplyPart, ReplyPlan
+    from tests.test_integration import _OPEN, EVENING, build, drain
+
+    answers = [ReplyPlan(parts=[ReplyPart(text="嗯"), ReplyPart(text="在的")]) for _ in range(12)]
+    app, channel, _llm, clock, memory = await build(tmp_path, PERSONA, answers)
+    app._should_handle = lambda _m: True
+    app.client = SimpleNamespace(user=SimpleNamespace(id=999))
+    app._default_channel = channel
+    app._channels[555] = channel
+
+    at = EVENING
+    for i in range(12):
+        clock.set(at)
+        await app.on_user_message(
+            SimpleNamespace(
+                id=2000 + i,
+                content=f"第 {i} 句",
+                created_at=at,
+                author=SimpleNamespace(id=42, display_name="Leo", bot=False),
+                channel=SimpleNamespace(id=555),
+                attachments=[],
+            )
+        )
+        await drain(app, clock, hops=12)
+        at = clock.now() + timedelta(seconds=20)  # 她回完二十秒他就接话
+
+    await memory.close()
+    _OPEN.remove(memory)
+
+    report = doctor.run(app.settings.db_path, clock.now() + timedelta(minutes=1), days=30)
+    finding = next(f for f in report.findings if "沉默" in f.line or "没接话" in f.line)
+    assert "有问必答" in finding.line, f"她十二轮全接住了，体检说：{finding.line}"
+
+
+async def test_an_old_database_is_not_read_as_her_talking_to_herself(
+    tmp_path: Path,
+) -> None:
+    """迁移之前的消息分不出回复和主动开口，那一段要排除掉。
+
+    不排的话，她过去所有的回复都会被当成主动开口——刚更新完那天，
+    体检会说她天天在自说自话。而"她是不是变黏了"正是这一项要回答的问题。
+    """
+    from newperson.memory import SCHEMA as REAL
+    from newperson.memory import Memory
+
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(REAL.replace(",\n    reply_batch TEXT\n", "\n"))
+    at = NOW - timedelta(days=10)
+    for _ in range(20):  # 二十轮老对话，全都没有批次信息（那一列还不存在）
+        read_at = at + timedelta(minutes=15)
+        say(conn, at, read_at=read_at)
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+            " VALUES ('dm','bot','她说的话',?)",
+            (read_at.isoformat(),),
+        )
+        at += timedelta(hours=8)
+    conn.commit()
+    conn.close()
+
+    memory = Memory(path)
+    await memory.open()  # 迁移：加列，并记下分界线
+    await memory.close()
+
+    report = doctor.run(path, NOW, days=14)
+    opened = next((f for f in report.findings if "主动开口" in f.line), None)
+    assert opened is None or "0.0 次/天" in opened.line, (
+        f"老数据被当成她在自说自话：{opened.line if opened else ''}\n{report.render()}"
+    )
+    assert not [f for f in report.findings if "沉默" in f.line], "老数据段不该报沉默比例"

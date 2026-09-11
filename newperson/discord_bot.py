@@ -869,6 +869,13 @@ class App:
         self, job: Job, plan, unread: list, now: datetime, start_index: int, covers: int
     ) -> None:
         channel_id = job.payload.get("channel_id")
+        # 这一批的身份：一批一个 read_at（mark_read 一批一条 UPDATE）。
+        #
+        # 头一次发的时候这些 StoredMessage 是在 `mark_read` **之前**取出来的，
+        # 它们手里的 read_at 还是 None——所以退回 `now`，而那正是
+        # `mark_read` 刚写进去的那个值。续发那条路上消息是从库里重新读的，
+        # read_at 有了，而 `now` 和它差着几分钟到几小时，所以不能拿 `now` 顶。
+        batch = max((m.read_at for m in unread if m.read_at), default=now)
         channel = await self.resolve_channel(channel_id)
         photo = await self._resolve_photo(plan.photo_request, now)
         react_to = (
@@ -904,16 +911,16 @@ class App:
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
-            await self._record_sent(blocked.result, now)
+            await self._record_sent(blocked.result, now, batch)
             return
         except Exception as exc:
             # 网络断在中间时，前几条其实已经到对方手机上了。不记下来的话
             # 她自己的历史里就少一截，重试续发会重复或者前后矛盾。
             if partial := getattr(exc, "delivery_result", None):
-                await self._record_sent(partial, now)
+                await self._record_sent(partial, now, batch)
             raise
 
-        await self._record_sent(result, now)
+        await self._record_sent(result, now, batch)
         if result.sent_texts or result.photo_sent:
             # 发得出去就把"发不出去"这个判断收回来。
             # 不收的话，一次 403（你临时退了共同服务器、关了私信）之后
@@ -939,7 +946,14 @@ class App:
             log.debug("[delivery] 取不到消息 %s：%r", message_id, exc)
             return None
 
-    async def _record_sent(self, result, now: datetime) -> None:
+    async def _record_sent(
+        self, result, now: datetime, reply_batch: datetime | None = None
+    ) -> None:
+        """把她真发出去的每一条记下来。
+
+        ``reply_batch`` 是她在回的那一批未读的 ``read_at``；主动开口传 None。
+        体检靠它分"回复"和"主动开口"——**不能靠时间去猜**。
+        """
         for i, text in enumerate(result.sent_texts):
             await self.memory.add_bot_message(
                 CONVERSATION_ID,
@@ -948,6 +962,7 @@ class App:
                 discord_message_id=result.sent_message_ids[i]
                 if i < len(result.sent_message_ids)
                 else None,
+                reply_batch=reply_batch,
             )
         if result.photo_sent and result.photo_sent.photo_id:
             await self.memory.mark_photo_used(

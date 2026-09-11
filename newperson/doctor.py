@@ -216,73 +216,68 @@ def check_rhythm(report: Report, gaps: list[float]) -> None:
         report.add(OK, "回复间隔够散", shape)
 
 
-ANSWER_WINDOW = timedelta(minutes=5)
-"""她处理完一批未读之后，多久之内说出来的话算"回这一批"。
-
-`mark_read` 和她那几条消息用的是同一个时刻（见 discord_bot 里的
-``handle_reply_job`` 和 ``_record_sent``），所以正常情况下这个差是 0。
-留五分钟是给以后留的余地，不是给"隔了一会儿又想起来"留的。
-"""
-
-RUN_GAP = timedelta(minutes=3)
-"""她一次说话分成的几个气泡算一轮；隔得比这久就是另一次开口。"""
-
-
 def _batches_and_runs(
     conn: sqlite3.Connection, since: datetime
-) -> tuple[list[datetime], list[datetime]]:
-    """``(她处理过的每一批未读, 她开口说话的每一轮)``。
+) -> tuple[list[datetime], int, datetime | None]:
+    """``(她处理过的每一批未读, 她主动开口的次数, 从什么时候起数得准)``。
 
-    **不能按"他说了几轮"去数。** 她是把整批未读并成一次回复的——
-    那正是这个项目的设计。他隔两小时说的三句话，只要她还没回，
-    就是同一批，她回一次就是全接住了。按"他每隔多久算新一轮"去切，
-    每隔一段就凭空多出一个"没接话"：实测她一条都没漏的十四天，
-    被算成沉默 35%；而他在悉尼、她在波士顿，他白天说的话正落在她睡觉的时候，
-    这种间隔是常态不是边角。
+    **不靠时间去猜哪句话在回哪一批。** 猜过两轮，两轮都把真实流量算反了：
 
-    所以用库里现成的那个信号：``read_at``。它是 ``mark_read`` 那一刻，
-    也就是"她真的处理过这批"——一批一个值，和她的回复同一个时刻。
+    - 第一轮按"他隔多久算新一轮"切他那一侧。可她是把整批未读并成一次回复的——
+      他隔两小时说的三句，只要她还没回就是同一批。她一条没漏的十四天
+      被算成沉默 35%。
+    - 第二轮改对了他那一侧，却在她那一侧犯了同样的错：按间隔把她的气泡聚成轮。
+      而一次投递的每个气泡在库里是同一个时刻，那个间隔唯一能做的事
+      就是把**两次独立的回复**并掉。热聊时她两次回复之间天然不到三分钟，
+      于是 12 轮全接住的对话被报成"没接话 83%"。
 
-    批次按 ``read_at`` 落在窗口里算，不按他什么时候说的：
-    窗口开头那批他可能是前一天说的，但她是在窗口里处理的。
+    所以现在不猜了：她每条消息上记着自己在回哪一批（``reply_batch``，
+    存的是那一批的 ``read_at``），主动开口是 NULL。一批一轮直接对上。
+
+    第三个返回值是这次实际从什么时候起算的。``reply_batch`` 是后加的列，
+    更早的消息全是 NULL，分不出回复和主动——那一段要排除掉，
+    否则她过去的每一次回复都会被算成主动开口。
     """
+    # 分界线是**迁移那一刻记下来的**，不是从数据里猜的：一个只主动开口、
+    # 从没回过话的库，和一个迁移之前的老库，在数据上长得一模一样。
+    row = _rows(conn, "SELECT value FROM kv WHERE key = 'reply_batch_since'")
+    raw = str(row[0]["value"] or "") if row else ""
+    boundary = _parse(raw) if raw else None
+    # 没有这条 kv 就是建库时本来就带着这一列，整段都记得准。
+    # 加一微秒：分界线那条消息**自己**也是迁移之前的，要排除在外。
+    floor = max(since, boundary + timedelta(microseconds=1)) if boundary else since
+
     rows = _rows(
         conn,
         "SELECT read_at FROM messages WHERE author_kind = 'user'"
         " AND read_at IS NOT NULL AND read_at >= ? AND deleted = 0",
-        (since.isoformat(),),
+        (floor.isoformat(),),
     )
     batches = sorted({t for t in (_parse(r["read_at"]) for r in rows) if t is not None})
 
-    starts: list[datetime] = []
-    last: datetime | None = None
-    for kind, at in _timeline(conn, since):
-        if kind == "user":
-            continue
-        if last is None or at - last > RUN_GAP:
-            starts.append(at)
-        last = at
-    return batches, starts
+    # 主动开口：她的消息里没有批次的那些，按**确切时刻**聚成一次。
+    # 一次投递的所有气泡共用一个 created_at，所以确切相等就够了，不用猜间隔。
+    rows = _rows(
+        conn,
+        "SELECT created_at FROM messages WHERE author_kind != 'user'"
+        " AND reply_batch IS NULL AND created_at >= ? AND deleted = 0",
+        (floor.isoformat(),),
+    )
+    opened = len({r["created_at"] for r in rows})
+    return batches, opened, floor
 
 
-def _match(batches: list[datetime], runs: list[datetime]) -> tuple[int, int]:
-    """``(接住的批数, 她自己开口的轮数)``。
-
-    一批最多认领她的一轮，而且只认领紧跟其后的那一轮。
-    "紧跟其后"是关键：她回完他之后隔五分钟又自己开口，那是**两件事**，
-    第二件是主动开口。只看"上一条是不是也是她说的"会把它整个吞掉。
-    """
-    claimed: set[int] = set()
-    answered = 0
-    cursor = 0
-    for batch in batches:
-        while cursor < len(runs) and runs[cursor] < batch:
-            cursor += 1
-        if cursor < len(runs) and runs[cursor] <= batch + ANSWER_WINDOW:
-            claimed.add(cursor)
-            answered += 1
-            cursor += 1
-    return answered, len(runs) - len(claimed)
+def _answered(conn: sqlite3.Connection, batches: list[datetime]) -> int:
+    """这些批里有多少批她真的说了话。"""
+    if not batches:
+        return 0
+    rows = _rows(
+        conn,
+        "SELECT DISTINCT reply_batch FROM messages WHERE author_kind != 'user'"
+        " AND reply_batch IS NOT NULL AND deleted = 0",
+    )
+    done = {t for t in (_parse(r["reply_batch"]) for r in rows) if t is not None}
+    return sum(1 for b in batches if b in done)
 
 
 def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
@@ -291,11 +286,10 @@ def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> 
     一次都不沉默，说明"有问必答"——那是助手，不是人。
     但沉默太多也不对，多半是模型在判"这条不用回"。
     """
-    batches, runs = _batches_and_runs(conn, since)
+    batches, _opened, _floor = _batches_and_runs(conn, since)
     if len(batches) < 10:
         return
-    answered, _opened = _match(batches, runs)
-    ratio = max(0.0, 1 - answered / len(batches))
+    ratio = max(0.0, 1 - _answered(conn, batches) / len(batches))
     if ratio > 0.5:
         report.add(WARN, f"她看了却没接话的比例 {ratio:.0%}，偏高", "多半是模型老在判'这条不用回'")
     elif ratio < 0.05:
@@ -321,9 +315,12 @@ def check_proactive(
     六个什么都没发的任务会被报成"她开口了 6 次"。
     真正的"她主动开口"是她说的话里，**没有在接他哪一批未读**的那些轮。
     """
-    batches, runs = _batches_and_runs(conn, since)
-    _answered, opened = _match(batches, runs)
-    per_day = opened / max(report.days, 1)
+    _batches, opened, floor = _batches_and_runs(conn, since)
+    # 窗口被分界线截短时按截短之后的天数算，否则刚更新完那几天分母偏大，
+    # 什么都显得不黏。用小数天，不然会差出一整天来。
+    now = since + timedelta(days=report.days)
+    days = max((now - floor).total_seconds() / 86400, 1.0)
+    per_day = opened / days
 
     # 口味只看任务表。`follow_up` 也算：她说"我查完告诉你"排的就是这种，
     # 而且它**没有每天的上限**，"她变成一份待办清单"最可能就从这条路来。
