@@ -1342,7 +1342,7 @@ def build_app(
     attention = AttentionPolicy(persona, rhythm, settings.delay_scale)
     memory = Memory(settings.db_path)
     scheduler = Scheduler(memory, clock, settings.delay_scale, rng)
-    brain = Brain(llm_client or build_client(settings), settings, persona, memory)
+    brain = Brain(llm_client or build_client(settings), settings, persona, memory, clock)
 
     library = PhotoLibrary(settings.photos_index)
     library.load()

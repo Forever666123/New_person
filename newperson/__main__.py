@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .attention import AttentionPolicy, extract_features, heat_of
 from .calendar import AcademicCalendar
+from .clock import RealClock
 from .config import Settings, load_settings
 from .persona import Persona, load_persona, validate_persona
 from .rhythm import Rhythm
@@ -361,10 +362,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
         memory = Memory(settings.db_path)
         await memory.open()
         try:
-            now = datetime.now(tz=persona.tz)
+            clock = RealClock(persona.tz)
+            now = clock.now()
             day = rhythm.local_date(now)
             daily = rhythm.for_day(day)
-            brain = Brain(build_client(settings), settings, persona, memory)
+            brain = Brain(build_client(settings), settings, persona, memory, clock)
             plan = await brain.generate_day_plan(
                 DayPlanRequest(
                     now=now,

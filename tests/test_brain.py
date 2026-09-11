@@ -653,3 +653,26 @@ def test_log_timestamps_follow_her_timezone_not_the_servers() -> None:
     assert stamp.group(1) == datetime.now(boston).strftime("%m-%d %H:%M")
     # 波士顿跟 UTC 从来不是同一个偏移，所以这条能真的分辨出用的是哪个时区
     assert stamp.group(1) != datetime.now(UTC).strftime("%m-%d %H:%M")
+
+
+async def test_the_api_error_timestamp_comes_from_the_clock(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """接口报错的时间戳要走 Clock，不能裸调 datetime.now()。
+
+    体检靠这个戳分"半年前那次抖动"和"此刻密钥失效了"——
+    一个是看看就行，一个是退出码 1。裸调的话测试没法把时钟拨过去验它。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from newperson.clock import FakeClock
+
+    frozen = datetime(2026, 3, 14, 9, 26, tzinfo=ZoneInfo("America/New_York"))
+    brain = Brain(
+        fake_client(RuntimeError("连不上")), settings(tmp_path), persona, memory, FakeClock(frozen)
+    )
+    assert await brain.generate_reply(reply_request(), TODAY) is None
+
+    stamp, _, _ = (await memory.kv_get("last_api_error")).partition("\t")
+    assert datetime.fromisoformat(stamp) == frozen, f"戳的是 {stamp}，不是时钟上的时间"

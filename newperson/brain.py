@@ -22,6 +22,7 @@ import anthropic
 from pydantic import BaseModel
 
 from . import style_guard
+from .clock import Clock
 from .config import Settings
 from .memory import Memory
 from .models import (
@@ -136,11 +137,15 @@ class Brain:
         settings: Settings,
         persona: Persona,
         memory: Memory | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self.client = client
         self.settings = settings
         self.persona = persona
         self.memory = memory
+        self.clock = clock
+        """只用来给接口报错打时间戳。项目里不裸调 datetime.now()，
+        测试要把时钟拨到任意时刻才能验"这个错是几小时前的"。"""
         self._system = build_system(persona)
 
     # -- 稳定层 -------------------------------------------------------------
@@ -285,7 +290,8 @@ class Brain:
         你分不出它是三周前的一次网络抖动，还是刚刚密钥失效了。
         """
         if self.memory is not None:
-            stamp = datetime.now(UTC).isoformat(timespec="seconds")
+            now = self.clock.now() if self.clock else datetime.now(UTC)
+            stamp = now.isoformat(timespec="seconds")
             await self.memory.kv_set("last_api_error", f"{stamp}\t{detail}")
 
     async def _clear_error(self) -> None:

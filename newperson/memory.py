@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -931,8 +931,10 @@ class Memory:
         `run_at` 是排期时刻，崩溃恢复之后它和实际执行时刻差着几小时，
         而体检要看的恰恰是"一堆事挤在同一分钟发生"——那是最容易露馅的一幕。
         """
-        done = status in ("done", "failed", "cancelled")
-        stamp = (at or datetime.now(UTC)).isoformat() if done else None
+        # 终态才记时刻。`at` 必须由调用方给：项目里不裸调 datetime.now()，
+        # 时间一律走 Clock，否则测试没法把时钟拨到任意时刻。
+        done = at is not None and status in ("done", "failed", "cancelled")
+        stamp = at.isoformat() if done else None
         if reason is None:
             await self.db.execute(
                 "UPDATE jobs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE id = ?",
