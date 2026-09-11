@@ -7,7 +7,7 @@
 
 ```bash
 source .venv/bin/activate
-python -m pytest -q                  # 382 个测试，不联网，二十秒跑完
+python -m pytest -q                  # 384 个测试，不联网，二十秒跑完
 ruff check newperson tests
 python -m newperson simulate --days 3   # 看作息和回复时机，不联网
 python -m newperson check                # 检查配置和人设

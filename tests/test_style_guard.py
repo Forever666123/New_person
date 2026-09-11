@@ -169,3 +169,19 @@ def test_greetings_are_only_greetings_at_the_start(persona: Persona) -> None:
     ):
         _, needs = sg.enforce(parts(innocent), persona.style, persona.boundaries)
         assert not needs, f"{innocent!r} 是正常说话，不该被拦"
+
+
+def test_an_english_greeting_is_caught_whatever_its_case(persona: Persona) -> None:
+    """`Hi` 和 `hi` 是同一件事。
+
+    比较原来是大小写敏感的，而模型写英文时默认首字母大写——
+    于是清单里躺着 hi 和 hello，真正会被写出来的 `Hi`/`Hello` 一个都拦不住。
+    她开口第一句是"Hi"，没有比这更像聊天机器人的了。
+    """
+    for greeting in ("Hi", "Hi～", "Hello", "HELLO", "Hi 那个 assignment 交了吗"):
+        _, needs = sg.enforce(parts(greeting), persona.style, persona.boundaries)
+        assert needs, f"{greeting!r} 是寒暄，应该拦下来"
+
+    for innocent in ("His 那篇 paper 我看了", "Hinton 那套说法", "高数 hint 给了吗"):
+        _, needs = sg.enforce(parts(innocent), persona.style, persona.boundaries)
+        assert not needs, f"{innocent!r} 是正常说话，不该被拦"

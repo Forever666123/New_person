@@ -126,14 +126,21 @@ def _opens_with_greeting(opening: str, phrase: str) -> bool:
     但它们只是句子的前半截，不是打招呼。真正的寒暄后面接的是句末——
     要么没了，要么是标点，要么是"呀""了""吗"这类语气词。
     """
-    if not opening.startswith(phrase):
+    # 大小写不敏感：清单里写的是 hi / hello，而模型写英文默认首字母大写，
+    # 真正会被写出来的是 `Hi`。比较敏感的话这两条形同虚设，
+    # 而"她开口第一句是 Hi"是最像聊天机器人的一种开场。
+    if not opening.lower().startswith(phrase.lower()):
         return False
     rest = opening[len(phrase) :]
     return not rest or rest[0] in GREETING_TAIL
 
 
-GREETING_TAIL = " \t\u3000，。、！？~…呀啊阿吗么了呢哦噢喔嘛哈诶欸的"
-"""寒暄后面允许跟的东西。再往后就是别的句子了，不是打招呼。"""
+GREETING_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢喔嘛哈诶欸的"
+"""寒暄后面允许跟的东西。再往后就是别的句子了，不是打招呼。
+
+全角半角都要有。"Hi～"里那个是全角波浪号，只收 ASCII 的 `~` 就漏了；
+英文寒暄后面跟的又多半是半角的 `!` `?` `.`。
+"""
 
 OPENING_NOISE = " \t\u3000，。、！？~…—-·:：;；\"'“”‘’（）()"
 """判断"是不是用寒暄开头"之前先掐掉的东西。"""
