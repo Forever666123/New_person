@@ -328,3 +328,39 @@ def test_force_awake_also_changes_what_presence_sees(persona: Persona, calendar)
     assert normal.state_at(night).state == "sleeping"
     assert debug.state_at(night).state != "sleeping"
     assert debug.state_at(night).activity > 0
+
+
+def test_vacation_does_not_flatten_the_phase_mix(persona: Persona) -> None:
+    """放假抽到「赶due」要在剩下的阶段里按权重重抽，不是退回第一个。
+
+    退回第一个（也就是权重最大的「平常」）会把「赶due」让出来的那份概率
+    整个送给平常，「松」一天也涨不到：她的假期于是和上课期一样平淡。
+    这个偏差是静默的，去调 yaml 里的权重也纠正不过来。
+
+    占比不是按权重算的，是按「权重 × 平均段长」：
+    平常 55×9.5、赶due 28×6.5、松 17×5，所以上课期的松本来就只占一成。
+    假期把赶due 那两成按 55:17 分掉，松该涨到一成六。
+    一个种子的两年里只有二三十段，单看方差极大（实测 5%~27%），
+    所以这里跨种子合起来数。
+    """
+    start = date(2026, 9, 2)
+    counts: Counter[str] = Counter()
+    for seed in range(1, 25):
+        calendar = AcademicCalendar(persona.academic, seed)
+        rhythm = Rhythm(persona.rhythm, persona.tz, seed, calendar)
+        for offset in range(730):
+            day = start + timedelta(days=offset)
+            if not calendar.in_session(day):
+                counts[rhythm.phase_for(day).name] += 1
+
+    total = sum(counts.values())
+    assert total > 2000, "样本太少，这条测试说明不了什么"
+
+    for phase in persona.rhythm.phases:
+        if phase.only_in_session:
+            assert phase.name not in counts, f"假期里不该出现「{phase.name}」"
+
+    easy = counts["松"] / total
+    # 退回 phases[0] 的话这个数会停在上课期的水平（约一成）。
+    assert easy > 0.13, f"假期里「松」只占 {easy:.0%}，赶due 让出来的概率没分到它头上"
+    assert easy < 0.21, f"假期里「松」占到 {easy:.0%}，重抽的权重不对"

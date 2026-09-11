@@ -76,6 +76,30 @@ class Rhythm:
                 return item
         return items[-1]
 
+    def _reweigh(self, phases: list[LifePhase], span_start: int) -> LifePhase:
+        """抽到的阶段在放假期间不成立时，**在剩下的里面按权重重抽**。
+
+        原来是直接退回 ``phases[0]``，也就是权重最大的那个"平常"。
+        后果是"赶 due"让出来的那份概率整个送给了平常，"松"一天也涨不到：
+        她的假期和上课期一样平淡。而这是个静默的偏差——
+        去调 yaml 里的权重也纠正不过来，因为纠正的是被过滤之前的那次抽签。
+
+        占比按的是"权重 × 平均段长"，不是权重本身：
+        平常 55×9.5、赶due 28×6.5、松 17×5，所以上课期的松本来就只有一成。
+        假期把赶due 的那两成按 55:17 分掉，松该涨到一成六（实测 16.6%）。
+        """
+        total = sum(max(p.weight, 0.0) for p in phases)
+        if total <= 0:
+            return phases[0]
+        # 用 span 的起点做种子：同一段永远抽到同一个，不会每次查都变。
+        roll = random.Random(self.seed * 104_729 + span_start).uniform(0, total)
+        acc = 0.0
+        for phase in phases:
+            acc += max(phase.weight, 0.0)
+            if roll <= acc:
+                return phase
+        return phases[-1]
+
     def phase_for(self, day: date) -> LifePhase:
         """这一天处在哪个阶段。阶段序列从 ``_PHASE_EPOCH`` 起确定性推演。
 
@@ -92,7 +116,7 @@ class Rhythm:
         if self._phase_spans and self._phase_spans[-1][1] > target:
             for start, end, phase in self._phase_spans:
                 if start <= target < end:
-                    return phase if phase in phases else phases[0]
+                    return phase if phase in phases else self._reweigh(phases, start)
 
         cursor = self._phase_spans[-1][1] if self._phase_spans else 0
         while cursor <= target and len(self._phase_spans) < 100_000:
@@ -101,8 +125,8 @@ class Rhythm:
             length = rng.randint(phase.min_days, max(phase.min_days, phase.max_days))
             self._phase_spans.append((cursor, cursor + length, phase))
             cursor += length
-        found = self._phase_spans[-1][2]
-        return found if found in phases else phases[0]
+        start, _end, found = self._phase_spans[-1]
+        return found if found in phases else self._reweigh(phases, start)
 
     def tz_for(self, day: date) -> ZoneInfo:
         """这一天她人在哪个时区。放假飞去别的地方，作息就跟着那边走。"""
