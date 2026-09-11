@@ -23,6 +23,9 @@ from newperson.prompts import build_system
 
 TZ = ZoneInfo("America/New_York")
 NOW = datetime(2026, 10, 12, 20, 0, tzinfo=TZ)
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"x" * 40
+"""一小段真的 PNG 文件头。图片类型现在按字节认，假字节过不了。"""
+
 TODAY = NOW.date()
 
 
@@ -194,10 +197,62 @@ async def test_an_image_he_sent_is_passed_along(
     """他发图片她要真的看得到，不能只看到 [图片] 两个字。"""
     client = fake_client(ReplyPlan(parts=[ReplyPart(text="哪拍的")]))
     brain = Brain(client, settings(tmp_path), persona, memory)
-    await brain.generate_reply(reply_request(images=[("image/png", b"\x89PNG" * 20)]), TODAY)
+    await brain.generate_reply(reply_request(images=[("image/png", PNG_BYTES)]), TODAY)
     content = client.messages.calls[0]["messages"][0]["content"]
     assert isinstance(content, list)
     assert content[0]["type"] == "image"
+    assert content[0]["source"]["media_type"] == "image/png"
+
+
+async def test_a_wrongly_labelled_image_is_sent_with_its_real_type(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """**Discord 报的类型是会错的，按字节认。**
+
+    线上真出过：他发了一张 PNG，Discord 报成 `image/webp`，我们原样转给接口，
+    接口对了一遍字节就 400——
+    `The image was specified using the image/webp media type, but the image
+    appears to be a image/png image`。
+
+    后果不是"这张图没看到"，是**她永久哑掉**：那条消息一直未读，
+    每次排新的回复任务都重新带上同一张图、再 400 一次，
+    后面所有的话都堵在它后面。实测八条消息堵了一个多小时，
+    而 `!np status` 上只能看到"未读 8 条"，看不出为什么。
+    """
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="哪拍的")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    await brain.generate_reply(reply_request(images=[("image/webp", PNG_BYTES)]), TODAY)
+    content = client.messages.calls[0]["messages"][0]["content"]
+    assert content[0]["source"]["media_type"] == "image/png", "照着 Discord 说的发了出去"
+
+
+async def test_an_image_we_cannot_identify_is_dropped_but_she_still_replies(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """认不出格式的图（iPhone 的 heic、bmp、截断的文件）就别发，但她照样要回。
+
+    接口只收 jpeg / png / gif / webp。发一个它不认的过去就是 400，
+    而 400 会把整批未读永久堵死——宁可她看不见这张图。
+    """
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    plan = await brain.generate_reply(
+        reply_request(images=[("image/heic", b"\x00\x00\x00\x18ftypheic" + b"x" * 40)]), TODAY
+    )
+    assert plan is not None, "认不出图就不回了？她该照样回，只是看不见图"
+    assert isinstance(client.messages.calls[0]["messages"][0]["content"], str)
+
+
+async def test_every_shape_the_api_accepts_is_recognised() -> None:
+    """四种接口收的格式都要认得出来，别把好图也扔了。"""
+    from newperson.brain import sniff_media_type
+
+    assert sniff_media_type(PNG_BYTES) == "image/png"
+    assert sniff_media_type(b"\xff\xd8\xff\xe0" + b"x" * 40) == "image/jpeg"
+    assert sniff_media_type(b"GIF89a" + b"x" * 40) == "image/gif"
+    assert sniff_media_type(b"RIFF" + b"\x00" * 4 + b"WEBP" + b"x" * 40) == "image/webp"
+    assert sniff_media_type(b"\x00\x00\x00\x18ftypheic") is None
+    assert sniff_media_type(b"") is None
 
 
 async def test_an_oversized_image_is_skipped(
@@ -205,7 +260,9 @@ async def test_an_oversized_image_is_skipped(
 ) -> None:
     client = fake_client(ReplyPlan(parts=[ReplyPart(text="嗯")]))
     brain = Brain(client, settings(tmp_path), persona, memory)
-    await brain.generate_reply(reply_request(images=[("image/png", b"x" * (6 * 1024 * 1024))]), TODAY)
+    await brain.generate_reply(
+        reply_request(images=[("image/png", PNG_BYTES + b"x" * (6 * 1024 * 1024))]), TODAY
+    )
     assert isinstance(client.messages.calls[0]["messages"][0]["content"], str)
 
 

@@ -130,6 +130,29 @@ class MemoryUpdateRequest:
     existing_self_facts: list[str]
 
 
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def sniff_media_type(raw: bytes) -> str | None:
+    """按**内容**认图片类型。认不出来返回 None。
+
+    接口只收 jpeg / png / gif / webp，而且会把声明的类型和真实字节对一遍。
+    所以这里只认这四种，别的（iPhone 的 heic、bmp、tiff、svg）一律当认不出来。
+    """
+    for magic, media_type in _IMAGE_MAGIC:
+        if raw.startswith(magic):
+            return media_type
+    # webp 是 RIFF 容器：前四字节 RIFF，8-12 字节 WEBP，中间四字节是长度
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 class Brain:
     def __init__(
         self,
@@ -302,8 +325,23 @@ class Brain:
 
     @staticmethod
     def _with_images(text: str, images: list[tuple[str, bytes]]) -> str | list[dict[str, Any]]:
-        """把对方发的图片拼进 user 消息，让她真的看得到内容。"""
-        usable = [(m, b) for m, b in images if b and len(b) <= MAX_IMAGE_BYTES]
+        """把对方发的图片拼进 user 消息，让她真的看得到内容。
+
+        **图片类型按字节认，不信别人报的那个。** Discord 报的 content_type
+        经常是错的（实测它把一张 PNG 报成 image/webp），而接口会对一遍字节，
+        对不上就是 400。后果不是"这张图没看到"——是**她永久哑掉**：
+        那条消息一直未读，每次排新的回复任务都重新带上同一张图、再 400 一次，
+        后面所有的话都堵在它后面。认不出来的直接不发，她照样回，只是看不见图。
+        """
+        usable: list[tuple[str, bytes]] = []
+        for _declared, raw in images:
+            if not raw or len(raw) > MAX_IMAGE_BYTES:
+                continue
+            media_type = sniff_media_type(raw)
+            if media_type is None:
+                log.warning("[brain] 认不出这张图的格式（%d 字节），不发给模型", len(raw))
+                continue
+            usable.append((media_type, raw))
         if not usable:
             return text
         blocks: list[dict[str, Any]] = [
