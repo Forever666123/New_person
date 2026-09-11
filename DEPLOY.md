@@ -386,10 +386,28 @@ cd /opt/New_person && .venv/bin/python -m newperson doctor
 这几种都会被点出来。顺带报接口出错、失败的任务和备份状态。
 
 觉得她哪天不对劲，先跑这个，再决定要不要找人看。
-每周跑一次也行：
+
+想让它每周自己跑一次，就这行（`crontab -e`）：
 
 ```
-0 6 * * 1 cd /opt/New_person && .venv/bin/python -m newperson doctor >> /var/log/chloe-doctor.log 2>&1
+0 6 * * 1 cd /opt/New_person && .venv/bin/python -m newperson doctor > /var/log/chloe-doctor.log 2>&1 || cp /var/log/chloe-doctor.log "/var/log/chloe-doctor.BAD-$(date +\%F).log"
+```
+
+三个地方是故意这么写的：
+
+- 用 `>` 不用 `>>`。一直追加的话这个文件会长到没人愿意翻，
+  而每周一份正常报告本来也没有留着的必要。
+- 后面挂 `|| cp`。发现 **BAD** 时体检的退出码是 1，
+  这一段就把那份报告另存一份带日期的；只写日志的话退出码就白算了，
+  服务器上没有 MTA，cron 也发不出邮件给你——出了事没人会知道。
+  WARN 不会触发，那些是"有空看看"，不是"坏了"。
+- `%F` 里的 `%` 要写成 `\%`。crontab 会把没转义的 `%` 当成换行，
+  命令会从那里断掉。
+
+于是你平时什么都不用看。想确认的时候只要：
+
+```bash
+ls /var/log/chloe-doctor.BAD-* 2>/dev/null || echo 这几周都正常
 ```
 
 ## 花多少钱

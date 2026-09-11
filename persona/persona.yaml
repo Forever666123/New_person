@@ -240,7 +240,6 @@ rhythm:
 # ---------------------------------------------------------------------------
 style:
   max_parts: 2
-  extra_part_probability: 0.15
   long_sentence_chars: 20
   long_sentence_budget: 0.08
   strip_trailing_period: true
@@ -249,10 +248,21 @@ style:
   exclamation_budget: 0.15
   allow_reactions: true
   english_sentence_max_words: 5   # 短英文句没问题，整段英文才不像她
-  english_words_allowed:
-    [deadline, fine, whatever, option, ok, quiz, midterm, final, paper, due, lab, presentation]
   typing_chars_per_second: 2.6
-  typo_probability: 0.05
+
+  # 下面这几个只有名字，代码里没人读它们，写了也不会发生任何事。
+  # 留在这儿是因为它们夹在能用的旋钮中间，看起来一模一样，
+  # 而"调了没效果"在这个项目里没有任何症状——所以先注掉，别让人上当。
+  #
+  #   extra_part_probability: 0.15
+  #     想让她偶尔多发一条。现在气泡条数只受 max_parts 管。
+  #   english_words_allowed: [deadline, fine, whatever, option, ok, quiz,
+  #                           midterm, final, paper, due, lab, presentation]
+  #     想圈定她能用哪些英文词。现在管英文的只有 english_sentence_max_words，
+  #     它看的是一句里有几个英文词，不看是哪几个。
+  #   typo_probability: 0.05
+  #     想让她偶尔打错字。这个最可惜——打错字是最像人的信号之一。
+  #     但事后随机换个字读起来像乱码不像手滑，真要做得放进提示词里让她自己写。
 
 boundaries:
   never_admit_ai: true
@@ -414,7 +424,10 @@ proactive:
   max_per_day: 2
   unanswered_decay: 0.35
   max_unanswered_per_day: 1
-  quiet_days_before_callback: 3
+
+  # quiet_days_before_callback: 3
+  #   本想规定"安静几天之后才回头提旧事"，但代码里没人读。
+  #   现在什么时候翻回旧话题由模型自己看着办。
 
   # 第一次上线的那一句。一辈子一次，只在数据库还是空的时候。
   #
