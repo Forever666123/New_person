@@ -1597,3 +1597,45 @@ async def test_a_channel_that_only_has_other_peoples_chatter_still_advances(
         await app.catch_up(page=2, max_pages=2)
     ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
     assert 200 in ids, f"闲聊把补抓卡死了，他那句永远补不到：{sorted(ids)}"
+
+
+async def test_catching_up_two_channels_keeps_the_unread_in_time_order(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓翻两个频道之后，未读还得是他说话的先后顺序。
+
+    补抓是一个频道一个频道整段写库的，而未读原来按 id（插入顺序）排——
+    他 20:05 在公开频道说的那句会排在 20:30 私聊那句**后面**。
+    下游全指着"最后一个就是他最后说的"：
+
+    - 提示词按这个顺序讲给她听，她看到的对话是倒着的；
+    - `staleness` 拿 `unread[-1]` 算他等了多久，于是两分钟前的消息
+      被算成隔了快一小时，热度被压成 cold，
+      提示里还会写着"他这条消息是 63 分钟前发的"；
+    - 表情反应和引用贴在 `unread[-1]` 上，而回复去的是**最新那条**的频道——
+      两者对不上，表情就贴到另一个频道的消息上去，404，静默消失。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done")
+
+    public = FakeHistoryChannel(
+        [fake_incoming(101, "公开频道 20:05", EVENING + timedelta(minutes=5), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(102, "私聊 20:30", EVENING + timedelta(minutes=30), channel_id=999)],
+        channel_id=999,
+    )
+    wire_inbound(app, dm, public)
+    await app.catch_up()
+
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    stamps = [m.created_at for m in unread]
+    assert stamps == sorted(stamps), f"未读不是时间序：{[(m.discord_message_id, m.created_at) for m in unread]}"
+    assert unread[-1].discord_message_id == 102, "最后一条不是他最后说的那条"
+
+    # 回复的目的地和 unread[-1] 必须指同一条消息，表情才不会贴错频道
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert job.payload.get("channel_id") == dm.id

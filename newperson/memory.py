@@ -292,12 +292,28 @@ class Memory:
         return int(cur.lastrowid or 0)
 
     async def unread_messages(self, conversation_id: str) -> list[StoredMessage]:
+        """还没读的消息，**按他说话的先后排**。
+
+        不能按 id（插入顺序）排：补抓是一个频道一个频道整段写库的，
+        他 20:05 在公开频道说的那句会排在 20:30 私聊那句**后面**。
+        下游全指着"最后一个就是他最后说的"：
+        提示词按这个顺序讲给她听、``staleness`` 拿 ``unread[-1]`` 算他等了多久、
+        表情反应和引用也贴在 ``unread[-1]`` 上。顺序错了，
+        她会被告知一条两分钟前的消息已经过了一小时，
+        表情还会贴到另一个频道的消息上去（404，静默消失）。
+
+        排序在 Python 里做，不在 SQL 里。``created_at`` 存的是 ISO 字符串，
+        而她的时区一年要换两次夏令时——字符串序和时间序在换季那天对不上。
+        """
         rows = await self._fetch_all(
             "SELECT * FROM messages WHERE conversation_id = ? AND author_kind = 'user'"
             " AND read_at IS NULL AND deleted = 0 ORDER BY id",
             (conversation_id,),
         )
-        return [self._row_to_message(r) for r in rows]
+        messages = [self._row_to_message(r) for r in rows]
+        # id 做次键：同一时刻的几条保持插入顺序，结果才稳定
+        messages.sort(key=lambda m: (m.created_at, m.id))
+        return messages
 
     async def mark_read(self, message_ids: list[int], read_at: datetime) -> None:
         if not message_ids:
