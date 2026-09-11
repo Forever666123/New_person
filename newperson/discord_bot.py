@@ -251,6 +251,69 @@ class App:
 
     # -- 收消息 -------------------------------------------------------------
 
+    async def catch_up(self, limit: int = 50) -> int:
+        """把停机期间漏掉的消息补回来。
+
+        **Discord 不补发新会话之前的事件。** 进程每重启一次就是一个新会话，
+        所以部署、宿主机维护、崩溃拉起的那几十秒里他说的话，
+        原来是不入库、不进未读、她永远不会回——而且他不会收到任何提示。
+        一次部署要好几分钟，这个窗口一点都不小。
+
+        两条重要的细节：
+
+        - **用消息本身的时间，不用现在的时间。** 正常收消息那条路存的是
+          ``clock.now()``，实时收的时候两者差不多；补抓时差的是几小时，
+          存成"刚刚"的话她会按"刚收到"去算回复时机，于是三小时前的话
+          被当成刚说的，秒回过去。
+        - **库是空的就什么都不做。** 不然第一次上线会把整段历史拉进来，
+          而那正是"她不该知道的事"。
+        """
+        newest = await self.memory.newest_discord_message_id(CONVERSATION_ID)
+        if newest is None:
+            return 0
+
+        try:
+            channel = await self.resolve_channel()
+        except Exception:  # noqa: BLE001 - 拿不到频道不该让启动失败
+            log.warning("[inbox] 补抓时拿不到频道，跳过")
+            return 0
+
+        try:
+            missed = [
+                m
+                async for m in channel.history(
+                    limit=limit, after=discord.Object(id=newest), oldest_first=True
+                )
+            ]
+        except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
+            log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
+            return 0
+
+        recovered = 0
+        for message in missed:
+            if not self._should_handle(message):
+                continue
+            if owner_cmds.is_command(message.content):
+                continue  # !np 是给程序看的，补抓时更不该执行
+            stored = await self.memory.add_user_message(
+                IncomingMessage(
+                    conversation_id=CONVERSATION_ID,
+                    discord_message_id=message.id,
+                    author_id=message.author.id,
+                    author_name=message.author.display_name,
+                    content=message.content,
+                    attachments=await self._download_images(message),
+                    created_at=message.created_at.astimezone(self.persona.tz),
+                )
+            )
+            if stored:
+                recovered += 1
+
+        if recovered:
+            log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
+            await self._schedule_reply(self.clock.now())
+        return recovered
+
     def _should_handle(self, message: discord.Message) -> bool:
         if message.author.bot:
             return False
@@ -1007,11 +1070,15 @@ class NewPersonClient(discord.Client):
             # 永远不去纠正。结果就是她半夜三点亮着绿灯，一直到进程重启为止。
             # 清掉缓存，下一轮循环会重新设一次。
             self.presence.forget_last_applied()
+            await self.app.catch_up()
             return
         self.presence = PresenceManager(
             self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng
         )
         self.app.spawn(self.presence.run_forever(), "presence")
+        # 放在最后：补抓要用到已经建好的频道和数据库。
+        # 每次重连都跑一遍，绝大多数时候什么都找不到，代价就是一次 history 调用。
+        await self.app.catch_up()
 
     async def on_message(self, message: discord.Message) -> None:
         try:

@@ -997,3 +997,165 @@ async def test_being_able_to_send_again_clears_the_undeliverable_flag(
 
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert conv.deliverable is True, "已经发出去了，这个标记该收回来"
+
+
+class FakeHistoryChannel(FakeChannel):
+    """能翻历史的假频道，用来测停机补抓。"""
+
+    def __init__(self, messages: list) -> None:
+        super().__init__()
+        self.messages = messages
+        self.history_calls: list[int] = []
+
+    def history(self, *, limit: int, after, oldest_first: bool = True):
+        self.history_calls.append(getattr(after, "id", 0))
+        picked = [m for m in self.messages if m.id > getattr(after, "id", 0)]
+        picked.sort(key=lambda m: m.id)
+
+        async def gen():
+            for m in picked[:limit]:
+                yield m
+
+        return gen()
+
+
+def fake_incoming(msg_id: int, text: str, at: datetime, author_id: int = 42):
+    """一条历史消息。DMChannel 判定靠 isinstance，这里用真的类型糊不过去，
+    所以直接把 _should_handle 需要的东西凑齐。"""
+    return SimpleNamespace(
+        id=msg_id,
+        content=text,
+        created_at=at,
+        author=SimpleNamespace(id=author_id, display_name="Leo", bot=False),
+        channel=SimpleNamespace(id=999),
+        attachments=[],
+    )
+
+
+async def test_messages_sent_while_she_was_down_are_recovered(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """进程停着的时候他发的话不能永远消失。
+
+    Discord **不补发新会话之前的事件**，而每次重启都是一个新会话。
+    所以部署、宿主机维护、崩溃拉起的那几十秒里他说的话，
+    原来是不入库、不进未读、她永远不会回，而且他不会收到任何提示。
+    一次部署要好几分钟，这个窗口一点都不小。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前说的", at=EVENING, msg_id=100)
+
+    missed_at = EVENING + timedelta(minutes=30)
+    channel = FakeHistoryChannel(
+        [
+            fake_incoming(101, "停机期间说的第一句", missed_at),
+            fake_incoming(102, "停机期间说的第二句", missed_at + timedelta(minutes=5)),
+        ]
+    )
+    app._default_channel = channel
+    app._should_handle = lambda _m: True
+
+    recovered = await app.catch_up()
+
+    assert recovered == 2
+    assert channel.history_calls == [100], "要从库里最新那条之后开始补，不是从头拉"
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    assert len(unread) == 3, "补回来的要进未读，否则她还是不会回"
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "补完要排一条回复"
+
+
+async def test_recovered_messages_keep_their_real_time(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补回来的消息要用**消息本身的时间**，不是现在的时间。
+
+    存成"刚刚"的话，她会按"刚收到"去算回复时机——
+    于是三小时前说的话被当成刚说的，她秒回过去。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+
+    real_time = EVENING + timedelta(minutes=20)
+    clock.set(EVENING + timedelta(hours=4))  # 四小时之后才重启
+    app._default_channel = FakeHistoryChannel([fake_incoming(101, "停机期间", real_time)])
+    app._should_handle = lambda _m: True
+
+    await app.catch_up()
+
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    recovered = [m for m in unread if m.discord_message_id == 101][0]
+    drift = abs((recovered.created_at - real_time).total_seconds())
+    assert drift < 60, f"时间偏了 {drift / 60:.0f} 分钟，她会按错误的时机回"
+
+
+async def test_a_fresh_install_does_not_drag_in_the_whole_history(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """库是空的时候什么都不补。
+
+    不然第一次上线会把整段历史拉进来——而那恰恰是"她不该知道的事"。
+    """
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    channel = FakeHistoryChannel([fake_incoming(1, "很久以前", EVENING)])
+    app._default_channel = channel
+    app._should_handle = lambda _m: True
+
+    assert await app.catch_up() == 0
+    assert channel.history_calls == [], "空库连 history 都不该调"
+
+
+async def test_catching_up_twice_does_not_duplicate(tmp_path: Path, persona: Persona) -> None:
+    """每次重连都会跑一遍补抓，重复跑不能把消息记两遍。"""
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "之前", at=EVENING, msg_id=100)
+    app._default_channel = FakeHistoryChannel(
+        [fake_incoming(101, "漏掉的", EVENING + timedelta(minutes=10))]
+    )
+    app._should_handle = lambda _m: True
+
+    assert await app.catch_up() == 1
+    assert await app.catch_up() == 0
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    assert len([m for m in unread if m.discord_message_id == 101]) == 1
+
+
+async def test_owner_commands_are_not_replayed_on_catch_up(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """`!np` 是给程序看的，补抓时更不该被当成消息记下来。
+
+    真执行一遍就更糟：重启时把停机期间的 `!np pause` 又跑一次。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "之前", at=EVENING, msg_id=100)
+    app._default_channel = FakeHistoryChannel(
+        [
+            fake_incoming(101, "!np status", EVENING + timedelta(minutes=5)),
+            fake_incoming(102, "真的消息", EVENING + timedelta(minutes=6)),
+        ]
+    )
+    app._should_handle = lambda _m: True
+
+    assert await app.catch_up() == 1
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    assert not [m for m in unread if "!np" in m.content]
+
+
+async def test_a_broken_history_call_does_not_stop_her_starting(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓失败（限流、权限变了）不能让她起不来。
+
+    补抓是锦上添花，网关连上才是命根子。
+    """
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    await send(app, "之前", at=EVENING, msg_id=100)
+
+    class Exploding(FakeChannel):
+        def history(self, **_kw):
+            raise RuntimeError("429")
+
+    app._default_channel = Exploding()
+    app._should_handle = lambda _m: True
+
+    assert await app.catch_up() == 0

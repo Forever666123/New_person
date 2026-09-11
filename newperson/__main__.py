@@ -8,6 +8,7 @@ python -m newperson plan       让她给今天编一份日程并打印（联网�
 python -m newperson photos     扫描照片目录，生成索引草稿
 python -m newperson backup     把她的记忆拷一份出来（一致快照，拷完就验）
 python -m newperson verify     检查一份备份还能不能用
+python -m newperson doctor     体检：只看时间戳和任务表，不读聊天内容
 ```
 """
 
@@ -15,13 +16,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import random
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .attention import AttentionPolicy, extract_features, heat_of
@@ -564,6 +566,26 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """体检。**只读元数据，不读一个字的聊天内容。**
+
+    她像不像人不在她说了什么，在时机上——而时机全都能从时间戳算出来。
+    这条线也该划在这儿：那是他们两个人的对话。
+    """
+    from . import doctor
+
+    settings = load_settings()
+    persona = None
+    with contextlib.suppress(Exception):
+        persona = load_persona(settings.persona_path)
+    tz = persona.tz if persona else UTC
+    db = Path(args.db) if args.db else settings.db_path
+
+    report = doctor.run(db, datetime.now(tz), days=args.days)
+    print(report.render())
+    return 0 if report.worst != doctor.BAD else 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     loaded = load_all(args)
     if loaded is None:
@@ -622,6 +644,10 @@ def main(argv: list[str] | None = None) -> int:
     ver = sub.add_parser("verify", help="检查一份备份还能不能用")
     ver.add_argument("path", help="要检查的 .db 文件")
 
+    doc = sub.add_parser("doctor", help="体检：只看时间戳和任务表，不读聊天内容")
+    doc.add_argument("--days", type=int, default=14, help="看最近多少天")
+    doc.add_argument("--db", default="", help="数据库路径，默认用 DB_PATH")
+
     args = parser.parse_args(argv)
     handlers = {
         "run": cmd_run,
@@ -632,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
         "ledger": cmd_ledger,
         "backup": cmd_backup,
         "verify": cmd_verify,
+        "doctor": cmd_doctor,
     }
     return handlers[args.command](args)
 

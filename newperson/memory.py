@@ -373,6 +373,20 @@ class Memory:
         )
         return row is not None
 
+    async def newest_discord_message_id(self, conversation_id: str) -> int | None:
+        """库里最新那条消息的 Discord 编号，用来补抓停机期间漏掉的。
+
+        取的是**所有**消息里最大的那个（包括她自己发的），不只是对方的：
+        她发完之后他回了一条、这时候进程挂了，只看对方那边会从更早的位置开始补，
+        把她自己说过的话也一并当成新消息拉回来。
+        """
+        row = await self._fetch_one(
+            "SELECT MAX(discord_message_id) AS newest FROM messages"
+            " WHERE conversation_id = ? AND discord_message_id IS NOT NULL",
+            (conversation_id,),
+        )
+        return int(row["newest"]) if row and row["newest"] is not None else None
+
     async def edit_message(self, discord_message_id: int, content: str, at: datetime) -> None:
         await self.db.execute(
             "UPDATE messages SET content = ?, edited_at = ? WHERE discord_message_id = ?",
