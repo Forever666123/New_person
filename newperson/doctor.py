@@ -73,6 +73,40 @@ def _parse(raw: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
+# 有些字段名义上是"诊断信息"，实际可能夹带聊天内容：
+#   - last_api_error 里可能是 pydantic 的校验错误，而那种错误会把
+#     `input_value='...'` 整段原样贴出来，那是模型的输出，常常复述他刚说的话
+#   - jobs.reason 平时是人设里的种类名，但任务失败时会被异常文本盖掉
+# 报告是会被打印、会被贴给别人看的东西，所以这里只放**认得出的**词，
+# 别的一律压成一句话。
+SAFE_REASONS = {
+    "opener", "own_life", "callback", "ledger_check", "travel_note", "window_photo",
+    "follow_up", "sign_off", "day_plan", "memory_update", "reply", "proactive",
+}
+MAX_DETAIL = 60
+
+
+def _safe_detail(raw: str) -> str:
+    """把诊断文本压成不会夹带聊天内容的形状。
+
+    两种情形要分开处理，**不能都用截断**：带引号的那种截断了也还是漏——
+    ``input_value='慌'`` 只有二十来个字符，截到 60 字就是原样输出。
+    所以只要出现引号或者 ``input_value``，整条都不印。
+    """
+    text = " ".join(str(raw).split())
+    if not text:
+        return ""
+    if any(mark in text for mark in ("input_value", "'", '"', "“", "”", "‘", "’")):
+        return "（这条可能夹带聊天内容，没有印出来；完整内容在 journalctl 里）"
+    if len(text) > MAX_DETAIL:
+        return f"{text[:MAX_DETAIL]}…（已截断，完整内容在 journalctl 里）"
+    return text
+
+
+def _safe_reason(raw: str | None) -> str:
+    return (raw or "?") if (raw or "?") in SAFE_REASONS else "其它"
+
+
 def _span(minutes: float) -> str:
     """把分钟数说成人话。一分钟的间隔印成"0.0 小时"没人看得懂。"""
     if minutes < 1:
@@ -165,12 +199,25 @@ def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> 
         (since.isoformat(),),
     )
     read = rows[0]["n"] if rows else 0
+    # **不能数气泡。** 她一次回复会分成两三个气泡，每个气泡一行；
+    # 主动消息和开场白也在里面。拿气泡数去比消息数，40% 的沉默会被算成 0%，
+    # 于是这一项永远在报"她几乎有问必答"——一个永远响的警报等于没有警报。
+    # 数的是"有多少条他的消息被回应了"：他发完之后、下一条他发之前，她说过话。
     rows = _rows(
         conn,
-        "SELECT COUNT(*) AS n FROM messages WHERE author_kind != 'user' AND created_at >= ?",
+        "SELECT author_kind, created_at FROM messages"
+        " WHERE created_at >= ? AND deleted = 0 ORDER BY id",
         (since.isoformat(),),
     )
-    hers = rows[0]["n"] if rows else 0
+    answered = 0
+    pending_user = False
+    for row in rows:
+        if row["author_kind"] == "user":
+            pending_user = True
+        elif pending_user:
+            answered += 1
+            pending_user = False
+    hers = answered
     if read < 10:
         return
     ratio = max(0.0, 1 - hers / read)
@@ -199,7 +246,8 @@ def check_proactive(report: Report, conn: sqlite3.Connection, since: datetime) -
 
     kinds: dict[str, int] = {}
     for row in rows:
-        kinds[row["reason"] or "?"] = kinds.get(row["reason"] or "?", 0) + 1
+        name = _safe_reason(row["reason"])
+        kinds[name] = kinds.get(name, 0) + 1
     mix = "　".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))
     per_day = len(rows) / max(report.days, 1)
 
@@ -227,11 +275,18 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
         "SELECT run_at FROM jobs WHERE status = 'done' AND run_at >= ? ORDER BY run_at",
         (since.isoformat(),),
     )
-    stamps = [t for t in (_parse(r["run_at"]) for r in rows) if t is not None]
+    # **在 Python 里排序，不靠 SQL 的字符串序。** run_at 存的是带偏移量的 ISO 串，
+    # 字典序在夏令时切换那一小时会把顺序弄反（-04:00 和 -05:00 的串比大小没有意义），
+    # 于是秋天回拨的那晚会凭空报出一堆"任务挤在两分钟内"。
+    stamps = sorted(t for t in (_parse(r["run_at"]) for r in rows) if t is not None)
+    # 滑动窗口，线性。原来是 O(n²) 且每轮复制一次列表，
+    # --days 放大之后两万条要跑七十秒。
     worst = 0
-    for i, at in enumerate(stamps):
-        n = sum(1 for other in stamps[i:] if (other - at).total_seconds() <= 120)
-        worst = max(worst, n)
+    left = 0
+    for right, at in enumerate(stamps):
+        while (at - stamps[left]).total_seconds() > 120:
+            left += 1
+        worst = max(worst, right - left + 1)
     if worst >= 4:
         report.add(
             WARN,
@@ -240,9 +295,19 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
         )
 
 
-def check_health(report: Report, conn: sqlite3.Connection, db_path: Path, now: datetime) -> None:
-    """接口、任务、备份——"她坏了"的那几种可能。"""
-    rows = _rows(conn, "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed'")
+def check_health(
+    report: Report, conn: sqlite3.Connection, db_path: Path, now: datetime, since: datetime
+) -> None:
+    """接口、任务、备份——"她坏了"的那几种可能。
+
+    失败任务也按窗口算。不限窗口的话，半年前那一次失败会让退出码永远是 1，
+    而一个永远非零的退出码等于没有退出码。
+    """
+    rows = _rows(
+        conn,
+        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed' AND run_at >= ?",
+        (since.isoformat(),),
+    )
     failed = rows[0]["n"] if rows else 0
     if failed:
         report.add(BAD, f"{failed} 个任务重试到放弃了", "她不会自己再试。`!np retry` 放回队列。")
@@ -252,7 +317,7 @@ def check_health(report: Report, conn: sqlite3.Connection, db_path: Path, now: d
         stamp, _, detail = str(rows[0]["value"]).partition("\t")
         when = _parse(stamp)
         ago = f"{(now - when).total_seconds() / 3600:.0f} 小时前" if when else "时间不明"
-        report.add(WARN, f"接口出过错（{ago}）", detail or stamp)
+        report.add(WARN, f"接口出过错（{ago}）", _safe_detail(detail or stamp))
 
     mark = db_path.parent / ".last_backup_at"
     when = _parse(mark.read_text(encoding="utf-8").strip()) if mark.exists() else None
@@ -308,7 +373,7 @@ def run(db_path: Path, now: datetime, days: int = 14) -> Report:
         check_proactive(report, conn, since)
         check_bursts(report, conn, since)
         check_memory(report, conn)
-        check_health(report, conn, db_path, now)
+        check_health(report, conn, db_path, now, since)
     finally:
         conn.close()
     return report

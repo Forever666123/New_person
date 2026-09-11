@@ -189,3 +189,149 @@ def test_a_missing_database_is_reported_not_crashed(tmp_path: Path) -> None:
     report = doctor.run(tmp_path / "nope.db", NOW, days=14)
     assert report.worst == doctor.BAD
     assert "找不到数据库" in report.findings[0].line
+
+
+def test_an_api_error_carrying_model_output_is_not_printed(tmp_path: Path) -> None:
+    """`last_api_error` 里可能夹带他的原话。
+
+    pydantic 的校验错误会把 `input_value='...'` 整段贴出来，而那是模型的输出，
+    常常在复述他刚说的事。报告是会被打印、会被贴给别人看的东西——
+    它要是能漏出聊天内容，就变成了另一种形式的读取。
+    """
+    secret = "我明天要去复查，有点慌"
+    path = make_db(tmp_path / "leak.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES ('last_api_error', ?)",
+        (
+            f"2026-09-24T10:00:00+00:00\t1 validation error for ReplyPlan parts "
+            f"Input should be a valid array [type=list_type, input_value='{secret}']",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    text = doctor.run(path, NOW, days=40).render()
+    assert secret not in text
+    assert "input_value" not in text
+
+
+def test_a_short_api_error_still_hides_the_quoted_part(tmp_path: Path) -> None:
+    """短的那种更危险：截断根本救不了它。
+
+    `input_value='慌'` 只有二十来个字符。按长度截到 60 字等于原样印出来，
+    而"他说了什么"只要一个字就够了。所以判的是引号，不是长度。
+    """
+    secret = "慌"
+    path = make_db(tmp_path / "short-leak.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES ('last_api_error', ?)",
+        (f"2026-09-24T10:00:00+00:00\tbad input_value='{secret}'",),
+    )
+    conn.commit()
+    conn.close()
+
+    text = doctor.run(path, NOW, days=40).render()
+    assert "input_value" not in text
+    assert f"'{secret}'" not in text
+
+
+def test_an_exception_in_a_job_reason_is_not_printed(tmp_path: Path) -> None:
+    """任务失败时异常文本会盖掉 `jobs.reason`，而那也可能夹带内容。
+
+    平时 reason 是人设里的种类名（own_life、ledger_check……），
+    但 `!np retry` 救活一条失败过的主动任务之后，它的 reason 已经是异常串了。
+    """
+    secret = "SOXL 116 手动止损"
+    path = make_db(tmp_path / "reason.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    for i in range(5):
+        conn.execute(
+            "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('proactive','done',?,?)",
+            ((NOW - timedelta(days=i + 1)).isoformat(), f"ValueError: 处理 {secret} 时出错"),
+        )
+    conn.commit()
+    conn.close()
+
+    text = doctor.run(path, NOW, days=40).render()
+    assert secret not in text
+
+
+def test_silence_counts_replies_not_bubbles(tmp_path: Path) -> None:
+    """她一次回复分成几个气泡发，不能把每个气泡都算成一次回应。
+
+    拿气泡数去比消息数的话，真实 40% 的沉默会被算成 0%，
+    于是这一项永远在报"她几乎有问必答"——一个永远响的警报等于没有警报。
+    """
+    path = tmp_path / "bubbles.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    # 十条他的消息，她只回应了六次，但每次都发三个气泡
+    for i in range(10):
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+            " VALUES ('dm','user','x',?,?)",
+            (at.isoformat(), at.isoformat()),
+        )
+        at += timedelta(minutes=10)
+        if i < 6:
+            for _ in range(3):
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+                    " VALUES ('dm','bot','y',?)",
+                    (at.isoformat(),),
+                )
+                at += timedelta(seconds=20)
+        at += timedelta(hours=3)
+    conn.commit()
+    conn.close()
+
+    finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
+    assert "40%" in finding.line, f"应该报 40% 沉默，实际：{finding.line}"
+
+
+def test_the_autumn_clock_change_does_not_fake_a_burst(tmp_path: Path) -> None:
+    """秋令时回拨那一小时不能凭空报"任务挤在两分钟内"。
+
+    run_at 存的是带偏移量的 ISO 串，靠 SQL 的字典序排序在那一小时会把顺序弄反
+    （-04:00 和 -05:00 的串比大小没有意义），于是每年十一月都会误报一次。
+    """
+    from zoneinfo import ZoneInfo
+
+    boston = ZoneInfo("America/New_York")
+    path = make_db(tmp_path / "dst.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    for i in range(12):
+        # fold 要在构造时就定下来——`+ timedelta(...)` 会把它丢掉，
+        # 于是十二条全变成 -04:00，那个歧义小时根本没造出来。
+        at = datetime(2026, 11, 1, 1, 8 * (i % 6), tzinfo=boston, fold=0 if i < 6 else 1)
+        conn.execute(
+            "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('reply','done',?,'')",
+            (at.isoformat(),),
+        )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, datetime(2026, 11, 2, 12, 0, tzinfo=boston), days=14)
+    assert not [f for f in report.findings if "挤在两分钟内" in f.line], "夏令时切换被误报成积压"
+
+
+def test_it_stays_fast_with_a_lot_of_history(tmp_path: Path) -> None:
+    """体检会被随手跑、会进 cron，不能因为攒了半年历史就跑几十秒。"""
+    import time
+
+    path = make_db(tmp_path / "big.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    at = NOW - timedelta(days=300)
+    conn.executemany(
+        "INSERT INTO jobs (kind, status, run_at, reason) VALUES ('reply','done',?,'')",
+        [((at + timedelta(minutes=8 * i)).isoformat(),) for i in range(20000)],
+    )
+    conn.commit()
+    conn.close()
+
+    started = time.monotonic()
+    doctor.run(path, NOW, days=400)
+    assert time.monotonic() - started < 5, "两万条任务跑太久了"
