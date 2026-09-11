@@ -286,3 +286,110 @@ def test_the_env_example_documents_every_knob_the_scripts_read() -> None:
             if var in ("SERVICE_STOP", "SERVICE_START"):
                 continue  # 由 SERVICE_NAME 推出来的，不用单独配
             assert var in example, f"{name} 会读 {var}，但 backup.env.example 里没写"
+
+
+def _fake_rclone(bin_dir: Path) -> None:
+    """把"远端"当成一个本地目录。restore.sh 只用到 lsf / lsl / copy 这三个。"""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "rclone"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        'case "$1" in\n'
+        '  lsf) ls -1 "${2%/}" ;;\n'
+        '  lsl) ls -l "${2%/}" ;;\n'
+        '  copy) cp "$2" "$3" ;;\n'
+        '  *) exit 0 ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+
+def test_restoring_keeps_the_replaced_database_wal_and_all(tmp_path: Path) -> None:
+    """真的装回去时，被顶掉的那份要**连 -wal 一起**留着。
+
+    这条走的是完整的 `restore.sh --install`：下载、解密、验、换文件、起服务。
+    它是这个项目里唯一一条"你需要它的那天没有心情调试它"的路径，
+    而在这之前从来没有任何东西真的跑过它。
+
+    盯的是一个很容易被忽略的细节：WAL 模式下她刚说过的话还躺在 `-wal` 里，
+    主库文件里没有。换文件时把 `-wal` 直接 rm 掉的话，那份
+    "留着以防万一"的副本恰好缺了最后几句——而你只会在最需要它的那天发现。
+    """
+    if shutil.which("gpg") is None:
+        import pytest
+
+        pytest.skip("这台机器上没有 gpg")
+    root = Path(__file__).resolve().parent.parent
+    if (root / "scripts" / "backup.env").exists():
+        import pytest
+
+        pytest.skip("本机有 scripts/backup.env，它会覆盖测试里设的环境变量")
+
+    # 线上那份：开着连接，最后几句只在 -wal 里
+    live = tmp_path / "data" / "newperson.db"
+    live.parent.mkdir()
+    conn = make_db(live, rows=7)
+    conn.execute(
+        "INSERT INTO messages (content, created_at) VALUES (?, ?)",
+        ("这句只在 wal 里", "2026-09-20T21:00:00+00:00"),
+    )
+    conn.commit()
+    assert (tmp_path / "data" / "newperson.db-wal").exists(), "前提不成立：没有 -wal 文件"
+
+    # 远端那份：一份更早的快照，内容和线上不一样
+    older = tmp_path / "older.db"
+    make_db(older, rows=3).close()
+    passfile = tmp_path / "pass"
+    passfile.write_text("drill-passphrase\n", encoding="utf-8")
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    subprocess.run(
+        ["gpg", "--batch", "--yes", "--quiet", "--symmetric", "--cipher-algo", "AES256",
+         "--passphrase-file", str(passfile),
+         "--output", str(remote / "newperson-20260101T000000Z.db.gpg"), str(older)],
+        check=True,
+    )
+
+    bin_dir = tmp_path / "bin"
+    _fake_rclone(bin_dir)
+    import os
+    import sys
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "RCLONE_REMOTE": f"{remote}/",
+        "GPG_PASSPHRASE_FILE": str(passfile),
+        "PYTHON_BIN": sys.executable,
+        "DB_PATH": str(live),
+        "SERVICE_STOP": "true",
+        "SERVICE_START": "true",
+    }
+    result = subprocess.run(
+        ["bash", str(root / "scripts" / "restore.sh"), "--install"],
+        input="yes\n", capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, f"恢复失败：{result.stdout}\n{result.stderr}"
+    conn.close()
+
+    # 装回去的是远端那份（3 条）
+    restored = sqlite3.connect(live)
+    assert restored.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
+    restored.close()
+
+    # 被顶掉的那份连 -wal 一起留着，而且打开它能读到只在 wal 里的那句
+    aside = sorted(live.parent.glob("newperson.db.replaced-*"))
+    aside = [p for p in aside if not p.name.endswith(("-wal", "-shm"))]
+    assert len(aside) == 1, f"旧库没留下来：{sorted(p.name for p in live.parent.iterdir())}"
+    assert aside[0].with_name(aside[0].name + "-wal").exists(), "旧库的 -wal 被删了，最后几句话没了"
+
+    old = sqlite3.connect(aside[0])
+    kept = [row[0] for row in old.execute("SELECT content FROM messages")]
+    old.close()
+    assert "这句只在 wal 里" in kept, f"旧库里少了只在 wal 里的那句：{kept}"
+
+    # 旧库的旁文件不能留在新库旁边，那些和新库对不上
+    assert not (live.parent / "newperson.db-wal").exists()
+    assert not backup.integrity_errors(live), "装回去的库自己就是坏的"

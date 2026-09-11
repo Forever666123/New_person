@@ -132,10 +132,19 @@ fi
 if [ -f "$DB_PATH" ]; then
     ASIDE="$DB_PATH.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
     mv "$DB_PATH" "$ASIDE"
-    say "当前那份挪到了 $(basename "$ASIDE")"
+    # **-wal 要跟着旧库一起挪走，不能删。** WAL 模式下刚说过的话还躺在
+    # -wal 里没写进主库；直接 rm 掉的话，这份"留着以防万一"的副本
+    # 恰好缺了她最后几句话——而你会在最需要它的那天才发现。
+    for side in wal shm; do
+        if [ -f "$DB_PATH-$side" ]; then
+            mv "$DB_PATH-$side" "$ASIDE-$side"
+        fi
+    done
+    say "当前那份挪到了 $(basename "$ASIDE")（连 -wal 一起）"
 fi
 mv "$NEW" "$DB_PATH"
-# -wal / -shm 是旧库的旁文件，留着会和新库对不上。
+# 兜一下：上面没进 if 分支（$DB_PATH 本来就不在）时，旁文件可能还留着，
+# 那些是旧库的，和新库对不上。
 rm -f "$DB_PATH-wal" "$DB_PATH-shm"
 
 say "起服务"
