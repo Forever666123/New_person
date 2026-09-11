@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -214,8 +216,73 @@ def check_rhythm(report: Report, gaps: list[float]) -> None:
         report.add(OK, "回复间隔够散", shape)
 
 
-TURN_GAP = timedelta(minutes=30)
-"""他连着打的几行算一轮；隔了这么久再开口，就是另一次搭话了。"""
+ANSWER_WINDOW = timedelta(minutes=5)
+"""她处理完一批未读之后，多久之内说出来的话算"回这一批"。
+
+`mark_read` 和她那几条消息用的是同一个时刻（见 discord_bot 里的
+``handle_reply_job`` 和 ``_record_sent``），所以正常情况下这个差是 0。
+留五分钟是给以后留的余地，不是给"隔了一会儿又想起来"留的。
+"""
+
+RUN_GAP = timedelta(minutes=3)
+"""她一次说话分成的几个气泡算一轮；隔得比这久就是另一次开口。"""
+
+
+def _batches_and_runs(
+    conn: sqlite3.Connection, since: datetime
+) -> tuple[list[datetime], list[datetime]]:
+    """``(她处理过的每一批未读, 她开口说话的每一轮)``。
+
+    **不能按"他说了几轮"去数。** 她是把整批未读并成一次回复的——
+    那正是这个项目的设计。他隔两小时说的三句话，只要她还没回，
+    就是同一批，她回一次就是全接住了。按"他每隔多久算新一轮"去切，
+    每隔一段就凭空多出一个"没接话"：实测她一条都没漏的十四天，
+    被算成沉默 35%；而他在悉尼、她在波士顿，他白天说的话正落在她睡觉的时候，
+    这种间隔是常态不是边角。
+
+    所以用库里现成的那个信号：``read_at``。它是 ``mark_read`` 那一刻，
+    也就是"她真的处理过这批"——一批一个值，和她的回复同一个时刻。
+
+    批次按 ``read_at`` 落在窗口里算，不按他什么时候说的：
+    窗口开头那批他可能是前一天说的，但她是在窗口里处理的。
+    """
+    rows = _rows(
+        conn,
+        "SELECT read_at FROM messages WHERE author_kind = 'user'"
+        " AND read_at IS NOT NULL AND read_at >= ? AND deleted = 0",
+        (since.isoformat(),),
+    )
+    batches = sorted({t for t in (_parse(r["read_at"]) for r in rows) if t is not None})
+
+    starts: list[datetime] = []
+    last: datetime | None = None
+    for kind, at in _timeline(conn, since):
+        if kind == "user":
+            continue
+        if last is None or at - last > RUN_GAP:
+            starts.append(at)
+        last = at
+    return batches, starts
+
+
+def _match(batches: list[datetime], runs: list[datetime]) -> tuple[int, int]:
+    """``(接住的批数, 她自己开口的轮数)``。
+
+    一批最多认领她的一轮，而且只认领紧跟其后的那一轮。
+    "紧跟其后"是关键：她回完他之后隔五分钟又自己开口，那是**两件事**，
+    第二件是主动开口。只看"上一条是不是也是她说的"会把它整个吞掉。
+    """
+    claimed: set[int] = set()
+    answered = 0
+    cursor = 0
+    for batch in batches:
+        while cursor < len(runs) and runs[cursor] < batch:
+            cursor += 1
+        if cursor < len(runs) and runs[cursor] <= batch + ANSWER_WINDOW:
+            claimed.add(cursor)
+            answered += 1
+            cursor += 1
+    return answered, len(runs) - len(claimed)
 
 
 def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
@@ -224,40 +291,14 @@ def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> 
     一次都不沉默，说明"有问必答"——那是助手，不是人。
     但沉默太多也不对，多半是模型在判"这条不用回"。
     """
-    # **两边都要数"轮次"，不能一边数轮次一边数条数。**
-    #
-    # 气泡那一侧曾经数错过：她一次回复分两三个气泡，拿气泡数去比消息数，
-    # 四成的沉默会被算成 0%。但他那一侧同样不能数条数——他连发三行是一轮，
-    # 她回一次就是接住了。混着数的话，这个比例实际测的是"他平均一轮打几行字"，
-    # 而这个项目的设计（把未读并成一次回复）保证了它大于 1。
-    # 实测：他每轮三行、她**每轮都回**，报出来是"没接话的比例 67%"；
-    # 她三天一句没回，报出来是"沉默 46%"，还是 ✓。两个方向都错。
-    turns = 0
-    answered = 0
-    pending = False
-    last_his: datetime | None = None
-    for kind, at in _timeline(conn, since):
-        if kind == "user":
-            # 隔得远就是**另一次**搭话，不是同一轮的下一行。
-            # 不分开的话，她一直不回的那一整段会被并成一轮，
-            # "三天一句没回"于是只算一次没接话——最该响的时候最安静。
-            fresh = not pending or (last_his is not None and at - last_his > TURN_GAP)
-            if fresh:
-                turns += 1
-            pending = True
-            last_his = at
-        elif pending:
-            answered += 1
-            pending = False
-    if pending:
-        # 最后那一轮她可能还没到点回。只有这一轮是悬而未决的，不算进去。
-        turns -= 1
-    if turns < 10:
+    batches, runs = _batches_and_runs(conn, since)
+    if len(batches) < 10:
         return
-    ratio = max(0.0, 1 - answered / turns)
+    answered, _opened = _match(batches, runs)
+    ratio = max(0.0, 1 - answered / len(batches))
     if ratio > 0.5:
         report.add(WARN, f"她看了却没接话的比例 {ratio:.0%}，偏高", "多半是模型老在判'这条不用回'")
-    elif ratio < 0.02:
+    elif ratio < 0.05:
         report.add(WARN, f"她几乎有问必答（沉默 {ratio:.0%}）", "真人会漏掉一些话不接")
     else:
         report.add(OK, f"沉默比例 {ratio:.0%}")
@@ -272,32 +313,19 @@ def check_proactive(
 ) -> None:
     """她主动开口的频率和花样。
 
-    全是回访（"那件事做了吗"）的话，她就成了一份待办清单。
+    全是"那件事做了吗"和"我查完告诉你"的话，她就成了一份待办清单。
 
     **频率从消息表数，不从任务表数。** 任务表记的是排期，而
     ``handle_proactive_job`` 有七八条提前 return（在睡觉、有未读、正热聊、
-    请假、没照片、没到期的承诺、"没什么要说的"），这些照样被标成 done。
-    实测六个什么都没发的任务，任务表里是 6 条 done——报告会说她开口了 6 次。
-    真正的"她主动开口"是消息表里她**说在他前面**的那些轮。
+    请假、没照片、没到期的承诺、"没什么要说的"），这些照样被标成 done：
+    六个什么都没发的任务会被报成"她开口了 6 次"。
+    真正的"她主动开口"是她说的话里，**没有在接他哪一批未读**的那些轮。
     """
-    # 她**说在他前面**就是主动开口。连着几个气泡算一次，
-    # 靠时间间隔区分"同一次的下一个气泡"和"隔了几小时又开口"——
-    # 只看"上一条是不是也是她说的"是不够的：她回完他之后过三小时主动找他，
-    # 上一条同样是她说的，那一次会被整个漏掉（实测九次主动报成 0.0 次/天）。
-    opened = 0
-    pending = False
-    last_hers: datetime | None = None
-    for kind, at in _timeline(conn, since):
-        if kind == "user":
-            pending = True
-            continue
-        if not pending and (last_hers is None or at - last_hers > TURN_GAP):
-            opened += 1
-        pending = False
-        last_hers = at
+    batches, runs = _batches_and_runs(conn, since)
+    _answered, opened = _match(batches, runs)
     per_day = opened / max(report.days, 1)
 
-    # 口味只看任务表。follow_up 也算——她说"我查完告诉你"排的就是这种，
+    # 口味只看任务表。`follow_up` 也算：她说"我查完告诉你"排的就是这种，
     # 而且它**没有每天的上限**，"她变成一份待办清单"最可能就从这条路来。
     rows = _rows(
         conn,
@@ -315,11 +343,15 @@ def check_proactive(
         report.add(OK, "这段时间她没主动开过口")
         return
 
-    checks = kinds.get("ledger_check", 0)
-    if len(rows) >= 4 and checks / len(rows) > 0.6:
+    # **办事型的两种都算在分子里。** 只把 ledger_check 当分子、
+    # 却把 follow_up 加进分母的话，加得越多这条警报越小：
+    # 十四次追问加十个"我查完告诉你"——二十四条主动没有一条是闲聊——
+    # 反而从 100% 降到 58%，安静通过。
+    errands = kinds.get("ledger_check", 0) + kinds.get("follow_up", 0)
+    if len(rows) >= 4 and errands / len(rows) > 0.6:
         report.add(
             WARN,
-            f"她主动说的话里 {checks / len(rows):.0%} 是在追问你做没做",
+            f"她主动说的话里 {errands / len(rows):.0%} 是在办事（追问你做没做、汇报查完了）",
             f"{mix}\n再高就像待办清单了，不像朋友。",
         )
     elif per_day >= max_per_day - 0.05:
@@ -375,58 +407,92 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
         )
     elif stamps:
         report.add(OK, f"{len(stamps)} 件事分布正常（同一两分钟里最多 {worst} 件）")
+    else:
+        # **没数据也要说一声。** 别的每一项都会说"样本还不够"，
+        # 只有这一项原来是直接蒸发的——报告里少一行，谁也不会注意到。
+        # 真实场景：`finished_at` 是后加的列，迁移之前就结束的任务永远是 NULL，
+        # 所以刚更新完那几天这一项本来就没东西可看。
+        done = _rows(conn, "SELECT COUNT(*) AS n FROM jobs WHERE status = 'done'")
+        n = done[0]["n"] if done else 0
+        report.add(
+            OK,
+            "还看不出事情挤不挤（没有带执行时刻的任务）"
+            + (f"，库里有 {n} 个更早的任务不带这个时刻" if n else ""),
+        )
 
 
-def check_health(
-    report: Report, conn: sqlite3.Connection, db_path: Path, now: datetime, since: datetime
-) -> None:
-    """接口、任务、备份——"她坏了"的那几种可能。
+def check_failed_jobs(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
+    """重试到放弃的任务。
 
-    失败任务也按窗口算。不限窗口的话，半年前那一次失败会让退出码永远是 1，
+    也按窗口算：不限窗口的话，半年前那一次失败会让退出码永远是 1，
     而一个永远非零的退出码等于没有退出码。
+
+    用 `finished_at`（真的放弃是几点）优先，没有才退回 run_at——
+    和"事情挤不挤"同一个口径，理由也一样：run_at 是排期时刻，
+    每次重试都会被改写，不是"这件事什么时候出的问题"。
     """
     rows = _rows(
         conn,
-        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed' AND run_at >= ?",
+        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'failed'"
+        " AND COALESCE(finished_at, run_at) >= ?",
         (since.isoformat(),),
     )
     failed = rows[0]["n"] if rows else 0
     if failed:
         report.add(BAD, f"{failed} 个任务重试到放弃了", "她不会自己再试。`!np retry` 放回队列。")
 
-    rows = _rows(conn, "SELECT value FROM kv WHERE key = 'last_api_error'")
-    if rows:
-        stamp, _, detail = str(rows[0]["value"]).partition("\t")
-        when = _parse(stamp)
-        hours = (now - when).total_seconds() / 3600 if when else None
-        ago = f"{hours:.0f} 小时前" if hours is not None else "时间不明"
-        # **还没恢复的接口报错是 BAD，不是 WARN。** 成功一次就会把这条清掉，
-        # 所以它还在，就意味着最后一次调用是失败的——密钥过期、余额用光、
-        # 模型名写错，这些她不会自己好。半年前那次抖动才是"看看就行"。
-        level = BAD if hours is None or hours < 6 else WARN
-        report.add(level, f"接口出过错（{ago}）", _safe_detail(detail or stamp))
 
-    # 复用 backup 模块：它已经处理过读不出来（OSError）和内容不是时间（ValueError），
-    # 而这里原来是 `mark.read_text()` 裸调——标记文件变成目录就直接把体检打崩。
+def check_api(report: Report, conn: sqlite3.Connection, now: datetime) -> None:
+    """接口现在通不通。
+
+    **还没恢复的接口报错是 BAD，不是 WARN。** 成功一次就会把这条清掉，
+    所以它还在，就意味着最后一次调用是失败的——密钥过期、余额用光、
+    模型名写错，这些她不会自己好。半年前那次抖动才是"看看就行"。
+    """
+    rows = _rows(conn, "SELECT value FROM kv WHERE key = 'last_api_error'")
+    if not rows:
+        return
+    stamp, _, detail = str(rows[0]["value"]).partition("\t")
+    when = _parse(stamp)
+    hours = (now - when).total_seconds() / 3600 if when else None
+    if hours is None:
+        ago = "时间不明"
+    elif hours < 0:
+        ago = "时间戳在未来，这台机器的时钟不对"
+    elif hours < 1:
+        ago = "刚刚"
+    else:
+        ago = f"{hours:.0f} 小时前"
+    level = BAD if hours is None or hours < 6 else WARN
+    report.add(level, f"接口出过错（{ago}）", _safe_detail(detail or stamp))
+
+
+def check_backup(report: Report, db_path: Path, now: datetime) -> None:
+    """异地备份还在不在。那个文件没了，她就不认识你了。
+
+    复用 `backup` 模块：它已经处理过读不出来（OSError）和内容不是时间（ValueError），
+    而这里原来是 `mark.read_text()` 裸调——标记文件变成目录就直接把体检打崩。
+    """
     when = backup.last_backup_at(db_path)
     if when is None:
         report.add(BAD, "没有异地备份", "她的记忆只存在这一台机器上。看 DEPLOY.md。")
+        return
+    hours = (now - when).total_seconds() / 3600
+    if hours < -1:
+        # 未来的标记（时钟跳变、从别的机器搬过来的 data/、手写的文件）
+        # 原来会算出负的小时数，一路走到 `hours > 48` 那个分支的反面，
+        # 把整份报告里最该响的那个 BAD 永久按住。
+        ahead = f"{-hours / 24:.0f} 天后" if -hours >= 24 else f"{-hours:.0f} 小时后"
+        report.add(
+            BAD,
+            f"备份的时间戳在未来（{ahead}）",
+            "这台机器的时钟不对，或者这份 data/ 是从别处搬来的。"
+            "在查清楚之前，别把这个当成备份正常。",
+        )
+    elif hours > 48:
+        report.add(BAD, f"备份停了 {hours / 24:.0f} 天", "去看 cron 和 /var/log/chloe-backup.log")
     else:
-        hours = (now - when).total_seconds() / 3600
-        if hours < -1:
-            # 未来的标记（时钟跳变、从别的机器搬过来的 data/、手写的文件）
-            # 原来会算出负的小时数，一路走到 `hours > 48` 那个分支的反面，
-            # 把整份报告里最该响的那个 BAD 永久按住。
-            report.add(
-                BAD,
-                f"备份的时间戳在未来（{-hours / 24:.0f} 天后）",
-                "这台机器的时钟不对，或者这份 data/ 是从别处搬来的。"
-                "在查清楚之前，别把这个当成备份正常。",
-            )
-        elif hours > 48:
-            report.add(BAD, f"备份停了 {hours / 24:.0f} 天", "去看 cron 和 /var/log/chloe-backup.log")
-        else:
-            report.add(OK, f"上次备份 {max(hours, 0):.0f} 小时前")
+        report.add(OK, f"上次备份 {max(hours, 0):.0f} 小时前")
 
 
 def check_stuck(report: Report, conn: sqlite3.Connection, now: datetime) -> None:
@@ -460,6 +526,24 @@ def check_stuck(report: Report, conn: sqlite3.Connection, now: datetime) -> None
         )
     elif hours > 12:
         report.add(WARN, f"有 {len(stamps)} 条未读，最早那条是 {_span(hours * 60)} 前的")
+
+
+def check_deliverable(report: Report, conn: sqlite3.Connection) -> None:
+    """她的话发不发得出去。**这是"她坏了"的另一半。**
+
+    私聊被 Discord 挡掉时（他退了共同服务器、关了对陌生人的私信），
+    消息照样被 `mark_read`、任务照样 done，只是 `deliverable` 被置 0——
+    她想说的话一个字都到不了他手里，而报告里每一项都正常。
+    `check_stuck` 只看得见未读那一半，这一列才是另一半。
+    """
+    rows = _rows(conn, "SELECT deliverable FROM conversations")
+    if rows and any(not r["deliverable"] for r in rows):
+        report.add(
+            BAD,
+            "她的话发不出去（Discord 拒收）",
+            "多半是你退了共同的服务器，或者关掉了那个服务器的成员私信。"
+            "加回来之后她自己会恢复——她发出去一条就把这个判断收回来了。",
+        )
 
 
 def check_memory(report: Report, conn: sqlite3.Connection) -> None:
@@ -512,6 +596,8 @@ def run(
         # 而更早以前它被 _rows 整个吞掉——印出一份全绿的体检单，退出码 0。
         conn.execute("SELECT 1 FROM messages LIMIT 1").fetchall()
     except sqlite3.DatabaseError as exc:
+        with contextlib.suppress(Exception):
+            conn.close()
         report.add(
             BAD,
             f"读不了 {db_path}",
@@ -521,20 +607,30 @@ def run(
         )
         return report
 
+    # 顺序是故意的：**"她坏了"那几项排在最前**。
+    # 每项各自兜异常——一列缺失（比如刚部署完、她还没重启，jobs 还没有
+    # finished_at）原来会把后面整段吞掉，而最该响的备份和接口恰好在最后。
+    checks: list[tuple[str, Callable[[], None]]] = [
+        ("她是不是卡住了", lambda: check_stuck(report, conn, now)),
+        ("话发不发得出去", lambda: check_deliverable(report, conn)),
+        # **拆成三项，各自兜异常。** 合成一项的话，"重试到放弃的任务"那句 SQL
+        # 碰上一列缺失，就把后面的"接口"和"备份"一起带走了——
+        # 而那两项恰恰是最该响的。
+        ("失败的任务", lambda: check_failed_jobs(report, conn, since)),
+        ("接口", lambda: check_api(report, conn, now)),
+        ("备份", lambda: check_backup(report, db_path, now)),
+        ("回复间隔", lambda: check_rhythm(report, reply_gaps(conn, since))),
+        ("沉默比例", lambda: check_silence(report, conn, since)),
+        ("主动开口", lambda: check_proactive(report, conn, since, max_per_day, kinds_known)),
+        ("事情挤不挤", lambda: check_bursts(report, conn, since)),
+        ("记忆和台账", lambda: check_memory(report, conn)),
+    ]
     try:
-        check_stuck(report, conn, now)
-        check_rhythm(report, reply_gaps(conn, since))
-        check_silence(report, conn, since)
-        check_proactive(report, conn, since, max_per_day, kinds_known)
-        check_bursts(report, conn, since)
-        check_memory(report, conn)
-        check_health(report, conn, db_path, now, since)
-    except sqlite3.DatabaseError as exc:
-        report.add(
-            BAD,
-            "查到一半读不下去了，**下面这份报告不完整**",
-            _safe_detail(str(exc)),
-        )
+        for name, check in checks:
+            try:
+                check()
+            except Exception as exc:  # noqa: BLE001 - 一项坏了不能连累别的
+                report.add(WARN, f"「{name}」这一项没查成", _safe_detail(str(exc)))
     finally:
         conn.close()
     return report

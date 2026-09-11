@@ -58,6 +58,12 @@ PHOTO_SHORTLIST = 20
 CATCHUP_CURSOR = "catchup_cursor:"
 """补抓的游标前缀，后面接频道 id。**一个频道一个**，见 _catch_up_channels。"""
 
+CATCHUP_SEEN = "catchup_channels"
+"""见过的入口频道 id，逗号分隔。用来在开始翻之前就把每个入口的基线钉住。"""
+
+LAST_INBOUND = "last_inbound_channel"
+"""他最后一次说话的频道。消息表里不存频道，补救路径只能靠它才知道该回哪儿。"""
+
 
 def time_of_day_at(dt: datetime) -> TimeOfDay:
     """给照片挑选用的时段。半夜不该发白天拍的照片。"""
@@ -292,6 +298,38 @@ class App:
         finally:
             self._catching_up = False
 
+    async def _remember_inbound(self, channel_id: int | None) -> None:
+        """记下他最后一次说话的地方。消息表里不存频道，只能单独记一份。"""
+        if isinstance(channel_id, int):
+            await self.memory.kv_set(LAST_INBOUND, str(channel_id))
+
+    async def _pin_baselines(self, newest: int) -> None:
+        """**开始翻之前**就把每个已知入口的游标基线钉住。
+
+        只在"翻到这个频道"的时候才钉是不够的：某一轮拿不到它
+        （限流、权限刚变），它连 kv 都不会被建；而同一轮另一个频道补抓成功，
+        会把库里最大的编号推上去。等下一轮它恢复了，起点就落在被推过去的位置，
+        中间他在那儿说的话永久跳过。实测两百个随机场景里有二十九个这样丢消息。
+
+        公开频道的 id 在配置里就有，拿不到频道也知道；私聊的 id 第一次
+        解析成功之后记进 kv，之后就一直知道了。
+        """
+        known: set[int] = set()
+        if self.settings.proactive_channel_id:
+            known.add(self.settings.proactive_channel_id)
+        raw = await self.memory.kv_get(CATCHUP_SEEN) or ""
+        known |= {int(x) for x in raw.split(",") if x.strip().isdigit()}
+        for cid in known:
+            key = f"{CATCHUP_CURSOR}{cid}"
+            if not await self.memory.kv_get(key):
+                await self.memory.kv_set(key, str(newest))
+
+    async def _remember_channel_ids(self, channels: list[Any]) -> None:
+        raw = await self.memory.kv_get(CATCHUP_SEEN) or ""
+        known = {int(x) for x in raw.split(",") if x.strip().isdigit()}
+        known |= {c.id for c in channels if isinstance(getattr(c, "id", None), int)}
+        await self.memory.kv_set(CATCHUP_SEEN, ",".join(str(i) for i in sorted(known)))
+
     async def _inbound_channels(self) -> list[Any]:
         """他可能说话的所有地方。私聊永远算一个。"""
         found: list[Any] = []
@@ -346,7 +384,11 @@ class App:
         私聊先翻、公开频道后翻的话，取遍历顺序会把他在私聊里说的最后一句
         回到公开频道去。"""
 
-        for channel in await self._inbound_channels():
+        channels = await self._inbound_channels()
+        await self._remember_channel_ids(channels)
+        await self._pin_baselines(newest)
+
+        for channel in channels:
             key = f"{CATCHUP_CURSOR}{getattr(channel, 'id', 0)}"
             stored_cursor = await self.memory.kv_get(key)
             if (stored_cursor or "").isdigit():
@@ -418,6 +460,7 @@ class App:
                         recovered += 1
                         if latest is None or at > latest[0]:
                             latest = (at, getattr(message.channel, "id", None))
+                            await self._remember_inbound(latest[1])
                 if len(batch) < page:
                     break
             else:
@@ -508,9 +551,20 @@ class App:
         log.info(
             "[inbox] %d 字%s", len(message.content), " 带图" if attachments else ""
         )
+        await self._remember_inbound(getattr(message.channel, "id", None))
         await self._schedule_reply(now, channel_id=message.channel.id)
 
     async def _schedule_reply(self, now: datetime, channel_id: int | None = None) -> None:
+        if channel_id is None:
+            # **不知道回哪儿的时候，回他最后说话的地方，不是默认频道。**
+            # `resolve_channel(None)` 返回的是主动消息的去处——配了
+            # PROACTIVE_CHANNEL_ID 就是那个公开频道。补抓的补救路径
+            # （上一轮半途炸了、这一轮全是重复）走的正是这条，
+            # 于是他在私聊里说的话会被当着别人的面回出去。
+            # 消息表里不存频道，所以这个值得单独记一份。
+            remembered = await self.memory.kv_get(LAST_INBOUND)
+            if (remembered or "").isdigit():
+                channel_id = int(remembered)
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         if not unread:
@@ -519,7 +573,15 @@ class App:
         # 热度看的是这批消息**到来之前**对话有多热。
         # 用会话表上的 last_user_message_at 是错的：那个字段已经被刚收到的
         # 这条消息更新过了，间隔永远是 0，于是永远判成热聊，她就永远秒回。
-        prior = await self.memory.last_exchange_before(CONVERSATION_ID, unread[0].id)
+        # **要这批里最小的 id，不是第一条的 id。** 未读现在按时间排，
+        # 而补抓是一个频道一整段写库的，时间序和 id 序不再一致：
+        # 私聊先翻（id 大、时间晚）、公开频道后翻（id 小、时间早）时，
+        # `unread[0].id` 是个大的，`last_exchange_before` 就把同一批里的
+        # 另一条也捞了进来——那条比 unread[0] 还晚，`heat_of` 把它滤掉，
+        # 于是什么都没有，一律判成 cold。他两分钟前还在说话，她等十五分钟才回。
+        prior = await self.memory.last_exchange_before(
+            CONVERSATION_ID, min(m.id for m in unread)
+        )
         heat = heat_of(
             unread[0].created_at,
             prior,

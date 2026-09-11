@@ -1695,3 +1695,129 @@ async def test_an_unknown_np_command_says_so_instead_of_doing_nothing(
     )
     text = await owner_cmds.handle("!np staus", ctx)
     assert "不认识" in text
+
+
+async def test_the_fallback_reply_goes_to_the_dm_not_the_public_channel(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补救路径也要回到他说话的地方。
+
+    上一轮补抓在"消息已入库"和"排回复"之间炸了，这一轮全是重复、
+    `recovered` 是 0，走的是补排那条分支——而它原来不传频道，
+    `resolve_channel(None)` 返回的是**主动消息的去处**，
+    配了 PROACTIVE_CHANNEL_ID 就是那个公开频道。
+    于是他在私聊里说的话会被当着别人的面回出去。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    dm = FakeHistoryChannel([], channel_id=999)
+    public = FakeHistoryChannel([], channel_id=777)
+    wire_inbound(app, dm, public)
+
+    # 上一轮的残局：私聊那条进了库、没人排回复，而"他在哪说的"已经记下了
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    await app._remember_inbound(dm.id)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done", at=EVENING)
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID,
+            discord_message_id=101,
+            author_id=42,
+            author_name="Leo",
+            content="上一轮进来但没排上的",
+            created_at=EVENING + timedelta(minutes=5),
+        )
+    )
+
+    assert await app.catch_up() == 0
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert job.payload.get("channel_id") == dm.id, (
+        f"补排的回复要去私聊 {dm.id}，实际去了 {job.payload.get('channel_id')}"
+    )
+
+
+async def test_a_channel_missing_for_one_round_does_not_lose_its_messages(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """某一轮**连频道都拿不到**时，那个频道的消息也不能丢。
+
+    "第一次翻到这个频道就把基线钉住"只在它进得了补抓循环时才生效。
+    拿不到（限流、权限刚变）的那一轮它连 kv 都不会被建，
+    而同一轮私聊补抓成功会把库里最大的编号推上去——
+    下一轮它恢复了，起点就落在被推过去的位置，中间的消息永久跳过。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done", at=EVENING)
+
+    public = FakeHistoryChannel(
+        [fake_incoming(150, "公开频道里的", EVENING + timedelta(minutes=5), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(200, "私聊里的", EVENING + timedelta(minutes=10), channel_id=999)],
+        channel_id=999,
+    )
+    app.settings.proactive_channel_id = public.id
+    app._should_handle = lambda _m: True
+
+    reachable = {"public": False}
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_user=lambda _id: SimpleNamespace(dm_channel=dm),
+        get_channel=lambda _cid: public if reachable["public"] else None,
+        fetch_channel=None,
+    )
+
+    assert await app.catch_up() == 1, "私聊那条这一轮就该补回来"
+    reachable["public"] = True  # 下一轮它恢复了
+    assert await app.catch_up() == 1, "公开频道那条要在这一轮补回来"
+
+    ids = {m.discord_message_id for m in await memory.unread_messages(CONVERSATION_ID)}
+    assert 150 in ids, f"那一轮拿不到频道，它的消息就永久没了：{sorted(ids)}"
+
+
+async def test_catching_up_out_of_id_order_does_not_fake_a_cold_conversation(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓打乱 id 序之后，"这批消息之前对话有多热"不能算错。
+
+    `last_exchange_before` 要的是这批里**最小**的 id。未读现在按时间排，
+    而补抓是一个频道一整段写库的：私聊先翻（id 大、时间晚）、
+    公开频道后翻（id 小、时间早）时，`unread[0].id` 是个大的，
+    于是同一批里的另一条被当成"上一次交流"捞了进来——
+    那条比 unread[0] 还晚，`heat_of` 把它整个滤掉，结果一律判成 cold。
+    他两分钟前还在说话，她按"冷了"处理，等十几分钟才回。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    # 先来一次真正的交流，它才是"上一次交流"
+    await send(app, "在图书馆", at=EVENING, msg_id=100)
+    await memory.add_bot_message(CONVERSATION_ID, "嗯", EVENING + timedelta(minutes=1))
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await memory.set_job_status(job.id or 0, "done", at=EVENING)
+    await memory.mark_read(
+        [m.id for m in await memory.unread_messages(CONVERSATION_ID)],
+        EVENING + timedelta(minutes=1),
+    )
+
+    # 补抓：公开频道那条时间早、id 大（私聊先入库）
+    public = FakeHistoryChannel(
+        [fake_incoming(300, "公开频道 20:02", EVENING + timedelta(minutes=2), channel_id=777)],
+        channel_id=777,
+    )
+    dm = FakeHistoryChannel(
+        [fake_incoming(301, "私聊 20:04", EVENING + timedelta(minutes=4), channel_id=999)],
+        channel_id=999,
+    )
+    wire_inbound(app, dm, public)
+    await app.catch_up()
+
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    assert [m.discord_message_id for m in unread] == [300, 301], "前提不成立：不是时间序"
+    assert unread[0].id > unread[1].id, "前提不成立：id 序和时间序没错开"
+
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert "cold" not in job.reason, (
+        f"他两分钟前还在说话，却被判成冷了：{job.reason}"
+    )

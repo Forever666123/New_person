@@ -25,6 +25,30 @@ NOW = datetime(2026, 9, 25, 12, 0, tzinfo=UTC)
 # 于是"任务扎堆"那一项在测试里跑的是另一套数据形状。
 
 
+def say(conn: sqlite3.Connection, at: datetime, read_at: datetime | None = None) -> None:
+    """他说一句。``read_at`` 是**她处理这一批的时刻**，不是他说话的时刻。
+
+    线上就是这样的：`mark_read` 在模型返回之后才调，用的是那一刻的时间，
+    而且一次把整批未读都标上。体检正是靠这个值把"一批"认出来的——
+    造数据时写成他自己的时间，测出来的就是另一套东西。
+    """
+    conn.execute(
+        "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
+        " VALUES ('dm','user','他说的话',?,?)",
+        (at.isoformat(), read_at.isoformat() if read_at else None),
+    )
+
+
+def she_says(conn: sqlite3.Connection, at: datetime, bubbles: int = 1) -> None:
+    """她说一次话。几个气泡共用同一个时刻，线上就是这么记的。"""
+    for _ in range(bubbles):
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
+            " VALUES ('dm','bot','她说的话',?)",
+            (at.isoformat(),),
+        )
+
+
 def make_db(path: Path, gaps: list[float], seed: int = 1) -> Path:
     """按给定的"他发完到她回"的间隔造一个库。"""
     rng = random.Random(seed)
@@ -32,17 +56,10 @@ def make_db(path: Path, gaps: list[float], seed: int = 1) -> Path:
     conn.executescript(SCHEMA)
     at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
     for gap in gaps:
-        conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
-            " VALUES ('dm','user','他说的话',?,?)",
-            (at.isoformat(), at.isoformat()),
-        )
+        spoke = at
         at += timedelta(minutes=gap)
-        conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-            " VALUES ('dm','bot','她说的话',?)",
-            (at.isoformat(),),
-        )
+        say(conn, spoke, read_at=at)
+        she_says(conn, at)
         at += timedelta(hours=rng.uniform(2, 20))
     conn.commit()
     conn.close()
@@ -279,42 +296,30 @@ def test_an_exception_in_a_job_reason_is_not_printed(tmp_path: Path) -> None:
     assert secret not in text
 
 
-def test_silence_is_counted_in_turns_on_both_sides(tmp_path: Path) -> None:
-    """沉默比例要**两边都数轮次**，一边数轮次一边数条数是错的。
+def test_silence_is_counted_per_batch_she_processed(tmp_path: Path) -> None:
+    """沉默比例数的是"她处理过的一批"，不是"他说了几轮"。
 
-    气泡那一侧曾经数错过：她一次回复分三个气泡，拿气泡数比消息数，
-    真实 40% 的沉默会被算成 0%。但他那一侧同样不能数条数——
-    他连发三行是一轮，她回一次就是接住了。混着数的话，
-    这个比例实际测的是"他平均一轮打几行字"，而把未读并成一次回复
-    正是这个项目的设计，所以它必然大于 1：
-    他每轮三行、她**每轮都回**，会被报成"没接话的比例 67%"。
+    **她是把整批未读并成一次回复的**——那正是这个项目的设计。
+    他隔两小时说的三句话，只要她还没回，就是同一批，她回一次就是全接住了。
+    按"他每隔多久算新一轮"去切的话，每隔一段就凭空多出一个"没接话"：
+    实测她一条都没漏的十四天被算成沉默 35%，而他在悉尼、她在波士顿，
+    他白天说的话正落在她睡觉的时候，这种间隔是常态不是边角。
 
-    这里造的库两边都掺了：他有时一行、有时三行，她回的时候发两三个气泡。
-    十六轮里她接了九轮，最后那一轮她可能还没到点回、不算数，
-    于是十五轮里接了九轮，答案是 40%。
+    这里造二十批，她接住了十二批，答案就是 40%。
+    每一批里他说的话条数、隔了多久都故意不一样，那些都不该影响结果。
     """
-    path = tmp_path / "turns.db"
+    path = tmp_path / "batches.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
     at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
-    for i in range(16):
-        for _ in range(3 if i % 2 else 1):  # 他一轮里打一到三行
-            conn.execute(
-                "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
-                " VALUES ('dm','user','x',?,?)",
-                (at.isoformat(), at.isoformat()),
-            )
-            at += timedelta(seconds=40)
-        at += timedelta(minutes=10)
-        if i < 9:  # 十五轮里接住九轮
-            for _ in range(2 + i % 2):  # 她一次回两三个气泡
-                conn.execute(
-                    "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-                    " VALUES ('dm','bot','y',?)",
-                    (at.isoformat(),),
-                )
-                at += timedelta(seconds=20)
-        at += timedelta(hours=3)
+    for i in range(20):
+        spoke = [at + timedelta(minutes=45 * j) for j in range(1 + i % 3)]
+        read_at = spoke[-1] + timedelta(minutes=18)
+        for one in spoke:
+            say(conn, one, read_at=read_at)
+        if i < 12:
+            she_says(conn, read_at, bubbles=1 + i % 3)
+        at = read_at + timedelta(hours=4)
     conn.commit()
     conn.close()
 
@@ -322,34 +327,30 @@ def test_silence_is_counted_in_turns_on_both_sides(tmp_path: Path) -> None:
     assert "40%" in finding.line, f"应该报 40% 沉默，实际：{finding.line}"
 
 
-def test_answering_every_single_turn_is_flagged_even_when_he_sends_three_lines(
+def test_answering_every_batch_is_flagged_even_when_he_spreads_it_over_hours(
     tmp_path: Path,
 ) -> None:
-    """他每轮打三行、她每轮都回——这是"有问必答"，不是"漏了三分之二"。"""
-    path = tmp_path / "every.db"
+    """他隔几小时连着说了几句、她一次全回——这是"有问必答"，不是"漏了大半"。
+
+    这一项是整份报告里唯一盯"她变成助手"的判据。按他说话的间隔切轮次的话，
+    它在真实流量下**永远不会响**（实测八个种子最低 19%）。
+    """
+    path = tmp_path / "everybatch.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
     at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
     for _ in range(15):
-        for _ in range(3):
-            conn.execute(
-                "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
-                " VALUES ('dm','user','x',?,?)",
-                (at.isoformat(), at.isoformat()),
-            )
-            at += timedelta(seconds=40)
-        at += timedelta(minutes=10)
-        conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-            " VALUES ('dm','bot','y',?)",
-            (at.isoformat(),),
-        )
-        at += timedelta(hours=3)
+        spoke = [at, at + timedelta(minutes=45), at + timedelta(minutes=100)]
+        read_at = spoke[-1] + timedelta(minutes=12)
+        for one in spoke:
+            say(conn, one, read_at=read_at)
+        she_says(conn, read_at, bubbles=2)
+        at = read_at + timedelta(hours=5)
     conn.commit()
     conn.close()
 
     finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
-    assert "有问必答" in finding.line, f"他连发三行被当成她漏了两条：{finding.line}"
+    assert "有问必答" in finding.line, f"她一条没漏却被说成漏了：{finding.line}"
 
 
 def test_days_of_total_silence_are_not_reported_as_normal(tmp_path: Path) -> None:
@@ -637,44 +638,55 @@ def test_a_fast_but_long_tailed_median_is_not_called_instant_replies(tmp_path: P
     assert rhythm_finding(report).level != doctor.BAD, rhythm_finding(report).line
 
 
-def test_speaking_up_after_her_own_reply_still_counts_as_speaking_up(tmp_path: Path) -> None:
-    """她回完他之后、隔几小时又主动找他——那一次不能被漏掉。
+def test_speaking_up_soon_after_her_own_reply_still_counts_as_speaking_up(
+    tmp_path: Path,
+) -> None:
+    """她回完他之后隔一会儿又自己开口——那是两件事，第二件是主动开口。
 
-    只看"上一条是不是也是她说的"来合并气泡的话，这种主动开口
-    上一条恰好也是她说的，于是整类被吞掉：实测十四天里九次主动
-    报成了"0.0 次/天"。区分"同一次的下一个气泡"和"隔了几小时又开口"
-    靠的是时间间隔，不是说话人。
+    按"上一条是不是也是她说的"去合并气泡，会把这一整类吞掉；
+    改成看时间间隔，也只是把盲区从"她刚说过话"缩成"她 N 分钟内说过话"——
+    而 `handle_proactive_job` 只在热聊（180 秒内）时才退出，
+    三分钟之后她就允许主动开口了。所以这里隔五分钟就该数上。
     """
     path = tmp_path / "speakup.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
     at = NOW - timedelta(days=10)
     for _ in range(10):
-        conn.execute(
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at)"
-            " VALUES ('dm','user','x',?,?)",
-            (at.isoformat(), at.isoformat()),
-        )
-        at += timedelta(minutes=20)
-        for _ in range(2):  # 她回两个气泡
-            conn.execute(
-                "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-                " VALUES ('dm','bot','y',?)",
-                (at.isoformat(),),
-            )
-            at += timedelta(seconds=15)
-        at += timedelta(hours=5)
-        conn.execute(  # 隔五小时她自己又开口了
-            "INSERT INTO messages (conversation_id, author_kind, content, created_at)"
-            " VALUES ('dm','bot','刚下课',?)",
-            (at.isoformat(),),
-        )
-        at += timedelta(hours=4)
+        read_at = at + timedelta(minutes=20)
+        say(conn, at, read_at=read_at)
+        she_says(conn, read_at, bubbles=2)
+        she_says(conn, read_at + timedelta(minutes=5))  # 隔五分钟她自己又开口
+        at = read_at + timedelta(hours=8)
     conn.commit()
     conn.close()
 
     finding = next(f for f in doctor.run(path, NOW, days=10).findings if "主动开口" in f.line)
     assert "1.0 次/天" in finding.line, f"十次主动一次都没数上：{finding.line}"
+
+
+def test_speaking_up_after_a_message_she_chose_not_to_answer_is_counted(
+    tmp_path: Path,
+) -> None:
+    """他上午说了一句她没接，晚上她自己开口——那也是主动开口。
+
+    "他说过话之后她说的都算回复"这种判法会把这一整类记成 0，
+    而"他说了她没接"恰恰是这个人物最像人的行为之一。
+    """
+    path = tmp_path / "unanswered.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = NOW - timedelta(days=10)
+    for _ in range(10):
+        read_at = at + timedelta(minutes=25)
+        say(conn, at, read_at=read_at)       # 她看了，但没接话
+        she_says(conn, read_at + timedelta(hours=10))
+        at = read_at + timedelta(hours=14)
+    conn.commit()
+    conn.close()
+
+    finding = next(f for f in doctor.run(path, NOW, days=10).findings if "主动开口" in f.line)
+    assert "1.0 次/天" in finding.line, finding.line
 
 
 def test_pausing_her_does_not_make_the_checkup_scream(tmp_path: Path) -> None:
@@ -696,3 +708,70 @@ def test_pausing_her_does_not_make_the_checkup_scream(tmp_path: Path) -> None:
     report = doctor.run(path, NOW, days=40)
     assert not [f for f in report.findings if "还没回" in f.line], report.render()
     assert any("pause" in f.line for f in report.findings)
+
+
+def test_one_missing_column_does_not_swallow_the_backup_and_api_checks(
+    tmp_path: Path,
+) -> None:
+    """一项查不成，不能把后面整段吞掉——尤其是最该响的那几项。
+
+    真实场景：`finished_at` 是后加的迁移列，只在她的进程 `open()` 时补上。
+    部署完新代码、她还没重启的那个窗口里跑一次 cron 体检，就是这个形状。
+    原来全部检查共用一个 try，而"没有异地备份""密钥过期"恰好排在最后。
+    """
+    path = tmp_path / "oldschema.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA.replace("    finished_at TEXT,\n", ""))
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES ('last_api_error', ?)",
+        (f"{(NOW - timedelta(hours=1)).isoformat()}\t401 invalid x-api-key",),
+    )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=14)
+    lines = "\n".join(f.line for f in report.findings)
+    assert "没有异地备份" in lines, f"备份那一项被吞掉了：\n{report.render()}"
+    assert "接口出过错" in lines, f"接口那一项被吞掉了：\n{report.render()}"
+    assert any("没查成" in f.line for f in report.findings), "坏掉的那一项应该说一声"
+
+
+def test_the_burst_check_says_when_it_has_nothing_to_look_at(tmp_path: Path) -> None:
+    """没数据也要说一声。别的每一项都会说"样本还不够"，只有这一项原来是直接蒸发的。
+
+    报告里少一行，谁也不会注意到——而那正是"报假平安"的一种。
+    """
+    path = make_db(tmp_path / "nofinish.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    at = NOW - timedelta(days=2)
+    for i in range(20):  # 迁移之前就结束的任务，finished_at 永远是 NULL
+        conn.execute(
+            "INSERT INTO jobs (kind, status, run_at, reason, created_at)"
+            " VALUES ('reply','done',?,'',?)",
+            ((at + timedelta(minutes=i)).isoformat(),) * 2,
+        )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert any("看不出事情挤不挤" in f.line for f in report.findings), report.render()
+
+
+def test_her_words_not_reaching_him_at_all_is_the_loudest_thing(tmp_path: Path) -> None:
+    """私聊被 Discord 挡掉——她想说的话一个字都到不了，而报告里每一项都正常。
+
+    消息照样被 `mark_read`、任务照样 done，只有 `deliverable` 被置 0，
+    而报告从不读这一列。`check_stuck` 只看得见未读那一半。
+    """
+    path = make_db(tmp_path / "blocked.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO conversations (id, kind, deliverable) VALUES ('owner','dm',0)"
+    )
+    conn.commit()
+    conn.close()
+
+    report = doctor.run(path, NOW, days=40)
+    assert any(f.level == doctor.BAD and "发不出去" in f.line for f in report.findings), (
+        report.render()
+    )
