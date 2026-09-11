@@ -1897,3 +1897,28 @@ async def test_np_status_says_it_out_loud_when_she_is_actually_stuck(
     # 暂停期间未读堆着是他自己要求的，不算卡住
     await memory.kv_set("paused", "1")
     assert "卡住" not in await owner_cmds.handle("!np status", ctx)
+
+
+async def test_pausing_her_does_not_eat_the_retry_budget(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """暂停期间那条回复被反复认领，但那不是"试了一次没成"。
+
+    `claim_job` 每认领一次 `attempts` 就 +1（那是为了让"进程跑到一半崩了"
+    也算一次尝试），而暂停分支只是把任务往后推十分钟，不走 `_handle_failure`，
+    所以这个数从来不清零。暂停满半小时就足以把三次重试的预算吃光：
+    resume 之后模型抖第一下——这个项目里最常见、设计上"当作这会儿没看手机"
+    的那种失败——那条任务直接判死，他那句话永远没人回。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    await send(app, "在吗", at=EVENING, msg_id=100)
+    job_id = (await memory.pending_jobs("reply", CONVERSATION_ID))[0].id or 0
+
+    await memory.kv_set("paused", "1")
+    for i in range(12):  # 暂停两小时，每十分钟被认领一次
+        clock.set(EVENING + timedelta(minutes=10 * (i + 1)))
+        await app.scheduler.run_due_once()
+
+    job = await memory.get_job(job_id)
+    assert job is not None and job.status == "pending", "暂停期间这条任务不该被判死"
+    assert job.attempts == 0, f"暂停吃掉了 {job.attempts} 次重试预算"

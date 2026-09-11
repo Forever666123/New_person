@@ -523,3 +523,39 @@ async def test_reaction_failure_does_not_lose_the_reply(
 
     assert channel.texts == ["嗯"]
     assert not result.reacted
+
+
+async def test_a_forbidden_reaction_does_not_mute_her(deliverer, channel) -> None:
+    """没有加表情的权限，不等于说不出话。**这两个是不同的权限。**
+
+    反应是加在所有文字**之前**的。403 往上抛的话，整条回复一个字都发不出去，
+    会话被标成 deliverable=0，而那个标记只在"真的发出了文字"时才收回来——
+    这条路永远走不到。她就此永久哑掉，而消息照样被 mark_read，
+    体检里"他的话没人回"那一项也一声不吭。
+    公开频道里机器人有 Send Messages 没有 Add Reactions 就是这个形状。
+    """
+
+    class NoReactions:
+        def __init__(self) -> None:
+            self.tried = 0
+
+        async def add_reaction(self, _emoji: str) -> None:
+            self.tried += 1
+            raise PermissionError403()
+
+    class PermissionError403(Exception):
+        status = 403
+
+    target = NoReactions()
+    result = await deliverer.deliver(
+        channel,
+        [ReplyPart(text="在的"), ReplyPart(text="刚下课")],
+        None,
+        reaction="👍",
+        react_to=target,
+    )
+
+    assert target.tried == 1, "前提不成立：没去加表情"
+    assert not result.reacted
+    assert result.sent_texts == ["在的", "刚下课"], "表情加不上就把话也咽回去了"
+    assert [s.content for s in channel.sends] == ["在的", "刚下课"]

@@ -305,3 +305,40 @@ async def test_recording_her_own_message_never_blows_up(memory: Memory) -> None:
     await memory.add_bot_message(CONV, "又一条", NOW + timedelta(minutes=1), discord_message_id=999)
     conv = await memory.get_conversation(CONV)
     assert conv.last_bot_message_at == NOW + timedelta(minutes=1)
+
+
+async def test_restoring_unread_only_puts_back_that_one_batch(memory: Memory) -> None:
+    """放回未读只该放回**那一批**，不是整部历史。
+
+    原来的条件是 `id <= upto_id AND read_at IS NOT NULL`，没有下界——
+    那是这个会话所有已读的消息。一次读不出存下来的 plan，
+    她就会把十几天前的几十条当成一批未读，一次性重新回一遍。
+    """
+    at = datetime(2026, 9, 20, 20, 0, tzinfo=TZ)
+    batches: list[list[int]] = []
+    for b in range(5):
+        ids = []
+        for j in range(2):
+            msg = await memory.add_user_message(
+                IncomingMessage(
+                    conversation_id="owner",
+                    discord_message_id=1000 + b * 10 + j,
+                    author_id=42,
+                    author_name="Leo",
+                    content=f"第 {b}-{j} 句",
+                    created_at=at,
+                )
+            )
+            ids.append(msg)
+            at += timedelta(minutes=1)
+        await memory.mark_read(ids, at)  # 一批一个 read_at，线上就是这样
+        at += timedelta(hours=6)
+        batches.append(ids)
+
+    assert await memory.unread_messages("owner") == []
+    restored = await memory.restore_unread("owner", batches[3][-1])
+    assert restored == 2, f"放回了 {restored} 条，该只有那一批的两条"
+    assert sorted(m.id for m in await memory.unread_messages("owner")) == batches[3]
+
+    # 再放一次什么都不会发生：那批已经是未读了
+    assert await memory.restore_unread("owner", batches[3][-1]) == 0

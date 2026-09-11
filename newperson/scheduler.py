@@ -107,6 +107,20 @@ class Scheduler:
         await self.memory.reschedule_job(job_id, run_at, payload)
         self._wake.set()
 
+    async def defer(self, job_id: int, run_at: datetime) -> None:
+        """把任务推到以后，**并且不算一次尝试**。
+
+        暂停期间、今天额度用完，都不是"试了一次没成"。用 reschedule 的话，
+        那条回复任务每十分钟被认领一次、``attempts`` 每次 +1，
+        而只有异常才会走 ``_handle_failure``，这个数从来不清零：
+        暂停满半小时就足以把三次重试的预算吃光。resume 之后模型抖第一下
+        （这个项目里最常见、设计上"当作这会儿没看手机"的那种失败），
+        那条任务直接判死，他那句话永远没人回。
+        """
+        await self.memory.reschedule_job(job_id, run_at)
+        await self.memory.uncount_attempt(job_id)
+        self._wake.set()
+
     async def cancel(self, job_id: int, reason: str = "") -> None:
         await self.memory.set_job_status(job_id, "cancelled", reason or None, at=self.clock.now())
         self._wake.set()

@@ -337,16 +337,23 @@ class Deliverer:
     # -- 细节 ---------------------------------------------------------------
 
     async def _react(self, react_to: Reactable, reaction: str, result: DeliveryResult) -> None:
-        """加表情反应。加不上不影响后面的文字，除非是 403。
+        """加表情反应。**加不上就跳过，403 也一样。**
 
-        表情是锦上添花：对方把那条消息删了、emoji 服务器不认，都不该让整条回复发不出去。
-        但 403 说明这个会话本来就发不出去，得往上报。
+        表情是锦上添花：对方把那条消息删了、emoji 服务器不认，
+        都不该让整条回复发不出去。
+
+        403 以前是往上抛的，理由是"这说明会话本来就发不出去"——那是错的。
+        加表情和发消息是**两个不同的权限**：公开频道里机器人有 Send Messages
+        没有 Add Reactions 就是这个形状。而反应是加在所有文字**之前**的，
+        于是一次 403 让整条回复一个字都发不出去，会话被标成 deliverable=0，
+        而那个标记只在"真的发出了文字"时才收回来——这条路永远走不到。
+        她就此永久哑掉，消息照样被 mark_read，`check_stuck` 一声不吭。
+
+        文字自己发不出去的时候，`_send` 那边照样会抛 403，该报的还是会报。
         """
         try:
             await react_to.add_reaction(reaction)
         except Exception as exc:
-            if _is_forbidden(exc):
-                raise
             log.warning("表情反应 %s 加不上，跳过：%s", reaction, exc)
             return
         result.reacted = True

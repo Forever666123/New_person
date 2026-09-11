@@ -752,9 +752,7 @@ class App:
     async def handle_reply_job(self, job: Job) -> None:
         if await owner_cmds.is_paused(self.memory):
             log.info("[job] 暂停中，回复先不发")
-            await self.scheduler.reschedule(
-                job.id or 0, self.clock.now() + timedelta(minutes=10)
-            )
+            await self.scheduler.defer(job.id or 0, self.clock.now() + timedelta(minutes=10))
             return
 
         now = self.clock.now()
@@ -821,7 +819,7 @@ class App:
         wake = self.rhythm.next_wake_after(now)
         run_at = self.rhythm.first_glance_after_waking(wake, self.rng)
         log.warning("[job] %s，推到 %s", why, run_at.strftime("%m-%d %H:%M"))
-        await self.scheduler.reschedule(job.id or 0, run_at)
+        await self.scheduler.defer(job.id or 0, run_at)
 
     async def _generate_reply(self, job: Job, unread: list, now: datetime):
         conv = await self.memory.get_conversation(CONVERSATION_ID)

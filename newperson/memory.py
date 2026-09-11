@@ -374,15 +374,26 @@ class Memory:
         return parse_dt(row["created_at"]) if row else None
 
     async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
-        """把一批消息放回未读。
+        """把**那一批**消息放回未读。
 
         存下来的回复读不出来时用：那批消息已经标成已读了，
         不放回去的话它们就再也不会被回复，而且没有任何征兆。
+
+        **只放回同一批的。** 原来的条件是 ``id <= upto_id AND read_at IS NOT NULL``，
+        没有下界——那是这个会话**所有**已读的消息。一次读不出 plan，
+        她就会把十几天前的几十条当成一批未读，一次性重新回一遍。
+
+        认批靠 ``read_at``：``mark_read`` 一批一条 UPDATE，
+        所以同一批共用一个值，而 ``upto_id`` 那条就在这一批里。
         """
+        row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (upto_id,))
+        stamp = row["read_at"] if row else None
+        if stamp is None:
+            return 0  # 已经放回去过了，或者这条不存在
         cur = await self.db.execute(
             "UPDATE messages SET read_at = NULL WHERE conversation_id = ?"
-            " AND author_kind = 'user' AND id <= ? AND read_at IS NOT NULL",
-            (conversation_id, upto_id),
+            " AND author_kind = 'user' AND id <= ? AND read_at = ?",
+            (conversation_id, upto_id, stamp),
         )
         await self.db.commit()
         return cur.rowcount
@@ -862,6 +873,18 @@ class Memory:
         if cur.rowcount == 0:
             return None
         return await self.get_job(job_id)
+
+    async def uncount_attempt(self, job_id: int) -> None:
+        """把刚才那次认领从 ``attempts`` 里减掉。见 :meth:`Scheduler.defer`。
+
+        ``claim_job`` 每认领一次就 +1，那是为了让"进程跑到一半崩了"也算一次尝试，
+        否则那种任务会永远重试下去。但**故意往后推**不是尝试——
+        暂停期间、额度用完，都不该消耗重试预算。
+        """
+        await self.db.execute(
+            "UPDATE jobs SET attempts = max(attempts - 1, 0) WHERE id = ?", (job_id,)
+        )
+        await self.db.commit()
 
     async def sweep_expired_leases(self, now: datetime) -> int:
         """把租约过期的 running 任务放回队列。进程崩了就靠这个。"""
