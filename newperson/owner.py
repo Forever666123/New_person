@@ -18,6 +18,8 @@ from . import backup as backup_mod
 from .memory import Memory
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from .life import LifeEngine
     from .rhythm import Rhythm
     from .scheduler import Scheduler
@@ -60,20 +62,7 @@ async def handle(text: str, ctx: OwnerContext) -> str:
     args = parts[1:]
     action = args[0].lower() if args else "help"
 
-    handlers = {
-        "status": _status,
-        "now": _now,
-        "retry": _retry,
-        "pause": _pause,
-        "resume": _resume,
-        "away": _away,
-        "back": _back,
-        "chatty": _chatty,
-        "ledger": _ledger,
-        "plan": _plan,
-        "help": _help,
-    }
-    handler = handlers.get(action)
+    handler = HANDLERS.get(action)
     if handler is None:
         return f"不认识 `{action}`。\n{HELP}"
     return await handler(args[1:], ctx)
@@ -301,3 +290,24 @@ async def away_state(memory: Memory, today: date) -> str | None:
 
 async def is_paused(memory: Memory) -> bool:
     return bool(await memory.kv_get("paused"))
+
+
+HANDLERS: dict[str, Callable[[list[str], OwnerContext], Awaitable[str]]] = {
+    "status": _status,
+    "now": _now,
+    "retry": _retry,
+    "pause": _pause,
+    "resume": _resume,
+    "away": _away,
+    "back": _back,
+    "chatty": _chatty,
+    "ledger": _ledger,
+    "plan": _plan,
+    "help": _help,
+}
+"""所有 `!np` 命令。**加新命令就在这儿加一行**（CLAUDE.md 里指的就是它）。
+
+放在模块层不是为了好看：这样测试能把它整个遍历一遍，
+新加的命令自动被"不许抛异常、不许返回空串"那条守着。
+在 handle() 里面的话，外面看不见它，新命令就是没人测的。
+"""

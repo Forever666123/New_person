@@ -1639,3 +1639,59 @@ async def test_catching_up_two_channels_keeps_the_unread_in_time_order(
     # 回复的目的地和 unread[-1] 必须指同一条消息，表情才不会贴错频道
     job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
     assert job.payload.get("channel_id") == dm.id
+
+
+async def test_every_np_command_answers_without_blowing_up(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """把 `!np` 的每一条都跑一遍：不许抛异常，不许返回空串。
+
+    这些命令是他在她不对劲的时候唯一的抓手——`!np status` 坏掉的那一刻，
+    正是他最需要它的那一刻，而它坏了不会有任何别的症状。
+
+    遍历的是 `owner.HANDLERS` 本身，所以**新加的命令自动被这条守着**。
+    """
+    from newperson import owner as owner_cmds
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "先说点什么", at=EVENING, msg_id=100)
+    ctx = owner_cmds.OwnerContext(
+        memory=memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=EVENING,
+    )
+    # 给每条命令一组说得通的参数；没列到的就按不带参数跑
+    args = {"away": "出差 5", "chatty": "0.5", "ledger": "study"}
+
+    for name in owner_cmds.HANDLERS:
+        text = await owner_cmds.handle(f"!np {name} {args.get(name, '')}".strip(), ctx)
+        assert isinstance(text, str) and text.strip(), f"`!np {name}` 回了个空"
+        assert "Traceback" not in text, f"`!np {name}` 把异常回出去了：{text}"
+
+    # 跑完之后别把她留在暂停或者请假状态里
+    await owner_cmds.handle("!np resume", ctx)
+    await owner_cmds.handle("!np back", ctx)
+    assert not await memory.kv_get("paused")
+    assert not await memory.kv_get("away_note")
+
+
+async def test_an_unknown_np_command_says_so_instead_of_doing_nothing(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """打错的命令要有回音。没回音的话他分不清是打错了还是她坏了。"""
+    from newperson import owner as owner_cmds
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    ctx = owner_cmds.OwnerContext(
+        memory=memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=EVENING,
+    )
+    text = await owner_cmds.handle("!np staus", ctx)
+    assert "不认识" in text
