@@ -521,11 +521,11 @@ def check_stuck(report: Report, conn: sqlite3.Connection, now: datetime) -> None
     if hours > 24:
         report.add(
             BAD,
-            f"他 {_span(hours * 60)} 前说的话还没回（一共 {len(stamps)} 条未读）",
+            f"他 {_span(hours * 60)}前说的话还没回（一共 {len(stamps)} 条未读）",
             "她睡得再久也不会超过一天。查 journalctl，看是不是卡在某个任务上。",
         )
     elif hours > 12:
-        report.add(WARN, f"有 {len(stamps)} 条未读，最早那条是 {_span(hours * 60)} 前的")
+        report.add(WARN, f"有 {len(stamps)} 条未读，最早那条是 {_span(hours * 60)}前的")
 
 
 def check_deliverable(report: Report, conn: sqlite3.Connection) -> None:
