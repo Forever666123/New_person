@@ -190,8 +190,12 @@ Discord 给每个机器人每 24 小时 1000 次 IDENTIFY（断线重连走 RESU
 ### 更新代码
 
 ```bash
-cd /opt/New_person && git pull && .venv/bin/pip install -e . && systemctl restart chloe
+/opt/New_person/scripts/update.sh
 ```
+
+它会拉代码、装依赖、**先跑一遍 check 确认新代码能起来**、再重启，最后确认服务真的活着。
+check 没过就不重启——她继续用旧代码跑着，比停在崩溃循环里强得多。
+代码没变化就直接退出，不会白重启一次。
 
 她的记忆在 `data/` 里，不受影响。改了 `persona.yaml` 也要 restart 才生效。
 
