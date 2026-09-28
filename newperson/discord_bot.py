@@ -19,6 +19,7 @@ import contextlib
 import logging
 import random
 import signal
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,8 @@ class App:
         """补抓正在跑。重连风暴时两个 on_ready 会重叠。"""
         self._tasks: set[asyncio.Task] = set()
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
+        self.on_phone: Callable[[], None] | None = None
+        """她拿起手机了（在线状态亮几分钟）。连上 Discord 之后由 client 接上。"""
 
     # -- 启动 ---------------------------------------------------------------
 
@@ -806,6 +809,12 @@ class App:
             diary_notes=notes,
         )
 
+    def _on_phone(self) -> None:
+        """她真的在用手机：要打字发出去了。在线状态只跟着这个亮。"""
+        if self.on_phone is not None:
+            with contextlib.suppress(Exception):
+                self.on_phone()
+
     def _local_stamps(self, messages: list, now: datetime) -> list:
         """聊天记录的时间戳换成她此刻所在的时区，跟"现在是几点"对得上。"""
         tz = self.rhythm.local_time(now).tzinfo
@@ -979,6 +988,8 @@ class App:
         async def interrupted() -> bool:
             return await self.memory.has_newer_user_message(CONVERSATION_ID, covers)
 
+        self._on_phone()
+
         async def on_progress(index: int) -> None:
             await self.memory.save_job_progress(
                 job.id or 0,
@@ -1124,27 +1135,70 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=ok)
             log.info("[delivery] 发送通道恢复了" if ok else "[delivery] 发不出去了")
 
+    async def _skip(self, job: Job, why: str) -> None:
+        """这次什么都不说。**记成作废，不是做完。**
+
+        体检按做完的任务数她主动开口的花样和"办事型"占比。什么都没发的任务
+        记成做完的话，一个空照片库的 window_photo、三个撞上未读的 follow_up，
+        就能把"她主动说的话里 75% 在办事"凭空印出来——而她实际上只说了一句闲话。
+        """
+        log.info("[proactive] %s", why)
+        await self.scheduler.cancel(job.id or 0)
+
+    async def _later(self, job: Job, now: datetime, minutes: tuple[float, float], why: str) -> None:
+        """过一会儿再说。挪到她醒着的时候。"""
+        run_at = self.life._awake_at_or_after(
+            now + timedelta(minutes=self.rng.uniform(*minutes))
+        )
+        log.info("[proactive] %s，%s 再说", why, run_at.strftime("%m-%d %H:%M"))
+        await self.scheduler.defer(job.id or 0, run_at)
+
     async def handle_proactive_job(self, job: Job) -> None:
         now = self.clock.now()
+        kind = job.payload.get("kind", "own_life")
+        # 她自己答应过的事（"我查完告诉你"）不能因为时机不巧就没了：
+        # 别的主动可有可无，这种丢了就是说话不算数。
+        promised = kind == "follow_up"
         if await owner_cmds.is_paused(self.memory):
+            if promised:
+                await self._later(job, now, (30, 90), "暂停中")
+                return
+            await self._skip(job, "暂停中")
             return
         if self.rhythm.is_sleeping(now):
-            log.info("[proactive] 这会儿在睡觉，算了")
+            if promised:
+                await self._later(job, now, (0, 1), "这会儿在睡觉")
+                return
+            await self._skip(job, "这会儿在睡觉，算了")
             return
 
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         if not conv.deliverable:
+            await self._skip(job, "发不出去")
             return
 
         # 有未读就不另起话头了，那是回复该做的事
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if unread or pending:
-            log.info("[proactive] 有未读，本来想说的话并进回复里")
             if pending:
+                reply = pending[0]
+                payload = None
+                if promised and not reply.progress.get("plan"):
+                    # 并进这次回复：她正要回他，顺便把答应的事说了
+                    hints = [*reply.payload.get("hints", []),
+                             f"你之前答应过他的事，这次顺便说：{job.payload.get('note', '')}"]
+                    payload = {**reply.payload, "hints": hints}
                 await self.scheduler.reschedule(
-                    pending[0].id or 0, now + timedelta(seconds=self.rng.uniform(20, 90))
+                    reply.id or 0, now + timedelta(seconds=self.rng.uniform(20, 90)), payload
                 )
+                if payload is not None:
+                    await self._skip(job, "有未读，答应他的事并进这次回复里说")
+                    return
+            if promised:
+                await self._later(job, now, (15, 40), "有未读，答应他的事等这轮回完")
+                return
+            await self._skip(job, "有未读，本来想说的话并进回复里")
             return
 
         heat = heat_of(
@@ -1155,11 +1209,13 @@ class App:
             self.persona.timing.warm_seconds,
         )
         if heat == "hot":
-            log.info("[proactive] 正聊着呢，不用另起话头")
+            if promised:
+                await self._later(job, now, (10, 30), "正聊着，答应他的事等这阵聊完")
+                return
+            await self._skip(job, "正聊着呢，不用另起话头")
             return
 
         day = self.rhythm.local_date(now)
-        kind = job.payload.get("kind", "own_life")
         if kind == "follow_up" and job.created_at:
             # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
             # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
@@ -1172,16 +1228,16 @@ class App:
                 await self.scheduler.defer(job.id or 0, hold)
                 return
         if not await self.life.can_initiate_today(CONVERSATION_ID, day):
-            log.info("[proactive] 今天已经主动过而且他没回，不追了")
+            await self._skip(job, "今天已经主动过而且他没回，不追了")
             return
         if away := await owner_cmds.away_state(self.memory, day):
             if kind not in ("callback", "follow_up"):
-                log.info("[proactive] 请假中（%s），这类主动跳过", away)
+                await self._skip(job, f"请假中（{away}），这类主动跳过")
                 return
 
         photos = await self._photo_shortlist(now)
         if job.payload.get("requires_photo") and not photos:
-            log.info("[proactive] 想发照片但库里没有，跳过")
+            await self._skip(job, "想发照片但库里没有，跳过")
             return
 
         owner_facts, self_facts = await self._recall(now)
@@ -1199,10 +1255,7 @@ class App:
         if job.payload.get("kind") == LEDGER_CHECK:
             ledger_ref = await self.life.due_ledger_entry(now)
             if ledger_ref is None:
-                # 记成作废，不是做完：什么都没问的任务算进体检的"办事型"里，
-                # 那个占比就虚高了。
-                log.info("[proactive] 本来要问一句，但已经没有到期的承诺了")
-                await self.scheduler.cancel(job.id or 0)
+                await self._skip(job, "本来要问一句，但已经没有到期的承诺了")
                 return
             _entry_id, _kind, entry = ledger_ref
             note = f"{note}\n他当时说的是：{entry.claim}"
@@ -1240,15 +1293,25 @@ class App:
             day,
         )
         if plan is None:
+            if await self.brain.over_budget(day):
+                # 额度用完不是故障。原来这里照样 raise，三次空转之后判死，
+                # 在体检和 !np status 里跟接口真坏了长得一样。
+                if promised:
+                    await self._defer_to_tomorrow(job, now, "今天的模型额度用完了")
+                    return
+                await self._skip(job, "今天的模型额度用完了，这句不说了")
+                return
             raise RuntimeError("主动消息没生成出来")
         if not plan.send or (not plan.parts and not plan.photo_request):
-            log.info("[proactive] 她想了想，没什么要说的")
+            await self._skip(job, "她想了想，没什么要说的")
             return
 
         photo = await self._resolve_photo(plan.photo_request, now)
         if job.payload.get("requires_photo") and photo is None:
+            await self._skip(job, "要的那张照片没取到")
             return
 
+        self._on_phone()
         try:
             result = await self.deliverer.deliver_proactive(
                 await self.resolve_channel(), plan, photo
@@ -1483,15 +1546,17 @@ class NewPersonClient(discord.Client):
         self.presence = PresenceManager(
             self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng
         )
+        self.app.on_phone = self.presence.note_activity
         self.app.spawn(self.presence.run_forever(), "presence")
         # 放在最后：补抓要用到已经建好的频道和数据库。
         # 每次重连都跑一遍，绝大多数时候什么都找不到，代价就是一次 history 调用。
         await self.app.catch_up()
 
     async def on_message(self, message: discord.Message) -> None:
+        # 这里**不**标"在看手机"。原来他一发消息她就变绿：30 秒内亮灯、
+        # 几分钟后变黄、几十分钟后在黄灯下回他，上课时也亮——一条百分之百的规律。
+        # 在线只跟着她自己的动作走，见 App._on_phone。
         try:
-            if self.presence and message.author.id in self.app.settings.all_allowed_user_ids:
-                self.presence.note_activity()
             await self.app.on_user_message(message)
         except Exception:  # noqa: BLE001 - 一条消息处理失败不能把网关拖垮
             log.exception("[discord] 处理消息时出错")

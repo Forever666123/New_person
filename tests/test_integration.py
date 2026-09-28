@@ -2544,3 +2544,104 @@ async def test_a_faded_fact_can_be_learned_again(tmp_path: Path, persona: Person
     listed = seen[-1].existing_owner_facts
     assert "很久以前说过的事" not in listed, "已经淡忘的还挂在'别重复'里，他再提也记不回来"
     assert "事实44" in listed, "最新记下的反而不在名单上"
+
+
+async def test_his_message_does_not_turn_her_green(tmp_path: Path, persona: Persona) -> None:
+    """在线状态跟着她自己拿手机走，不跟着他发消息走。
+
+    原来他一发她就亮绿灯：30 秒内变绿、几分钟后变黄、几十分钟后在黄灯下回他，
+    上课时也亮。那是一条百分之百的规律，比什么都像程序。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    app._started = True
+    client = NewPersonClient(app)
+    await client.on_ready()
+    for task in [t for t in app._tasks if t.get_name() == "presence"]:
+        task.cancel()
+    assert client.presence is not None
+    assert app.on_phone is not None, "on_ready 没把'她拿起手机'接到在线状态上"
+    # 这条测的是在线状态，不是找频道：发消息还走假频道
+    app.client = SimpleNamespace(user=SimpleNamespace(id=999), get_channel=lambda _cid: channel)
+
+    app._should_handle = lambda _m: True
+    clock.set(EVENING)
+    await client.on_message(fake_incoming(100, "在吗", EVENING))
+    assert client.presence._online_until is None, "他一发消息她就亮了"
+
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["嗯"]
+    assert client.presence._online_until is not None, "她回消息的时候也没亮"
+    assert client.presence._online_until > job.run_at
+
+
+async def test_her_promise_is_not_dropped_when_they_are_mid_chat(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她说"等我查一下"，十分钟后那个 follow_up 到点时他们正聊着——不能就这么没了。
+
+    原来撞上热聊或未读就 return，任务记成做完：她自己许的承诺凭空消失，
+    而且恰好在最容易许诺的时候（正聊着天）必然丢。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    clock.set(EVENING)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 10, "告诉他查到的那个参数")
+    job = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+
+    # 到点那一刻他们正热聊：他刚说完，她刚回完
+    clock.set(job.run_at + timedelta(seconds=1))
+    await memory.update_conversation(
+        CONVERSATION_ID,
+        last_user_message_at=clock.now() - timedelta(seconds=40),
+        last_bot_message_at=clock.now() - timedelta(seconds=20),
+    )
+    await app.scheduler.run_due_once()
+    again = await memory.get_job(job.id or 0)
+    assert again.status == "pending", "正聊着，她答应的事就这么没了"
+    assert again.run_at > clock.now()
+    assert again.attempts == 0, "往后挪不是失败"
+
+
+async def test_her_promise_rides_along_with_the_reply_she_is_about_to_send(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """follow_up 到点时她正好要回他：把答应的事并进这次回复里说。"""
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="查到了 是0.3")])]
+    )
+    clock.set(EVENING)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他查到的那个参数是0.3")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+
+    at = follow.run_at - timedelta(seconds=5)
+    clock.set(at)
+    await send(app, "你那边怎么样", at=at, msg_id=321)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, follow.run_at + timedelta(minutes=5))
+
+    clock.set(follow.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(follow.id or 0)).status == "cancelled"
+    await drain(app, clock)
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert "你之前答应过他的事，这次顺便说：告诉他查到的那个参数是0.3" in prompt
+
+
+async def test_a_proactive_that_says_nothing_is_not_counted_as_done(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """什么都没发的主动任务记成作废。体检按做完的任务数她主动的花样，
+    空照片库的 window_photo 记成做完，就会凭空多出一条"她主动说过"。"""
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    clock.set(EVENING)
+    job_id = await app.scheduler.schedule(
+        "proactive", EVENING, conversation_id=CONVERSATION_ID,
+        payload={"kind": "window_photo", "note": "拍窗外", "requires_photo": True},
+        reason="window_photo",
+    )
+    await app.scheduler.run_due_once()
+    assert channel.sent == [] and llm.calls == []
+    assert (await memory.get_job(job_id)).status == "cancelled"
