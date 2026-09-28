@@ -733,3 +733,51 @@ async def test_the_api_error_timestamp_comes_from_the_clock(
 
     stamp, _, _ = (await memory.kv_get("last_api_error")).partition("\t")
     assert datetime.fromisoformat(stamp) == frozen, f"戳的是 {stamp}，不是时钟上的时间"
+
+
+def test_his_small_hours_are_labelled_as_small_hours() -> None:
+    """给她看的时间要带"凌晨/下午"，不能只给一个 24 小时制的数。
+
+    线上真出过：他那边凌晨两点，她回了句"两点是该起了"，
+    他得纠正两次。隔着十四个小时的时差，"几点"本来就容易算错，
+    光给 ``02:05`` 模型会把它当成一个普通的钟点。
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from newperson.prompts import format_time
+
+    sydney = ZoneInfo("Australia/Sydney")
+    assert "凌晨 02:05" in format_time(datetime(2026, 9, 26, 2, 5, tzinfo=sydney))
+    assert "下午 14:30" in format_time(datetime(2026, 9, 26, 14, 30, tzinfo=sydney))
+    assert "晚上 20:34" in format_time(datetime(2026, 9, 26, 20, 34, tzinfo=sydney))
+
+
+def test_a_stale_reminder_is_told_he_has_spoken_since(persona: Persona) -> None:
+    """记下"要问他的事"之后他又说过话，提示词要把这一点讲出来。
+
+    线上真出过：他已经说了"做完了"，她自己也回了"不错"，
+    一个多小时之后那条旧的提醒照样响了，问他"弄完了吧"，
+    他回"我不是和你说了吗"。模型看得见最近的对话，
+    但那条提醒是"你为什么想说话"——它会照着提醒去问，除非被明确告诉：
+    这件事是早先记下的，他之后说过话，先看看他是不是已经答了。
+    """
+    from newperson.prompts import build_proactive_user
+
+    common = dict(
+        persona=persona,
+        situation="此刻",
+        trigger_note="问问他作业 A 弄完没有",
+        summary="",
+        owner_facts=[],
+        self_facts=[],
+        recent=[],
+        hours_since_last_exchange=2.0,
+        unanswered_initiations=0,
+        photos=[],
+    )
+    stale = build_proactive_user(**common, he_spoke_since_noted=True)
+    fresh = build_proactive_user(**common, he_spoke_since_noted=False)
+    assert "那之后他又说过话" in stale
+    assert "别再问" in stale
+    assert "那之后他又说过话" not in fresh

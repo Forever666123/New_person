@@ -108,6 +108,8 @@ class ProactiveRequest:
     hours_since_last_exchange: float | None
     unanswered_initiations: int
     photos: list[Photo]
+    he_spoke_since_noted: bool = False
+    """这件事记下之后他又说过话。那样的话她要先看看他是不是已经答过了。"""
 
 
 @dataclass
@@ -455,6 +457,7 @@ class Brain:
             hours_since_last_exchange=req.hours_since_last_exchange,
             unanswered_initiations=req.unanswered_initiations,
             photos=req.photos,
+            he_spoke_since_noted=req.he_spoke_since_noted,
         )
         plan = await self._call(ProactivePlan, prompt, purpose="proactive", today=today)
         if plan is None or not plan.send:

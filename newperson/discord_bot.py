@@ -1123,6 +1123,13 @@ class App:
             if entry.committed_to:
                 note += f"\n他答应要做的：{entry.committed_to}"
 
+        # 这件事记下之后他说过话没有。说过的话，那条记下的"要问他的事"可能已经过时了——
+        # 他也许早就答了。只在 follow_up 和回访这两种"问他事情"的主动上提醒她。
+        he_spoke_since = False
+        if job.payload.get("kind") in ("follow_up", LEDGER_CHECK) and job.created_at:
+            last_his = conv.last_user_message_at
+            he_spoke_since = bool(last_his and last_his > job.created_at)
+
         plan = await self.brain.generate_proactive(
             ProactiveRequest(
                 situation=await self._build_situation(now),
@@ -1134,6 +1141,7 @@ class App:
                 hours_since_last_exchange=(now - last).total_seconds() / 3600 if last else None,
                 unanswered_initiations=conv.unanswered_initiations,
                 photos=photos,
+                he_spoke_since_noted=he_spoke_since,
             ),
             day,
         )

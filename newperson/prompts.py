@@ -24,9 +24,34 @@ from .persona import Persona
 WEEKDAYS = "一二三四五六日"
 
 
+def _period(hour: int) -> str:
+    if hour < 5:
+        return "凌晨"
+    if hour < 8:
+        return "早上"
+    if hour < 11:
+        return "上午"
+    if hour < 13:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    if hour < 23:
+        return "晚上"
+    return "深夜"
+
+
 def format_time(dt: datetime) -> str:
-    """``10-12 周一 20:34``"""
-    return f"{dt.strftime('%m-%d')} 周{WEEKDAYS[dt.weekday()]} {dt.strftime('%H:%M')}"
+    """``10-12 周一 晚上 20:34``
+
+    **带上"凌晨/下午"这种字。** 光给 24 小时制的 ``02:05``，
+    模型会把它当成一个普通的钟点：线上真出过——他那边凌晨两点，
+    她回了句"两点是该起了"，他得纠正两次"凌晨两点啊"。
+    隔着十四个小时的时差，"几点"本来就容易算错，别再让它猜是白天还是夜里。
+    """
+    return (
+        f"{dt.strftime('%m-%d')} 周{WEEKDAYS[dt.weekday()]} "
+        f"{_period(dt.hour)} {dt.strftime('%H:%M')}"
+    )
 
 
 def _section(title: str, body: str) -> str:
@@ -297,6 +322,7 @@ def build_proactive_user(
     hours_since_last_exchange: float | None,
     unanswered_initiations: int,
     photos: list[Photo],
+    he_spoke_since_noted: bool = False,
 ) -> str:
     """她主动开口。"""
     blocks = [_section("此刻", situation)]
@@ -311,6 +337,16 @@ def build_proactive_user(
         blocks.append(_section("最近的对话", format_messages(recent, persona)))
 
     context = [trigger_note]
+    if he_spoke_since_noted:
+        # 这件事是**几个小时前**记下的，而那之后他又说过话。
+        # 线上真出过：他已经说了"做完了"，她自己也回了"不错"，
+        # 过一个半小时那条旧的提醒照样响了——"弄完了吧？"
+        # 他回"我不是和你说了吗"。人不会这样，程序才会。
+        context.append(
+            "这件事是你早些时候记下的，**那之后他又说过话**（见上面最近的对话）。"
+            "他要是已经说过答案了，就别再问——把 send 设成 false，"
+            "或者顺着他说的接着聊。"
+        )
     if hours_since_last_exchange is not None:
         if hours_since_last_exchange < 24:
             context.append(f"你们上一次说话是 {hours_since_last_exchange:.0f} 小时前。")

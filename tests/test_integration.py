@@ -2121,3 +2121,55 @@ async def test_a_failing_memory_update_does_not_burn_the_daily_budget(
 
     jobs = await memory.failed_jobs(CONVERSATION_ID)
     assert len(jobs) <= 2, f"排了 {len(jobs)} 个注定失败的整理任务，每个烧三次调用"
+
+
+async def test_a_reminder_that_fires_after_he_has_spoken_knows_it_may_be_stale(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """排好的"回头问他"，在他又说过话之后才响，要让她知道这件事可能已经过时了。
+
+    走完整条路：她排了一个 follow_up → 他又发了消息、她也回了 → 那个 follow_up 到点。
+    到点那一刻交给模型的请求里要带着"他之后说过话"。不带的话，
+    她只看得见那条旧提醒，会照着去问一件他刚刚才说完的事。
+    """
+    from newperson.brain import ProactivePlan
+
+    seen = []
+
+    class Recording:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def generate_proactive(self, request, _day):
+            seen.append(request)
+            return ProactivePlan(send=False, parts=[])
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app.brain = Recording(app.brain)
+    clock.set(EVENING)
+
+    await app.life.schedule_follow_up(CONVERSATION_ID, 90, "问问他作业 A 弄完没有")
+    job = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+
+    # 四十分钟后他来说了一句，她那边也记下了这一条
+    clock.set(EVENING + timedelta(minutes=40))
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID,
+            discord_message_id=4242,
+            author_id=42,
+            author_name="Leo",
+            content="作业 A 弄完了",
+            created_at=clock.now(),
+        )
+    )
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], clock.now())
+
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.handle_proactive_job(job)
+
+    assert seen, "前提不成立：这条提醒根本没走到模型（她在睡觉？正热聊？）"
+    assert seen[-1].he_spoke_since_noted, "他明明说过话了，提醒却不知道"
