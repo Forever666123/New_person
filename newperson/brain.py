@@ -32,6 +32,7 @@ from .models import (
     MemoryUpdate,
     Photo,
     ProactivePlan,
+    ReplyPart,
     ReplyPlan,
     StoredMessage,
 )
