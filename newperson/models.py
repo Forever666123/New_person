@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Literal, NamedTuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # 作息 / 注意力
@@ -227,6 +227,13 @@ class LedgerEntry(BaseModel):
     )
 
 
+def _clamp(value: Any, low: float, high: float) -> Any:
+    """数字就夹到区间里，别的原样交给 pydantic 去报错。"""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return value
+    return min(max(value, low), high)
+
+
 class LedgerTiming(NamedTuple):
     """他说的那个时间，换算好的。代码算，不让模型算。"""
 
@@ -246,6 +253,17 @@ class ReplyPart(BaseModel):
         default=0.0, ge=0.0, le=180.0, description="发这条之前先停几秒。通常 0 到 10。"
     )
 
+    @field_validator("pause_before_seconds", mode="before")
+    @classmethod
+    def _clamp_pause(cls, value: Any) -> Any:
+        """越界就截到边上，别拒收。
+
+        范围只写在 schema 的说明里，接口不强制。模型给个 300，
+        SDK 解析时拒收，整条回复作废、调度器拿同样的上下文重试三次、
+        三次还是 300——他那句话就一直没人回，而那几次调用照样计费。
+        """
+        return _clamp(value, 0.0, 180.0)
+
 
 class PhotoRequest(BaseModel):
     """想发一张照片。优先用 photo_id 从可用照片列表里选。"""
@@ -260,6 +278,13 @@ class FollowUp(BaseModel):
 
     delay_minutes: int = Field(ge=1, le=60 * 24 * 7)
     note: str = Field(description="到时候要说什么。只写你自己答应过的事。")
+
+    @field_validator("delay_minutes", mode="before")
+    @classmethod
+    def _clamp_delay(cls, value: Any) -> Any:
+        """"下下周末帮你看"是十几天，超了一周就截到一周，别让整条回复作废。"""
+        clamped = _clamp(value, 1, 60 * 24 * 7)
+        return int(clamped) if isinstance(clamped, float) else clamped
 
 
 class ReplyPlan(BaseModel):

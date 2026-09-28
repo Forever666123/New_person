@@ -19,6 +19,7 @@ from datetime import UTC, date, datetime
 from typing import Any, TypeVar
 
 import anthropic
+import pydantic
 from pydantic import BaseModel
 
 from . import style_guard
@@ -54,6 +55,43 @@ PRICING_PER_MTOK = {
     "claude-haiku-4-5": (1.0, 5.0),
 }
 """(输入, 输出) 美元每百万 token。缓存命中按输入的十分之一算，写入按 1.25 倍。"""
+
+def price_of(model: str) -> tuple[float, float]:
+    """(输入, 输出) 单价。带日期的正式 ID（claude-haiku-4-5-20251001）按别名算。
+
+    表是按字符串精确查的，写成带日期的那种会落到默认价上，Haiku 被多估五倍，
+    `!np status` 的花费和按钱算的判断都跟着偏。只认"别名 + 八位日期"这一种写法：
+    别的后缀（比如 -5-5）可能是另一个型号，价钱不一定一样，宁可按默认的高价算。
+    """
+    if model in PRICING_PER_MTOK:
+        return PRICING_PER_MTOK[model]
+    base, _, tail = model.rpartition("-")
+    if base in PRICING_PER_MTOK and len(tail) == 8 and tail.isdigit():
+        return PRICING_PER_MTOK[base]
+    return (5.0, 25.0)
+
+
+def _money_trouble(exc: Exception) -> str:
+    """认出"钱的事"：余额用完、撞到自己设的花费上限、密钥不认了。
+
+    这几种原来在 `!np status` 里都只是"接口返回 400/401/429"，
+    跟任何别的 400 分不开——而它们恰恰是要他本人去处理的那种。
+    措辞留余地：余额明明够、也有人碰到过同一句报错。认不出来就返回空串。
+    """
+    body = getattr(exc, "body", None)
+    message = ""
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        message = str(body["error"].get("message", ""))
+    text = f"{message} {exc}".lower()
+    code = getattr(exc, "status_code", 0)
+    if "credit balance is too low" in text:
+        return f"接口返回 {code}：多半是 API 余额用完了，去 Console 的 Billing 页看看"
+    if "usage limit" in text or "spend limit" in text:
+        return f"接口返回 {code}：撞到了 Console 里设的花费上限"
+    if code == 401:
+        return "接口返回 401：API key 不认了（过期、被删或写错）"
+    return ""
+
 
 EFFORT_SUPPORTED = {
     "claude-fable-5-1",
@@ -220,7 +258,7 @@ class Brain:
         written = getattr(usage, "cache_creation_input_tokens", 0) or 0
         out = getattr(usage, "output_tokens", 0) or 0
 
-        in_price, out_price = PRICING_PER_MTOK.get(model_used or self.settings.model, (5.0, 25.0))
+        in_price, out_price = price_of(model_used or self.settings.model)
         cost = (
             inp * in_price + cached * in_price * 0.1 + written * in_price * 1.25 + out * out_price
         ) / 1_000_000
@@ -278,12 +316,24 @@ class Brain:
             response = await self.client.messages.parse(**kwargs)
         except anthropic.RateLimitError as exc:
             log.warning("[brain] %s 撞到限流，稍后重试", purpose)
-            await self._note_error(f"限流（429）：{str(exc)[:80]}")
+            await self._note_error(
+                _money_trouble(exc) or f"限流（429）：{str(exc)[:80]}"
+            )
             return None
         except anthropic.APIStatusError as exc:
             level = log.warning if exc.status_code >= 500 else log.error
             level("[brain] %s 接口返回 %s：%s", purpose, exc.status_code, exc)
-            await self._note_error(f"接口返回 {exc.status_code}")
+            await self._note_error(
+                _money_trouble(exc) or f"接口返回 {exc.status_code}"
+            )
+            return None
+        except pydantic.ValidationError as exc:
+            # 接口已经回了、也计了费，是 SDK 解析它的输出时不认。
+            # 原来落到下面的兜底里，用量一条不记，日限额看不见这几次调用。
+            log.warning("[brain] %s 的输出不合格式：%s", purpose, exc)
+            await self._note_error("返回的内容不合格式")
+            if self.memory is not None:
+                await self.memory.record_usage(today)
             return None
         except anthropic.APIConnectionError as exc:
             log.warning("[brain] %s 连不上：%s", purpose, exc)

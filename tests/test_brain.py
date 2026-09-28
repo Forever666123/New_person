@@ -781,3 +781,74 @@ def test_a_stale_reminder_is_told_he_has_spoken_since(persona: Persona) -> None:
     assert "那之后他又说过话" in stale
     assert "别再问" in stale
     assert "那之后他又说过话" not in fresh
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "expect"),
+    [
+        (400, "Your credit balance is too low to access the Anthropic API.", "余额"),
+        (400, "You have reached your specified API usage limits.", "花费上限"),
+        (401, "invalid x-api-key", "API key"),
+    ],
+)
+async def test_money_trouble_is_named_in_the_status(
+    persona: Persona, tmp_path: Path, memory: Memory, status: int, message: str, expect: str
+) -> None:
+    """余额用完、撞到花费上限、密钥不认——这几种要他本人去处理。
+
+    原来在 `!np status` 里都只是"接口返回 400"，跟任何别的 400 分不开。
+    他问过"快到期了提醒我一下，我得去充钱"：这就是那个提醒。
+    """
+    from newperson.doctor import _safe_detail
+
+    request = httpx.Request("POST", "http://x")
+    cls = anthropic.AuthenticationError if status == 401 else anthropic.BadRequestError
+    error = cls(
+        message,
+        response=httpx.Response(status, request=request),
+        body={"type": "error", "error": {"type": "invalid_request_error", "message": message}},
+    )
+    brain = Brain(fake_client(error), settings(tmp_path), persona, memory)
+    assert await brain.generate_reply(reply_request(), TODAY) is None
+    noted = (await memory.kv_get("last_api_error") or "").partition("\t")[2]
+    assert expect in noted, noted
+    assert _safe_detail(noted) == noted, "体检会把这条藏起来"
+
+
+def test_an_out_of_range_number_does_not_void_the_whole_reply() -> None:
+    """模型给出十几天的 follow_up、五分钟的停顿：截到边上，别整条作废。
+
+    范围只写在 schema 的说明里，接口不强制。原来 SDK 解析时拒收，
+    这次回复作废、重试三次还是一样——他那句话一直没人回，那几次调用照样计费。
+    """
+    plan = ReplyPlan.model_validate_json(
+        '{"parts":[{"text":"行","pause_before_seconds":999}],'
+        '"follow_up":{"delay_minutes":20000,"note":"下下周末看完告诉他"}}'
+    )
+    assert plan.parts[0].pause_before_seconds == 180
+    assert plan.follow_up is not None and plan.follow_up.delay_minutes == 60 * 24 * 7
+
+
+async def test_an_unparseable_answer_still_counts_against_the_daily_cap(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """接口回了、计了费、SDK 却解析不了：这一次也要记进用量，日限额才看得见。"""
+    import pydantic
+
+    try:
+        ReplyPlan.model_validate_json('{"parts": "不是列表"}')
+    except pydantic.ValidationError as exc:
+        error = exc
+    brain = Brain(fake_client(error), settings(tmp_path), persona, memory)
+    assert await brain.generate_reply(reply_request(), TODAY) is None
+    usage_today = await memory.usage_for(TODAY)
+    assert usage_today and usage_today["calls"] >= 1
+
+
+def test_a_dated_model_id_is_priced_like_its_alias() -> None:
+    """.env 里写成带日期的正式 ID 也按同一个价算；认不出的型号按高价算，宁可多估。"""
+    from newperson.brain import PRICING_PER_MTOK, price_of
+
+    assert price_of("claude-haiku-4-5-20251001") == PRICING_PER_MTOK["claude-haiku-4-5"]
+    assert price_of("claude-sonnet-5") == PRICING_PER_MTOK["claude-sonnet-5"]
+    assert price_of("claude-sonnet-5-5") == (5.0, 25.0)

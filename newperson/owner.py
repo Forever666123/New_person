@@ -129,7 +129,9 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
     if not conv.deliverable:
         lines.append("**发不出去**：你需要和机器人在同一个服务器里，并允许服务器成员私信")
 
-    used = await ctx.memory.usage_for(ctx.now.date())
+    # 用量按她所在地的日子记（跟日限额同一个口径）。她出国时用纽约的日子读，
+    # 傍晚以后就读成另一天了。
+    used = await ctx.memory.usage_for(ctx.rhythm.local_date(ctx.now))
     calls = used.get("calls", 0)
     cap = ctx.max_calls_per_day
     line = f"今天调了 {calls} 次模型（上限 {cap}），约 ${used.get('estimated_usd', 0):.2f}"

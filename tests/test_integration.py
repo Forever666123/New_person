@@ -2645,3 +2645,22 @@ async def test_a_proactive_that_says_nothing_is_not_counted_as_done(
     await app.scheduler.run_due_once()
     assert channel.sent == [] and llm.calls == []
     assert (await memory.get_job(job_id)).status == "cancelled"
+
+
+async def test_leave_notes_are_not_put_in_her_mouth(tmp_path: Path, persona: Persona) -> None:
+    """`!np away 出差 5` 说的是他出门。原来却变成她的"此刻"：你最近出差。
+
+    一个在读研究生被告知自己在出差，会在回复里说出来。写成"他在出差"也不行：
+    那是他没跟她说过的事。备注只给他自己看，她只是这几天话少。
+    """
+    from newperson.owner import OwnerContext, handle
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    ctx = OwnerContext(
+        memory=memory, rhythm=app.rhythm, scheduler=app.scheduler, life=app.life,
+        conversation_id=CONVERSATION_ID, now=EVENING,
+    )
+    await handle("!np away 出差 5", ctx)
+    situation = await app._build_situation(EVENING)
+    assert "出差" not in situation
+    assert "没什么心思聊天" in situation

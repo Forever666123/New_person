@@ -251,3 +251,59 @@ def test_proactive_moments_follow_her_activity_curve(persona: Persona) -> None:
         f"加权之后平均活跃度没有提高：{statistics.mean(weighted):.3f} "
         f"vs 均匀 {statistics.mean(uniform):.3f}"
     )
+
+
+async def test_an_empty_photo_library_does_not_eat_the_day(harness: Harness) -> None:
+    """照片库空着的时候，要照片的那几种不进候选。
+
+    原来 window_photo 照样抽签、占掉当天的名额，到点才发现没照片、跳过——
+    大约六分之一本该开口的日子，她一句话都不说。
+    """
+    harness.life.has_photos = lambda: False
+    _counts, kinds, _ = await harness.sweep(150, TERM_START)
+    needs_photo = {k.name for k in harness.life.persona.proactive.kinds if k.requires_photo}
+    assert needs_photo, "前提不成立：人设里没有要照片的主动种类"
+    assert not (needs_photo & set(kinds)), f"没照片还排了：{kinds}"
+
+
+async def test_a_failed_day_plan_is_tried_again_the_same_day(harness: Harness) -> None:
+    """起床那次日程没生成出来，当天再试。原来一整天没有日程，也就一整天不主动。"""
+    from newperson.models import Job
+
+    life, memory, clock = harness.life, harness.memory, harness.clock
+    day = life.rhythm.local_date(clock.now())
+    wake = life.rhythm.for_day(day).wake
+    clock.set(wake + timedelta(minutes=10))
+
+    class Failing:
+        async def generate_day_plan(self, _req, _day):
+            return None
+
+    life.brain = Failing()
+    await life.handle_day_plan_job(Job(kind="day_plan", run_at=clock.now()))
+    retries = [j for j in await memory.pending_jobs("day_plan") if j.payload.get("retry")]
+    assert len(retries) == 1, "没人再试"
+    assert retries[0].run_at > clock.now()
+    assert life.rhythm.local_date(retries[0].run_at) == day
+
+
+async def test_a_hand_saved_plan_still_gets_her_proactive_moments(harness: Harness) -> None:
+    """`plan --save` 存进去的日程，她起床时照样补排主动时刻。
+
+    主动时刻原来只在"新生成日程"那条路上排：手动存过的那一天，
+    她起床看见已经有日程就直接返回，一次都不会主动开口。
+    """
+    from newperson.life import PROACTIVE_PENDING
+
+    life, memory, clock = harness.life, harness.memory, harness.clock
+    scheduled = 0
+    for offset in range(20):
+        day_start = TERM_START + timedelta(days=offset)
+        day = day_start.date()
+        clock.set(life.rhythm.for_day(day).wake + timedelta(minutes=5))
+        await memory.save_day_plan(day, PLAN)
+        await memory.kv_set(f"{PROACTIVE_PENDING}{day}", "1")
+        await life.ensure_today_plan("owner")
+        assert await memory.kv_get(f"{PROACTIVE_PENDING}{day}") is None
+        scheduled += len(await memory.pending_jobs("proactive"))
+    assert scheduled > 0, "手动存过日程的日子一次都没排主动"

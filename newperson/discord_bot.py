@@ -128,6 +128,9 @@ class App:
         """补抓正在跑。重连风暴时两个 on_ready 会重叠。"""
         self._tasks: set[asyncio.Task] = set()
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
+        # 照片库空着的时候，要照片的那几种主动不进当天的候选。
+        # 原来它照样抽签、占掉名额，到点再发现没照片跳过——那天就什么都不说了。
+        self.life.has_photos = lambda: bool(self.media.library.available(set(), None))
         self.on_phone: Callable[[], None] | None = None
         """她拿起手机了（在线状态亮几分钟）。连上 Discord 之后由 client 接上。"""
 
@@ -787,8 +790,11 @@ class App:
         notes = [note for _, note in await self.memory.diary_notes(day)]
 
         mood = list(daily.mood_notes)
-        if away := await owner_cmds.away_state(self.memory, day):
-            mood.append(f"你最近{away}，没什么心思聊天。")
+        if await owner_cmds.away_state(self.memory, day):
+            # 备注**不写进来**。`!np away 出差 5` 说的是他出门，原来却成了
+            # "你最近出差"——一个在读研究生被告知自己在出差，会在回复里说出来。
+            # 写成"他在出差"也不行：那是他没跟她说过的事，她不该知道。
+            mood.append("你这几天没什么心思聊天。")
 
         # 作息只知道有没有课，日程才知道她此刻具体在干什么。
         # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。
@@ -822,7 +828,9 @@ class App:
 
     async def _photo_shortlist(self, now: datetime) -> list:
         used = await self.memory.recently_used_photo_ids(now)
-        return self.media.library.available(used, time_of_day_at(now))[:PHOTO_SHORTLIST]
+        # 时段按她人在的地方算：她在苏州的半夜，纽约是中午
+        here = self.rhythm.local_time(now)
+        return self.media.library.available(used, time_of_day_at(here))[:PHOTO_SHORTLIST]
 
     async def _recall(self, now: datetime) -> tuple[list[str], list[str]]:
         cfg = self.persona.memory
@@ -838,7 +846,9 @@ class App:
         if request is None:
             return None
         used = await self.memory.recently_used_photo_ids(now)
-        return await self.media.resolve(request, used, self.rng, time_of_day_at(now))
+        return await self.media.resolve(
+            request, used, self.rng, time_of_day_at(self.rhythm.local_time(now))
+        )
 
     # -- 回复 ---------------------------------------------------------------
 

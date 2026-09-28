@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 
 from .brain import Brain, DayPlanRequest
@@ -33,6 +34,9 @@ LEDGER_CHECK = "ledger_check"
 
 _WHEN_THERE = re.compile(r"\s*(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})\s*")
 """模型写的"他那边的时间"：MM-DD HH:MM。别的写法一律不认，退回按周期问。"""
+
+PROACTIVE_PENDING = "proactive_pending:"
+"""这一天的日程是外面存进来的（`plan --save`），主动时刻还没排。"""
 
 OPENER_KEY = "opener"
 """排过开场没有。同时用作任务的去重键，所以它天然只会排上一次。"""
@@ -60,6 +64,8 @@ class LifeEngine:
         self.brain = brain
         self.clock = clock
         self.rng = rng
+        self.has_photos: Callable[[], bool] = lambda: True
+        """手边有没有能发的照片。App 接上照片库；没接的时候当作有。"""
 
     # -- 日程 ---------------------------------------------------------------
 
@@ -86,6 +92,10 @@ class LifeEngine:
 
         existing = await self.memory.get_day_plan(day)
         if existing is not None:
+            if await self.memory.kv_get(f"{PROACTIVE_PENDING}{day}"):
+                await self.memory.kv_delete(f"{PROACTIVE_PENDING}{day}")
+                count = await self.schedule_proactive_candidates(existing, conversation_id)
+                log.info("[life] %s 的日程是手动存的，补排了 %d 个主动时刻", day, count)
             return existing
         if not await self.memory.claim_day_plan(day, now):
             return None  # 别人正在生成
@@ -332,8 +342,11 @@ class LifeEngine:
         shareable = [e for e in plan.events if e.shareable]
 
         eligible: list[ProactiveKind] = []
+        photos = self.has_photos()
         for kind in cfg.kinds:
             if kind.only_while_travelling and not travelling:
+                continue
+            if kind.requires_photo and not photos:
                 continue
             if await self._days_since_last(kind.name, day) < kind.min_days_since_last:
                 continue
@@ -602,6 +615,30 @@ class LifeEngine:
 
     # -- 任务入口 -----------------------------------------------------------
 
+    DAY_PLAN_RETRIES = 3
+    """起床那次日程没生成出来，当天最多再试几次。"""
+
     async def handle_day_plan_job(self, job: Job) -> None:
-        await self.ensure_today_plan(job.conversation_id or "owner")
+        conversation_id = job.conversation_id or "owner"
+        await self.ensure_today_plan(conversation_id)
         await self.schedule_next_day_plan()
+
+        # 起床那次失败了（模型抖了一下、输出解析不了），当天得再试。
+        # 原来只打一行"稍后再试"，可是没人排那个"稍后"：一整天没有日程，
+        # 也就一整天不会主动开口。
+        now = self.clock.now()
+        day = self.rhythm.local_date(now)
+        tries = int(job.payload.get("retry", 0))
+        if await self.memory.get_day_plan(day) is not None or tries >= self.DAY_PLAN_RETRIES:
+            return
+        run_at = now + timedelta(minutes=self.rng.uniform(30, 60))
+        if self.rhythm.is_sleeping(run_at) or self.rhythm.local_date(run_at) != day:
+            return
+        await self.scheduler.schedule(
+            "day_plan",
+            run_at,
+            conversation_id=conversation_id,
+            payload={"retry": tries + 1},
+            dedupe_key=f"day_plan_retry:{day}:{tries + 1}",
+            reason=f"{day} 的日程再试一次",
+        )
