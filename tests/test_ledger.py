@@ -13,6 +13,8 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from newperson.calendar import AcademicCalendar
 from newperson.clock import FakeClock
 from newperson.life import LEDGER_CHECK, LifeEngine
@@ -437,3 +439,40 @@ def test_the_output_rules_tell_her_how_to_close_something(persona: Persona) -> N
     rules = build_system(persona)
     assert "resolved_ledger_ids" in rules
     assert "没做" in rules, "要说清楚'没做'也算有下文，否则只有做到了才会翻篇"
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "感觉情绪不太稳定 明天还要复习",
+        "有点想哭 作业还没写",
+        "睡不着 有点想你了",
+        "考试好紧张 一做题就慌",
+        "最近有点焦虑 deadline 又快到了",
+    ],
+)
+def test_when_he_is_low_the_low_mood_mode_wins_over_his_tasks(persona: Persona, said: str) -> None:
+    """他难受的时候，就算同一句里提到了作业和考试，也要进"低气压"而不是"课业"。
+
+    进了课业模式，台账就被带进上下文，她就会顺手问"弄完没"。
+    他真正会说的是"情绪不太稳定""有点想哭""有点想你了""好紧张"——
+    原来这几种都没收，于是那一批落回课业模式。
+    """
+    mode = persona.mode_for(said)
+    assert mode is not None and mode.name == "低气压", f"「{said}」进了 {mode.name if mode else None}"
+    assert not mode.include_ledger, "低气压不该把他的台账带进上下文"
+
+
+def test_the_low_mood_mode_does_not_steer_back_to_his_tasks(persona: Persona) -> None:
+    """低气压模式的指令不能让她"接一句然后回到正事"。
+
+    原来写的就是"先接情绪，一句就够，然后落到事上问一句具体的"。
+    她照做了：他说想哭，她接一句就回到"明天先把作业写完"；
+    他说谢谢你听我说，她回"手上事先弄完"。那不是硬气，是在念待办清单。
+    """
+    mode = next(m for m in persona.modes if m.name == "低气压")
+    assert "落到事上" not in mode.instruction
+    assert "别提他的任务" in mode.instruction
+    # 但也不能变成心理咨询：那几条"不要"还得在
+    for still_banned in ("不讲道理", "不给建议清单", "不问"):
+        assert still_banned in mode.instruction
