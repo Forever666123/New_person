@@ -65,6 +65,7 @@ docker compose up -d --build
 | `backup <路径>` | 拷一份一致快照出来，拷完当场验 |
 | `verify <文件>` | 检查一份备份还能不能用，并把里面有什么打出来 |
 | `doctor [--days N]` | 体检。**只看时间戳和任务表，不读一个字聊天内容** |
+| `export [--days N]` | 把聊天记录按时间顺序打出来，标出哪几句是她自己开的口。**只在你自己要的时候用** |
 
 日常不用直接调这两个，`scripts/backup.sh` 会调。详见 [DEPLOY.md](DEPLOY.md#备份这条最重要)。
 

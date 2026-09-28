@@ -393,3 +393,41 @@ def test_restoring_keeps_the_replaced_database_wal_and_all(tmp_path: Path) -> No
     # 旧库的旁文件不能留在新库旁边，那些和新库对不上
     assert not (live.parent / "newperson.db-wal").exists()
     assert not backup.integrity_errors(live), "装回去的库自己就是坏的"
+
+
+def test_export_prints_the_conversation_in_order_and_marks_when_she_spoke_first(
+    tmp_path: Path, capsys
+) -> None:
+    """`export` 把对话按顺序打出来，并标出哪几句是她**自己开的口**。
+
+    这个命令只在他自己要的时候用（体检故意不读内容）。它存在的理由是
+    "她老来问我做了没"这种事——光看体检只知道比例偏高，
+    看导出能直接看到是哪几句、什么时候、隔了多久。
+    """
+    from newperson.__main__ import main
+    from newperson.memory import SCHEMA
+
+    db = tmp_path / "chat.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(SCHEMA)
+    rows = [
+        ("user", "明天早上九点我去把它做完", "2026-09-27T11:30:00-04:00", "2026-09-27T11:40:00-04:00", None),
+        ("bot", "好 你先睡", "2026-09-27T11:40:00-04:00", None, "2026-09-27T11:40:00-04:00"),
+        ("bot", "做了吗", "2026-09-27T14:30:00-04:00", None, None),
+    ]
+    for kind, content, created, read_at, batch in rows:
+        conn.execute(
+            "INSERT INTO messages (conversation_id, author_kind, content, created_at, read_at, reply_batch)"
+            " VALUES ('owner', ?, ?, ?, ?, ?)",
+            (kind, content, created, read_at, batch),
+        )
+    conn.commit()
+    conn.close()
+
+    assert main(["export", "--db", str(db)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 3
+    assert "他" in out[0] and "明天早上九点" in out[0]
+    assert "她·主动" not in out[1], "接他那一批的回复不是主动"
+    assert "她·主动" in out[2] and "做了吗" in out[2], "自己开口问的那句要标出来"
+    assert "（他 09-28" in out[2], "要同时给出他那边的时间，才看得出是不是半夜问的"

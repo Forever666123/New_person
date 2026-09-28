@@ -9,6 +9,7 @@ python -m newperson photos     扫描照片目录，生成索引草稿
 python -m newperson backup     把她的记忆拷一份出来（一致快照，拷完就验）
 python -m newperson verify     检查一份备份还能不能用
 python -m newperson doctor     体检：只看时间戳和任务表，不读聊天内容
+python -m newperson export     把聊天记录按时间顺序打出来（只在你自己要的时候用）
 ```
 """
 
@@ -612,6 +613,68 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report.worst != doctor.BAD else 1
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    """把聊天记录按时间顺序打出来，给他自己看、或者递给人帮忙看。
+
+    **只在他自己要的时候用。** 体检（doctor）故意只读时间戳——它每周自动跑、
+    会写进日志文件；这个命令不一样，是他主动要把自己的对话拿出来。
+    只读，不改库里任何东西。
+
+    她说的话标出"主动"：她不是在接他哪一批未读，而是自己开的口。
+    "她老来问我做了没"这种问题，一眼就能在这一列里看出来。
+    """
+    settings = load_settings()
+    try:
+        persona = load_persona(settings.persona_path)
+        hers, his = persona.tz, persona.owner_tz
+    except Exception:  # noqa: BLE001 - 人设读不了也能导出，只是时间都按 UTC
+        hers, his = UTC, None
+    db = Path(args.db) if args.db else settings.db_path
+    if not db.exists():
+        print(f"{BAD} 找不到数据库 {db}（是不是没在 /opt/New_person 里跑？）")
+        return 1
+
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        has_batch = "reply_batch" in columns
+        row = conn.execute("SELECT value FROM kv WHERE key = 'reply_batch_since'").fetchone()
+        boundary = datetime.fromisoformat(row[0]) if row and row[0] else None
+
+        cutoff = datetime.now(UTC) - timedelta(days=args.days) if args.days else None
+        rows = conn.execute(
+            "SELECT author_kind, content, attachments_json, created_at"
+            + (", reply_batch" if has_batch else ", NULL AS reply_batch")
+            + " FROM messages WHERE deleted = 0 ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    shown = 0
+    for r in rows:
+        at = datetime.fromisoformat(r["created_at"])
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=UTC)
+        if cutoff is not None and at < cutoff:
+            continue
+        who = "他"
+        if r["author_kind"] != "user":
+            # 迁移之前的消息分不出回复还是主动，那一段不标
+            knowable = has_batch and (boundary is None or at > boundary)
+            who = "她·主动" if knowable and r["reply_batch"] is None else "她"
+        stamp = at.astimezone(hers).strftime("%m-%d %H:%M")
+        if his is not None:
+            stamp += f"（他 {at.astimezone(his).strftime('%m-%d %H:%M')}）"
+        pic = " [图]" if r["attachments_json"] not in (None, "", "[]") else ""
+        text = " ".join(str(r["content"] or "").split())
+        print(f"{stamp}  {who:<4} {text}{pic}")
+        shown += 1
+
+    print(f"\n一共 {shown} 条。时间是她那边的，括号里是他那边的。", file=sys.stderr)
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     loaded = load_all(args)
     if loaded is None:
@@ -670,6 +733,10 @@ def main(argv: list[str] | None = None) -> int:
     ver = sub.add_parser("verify", help="检查一份备份还能不能用")
     ver.add_argument("path", help="要检查的 .db 文件")
 
+    exp = sub.add_parser("export", help="把聊天记录按时间顺序打出来（只在你自己要的时候用）")
+    exp.add_argument("--days", type=int, default=0, help="只看最近多少天，默认全部")
+    exp.add_argument("--db", default="", help="数据库路径，默认用 DB_PATH")
+
     doc = sub.add_parser("doctor", help="体检：只看时间戳和任务表，不读聊天内容")
     doc.add_argument("--days", type=int, default=14, help="看最近多少天")
     doc.add_argument("--db", default="", help="数据库路径，默认用 DB_PATH")
@@ -685,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         "backup": cmd_backup,
         "verify": cmd_verify,
         "doctor": cmd_doctor,
+        "export": cmd_export,
     }
     return handlers[args.command](args)
 
