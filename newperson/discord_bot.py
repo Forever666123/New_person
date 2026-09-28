@@ -743,12 +743,17 @@ class App:
 
         return build_situation(
             persona=self.persona,
-            now=now,
+            now=self.rhythm.local_time(now),
             state_line=state_line,
             mood_notes=mood,
             day_plan=plan,
             diary_notes=notes,
         )
+
+    def _local_stamps(self, messages: list, now: datetime) -> list:
+        """聊天记录的时间戳换成她此刻所在的时区，跟"现在是几点"对得上。"""
+        tz = self.rhythm.local_time(now).tzinfo
+        return [m.model_copy(update={"created_at": m.created_at.astimezone(tz)}) for m in messages]
 
     async def _photo_shortlist(self, now: datetime) -> list:
         used = await self.memory.recently_used_photo_ids(now)
@@ -850,7 +855,7 @@ class App:
         recent = await self.memory.recent_messages(
             CONVERSATION_ID, self.persona.memory.recent_messages
         )
-        recent = [m for m in recent if m.id not in {u.id for u in unread}]
+        recent = self._local_stamps([m for m in recent if m.id not in {u.id for u in unread}], now)
 
         mode_name = job.payload.get("mode")
         mode = next((m for m in self.persona.modes if m.name == mode_name), None)
@@ -880,7 +885,7 @@ class App:
                 not_yet=await self.memory.pending_timed(now),
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
-                unread=unread,
+                unread=self._local_stamps(unread, now),
                 hints=list(job.payload.get("hints", [])),
                 photos=await self._photo_shortlist(now),
                 images=images,
@@ -1167,7 +1172,9 @@ class App:
                 summary=conv.summary,
                 owner_facts=owner_facts,
                 self_facts=self_facts,
-                recent=await self.memory.recent_messages(CONVERSATION_ID, 20),
+                recent=self._local_stamps(
+                    await self.memory.recent_messages(CONVERSATION_ID, 20), now
+                ),
                 hours_since_last_exchange=(now - last).total_seconds() / 3600 if last else None,
                 unanswered_initiations=conv.unanswered_initiations,
                 photos=photos,

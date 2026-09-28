@@ -96,7 +96,7 @@ class LifeEngine:
 
         plan = await self.brain.generate_day_plan(
             DayPlanRequest(
-                now=now,
+                now=self.rhythm.local_time(now),
                 state_line=self.state_line(now),
                 mood_notes=daily.mood_notes,
                 wake_at=daily.wake,

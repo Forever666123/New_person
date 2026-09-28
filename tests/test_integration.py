@@ -2359,3 +2359,34 @@ async def test_the_ledger_command_shows_the_time_he_named(
     )
     out = await handle("!np ledger trading", ctx)
     assert "你说的时间：09-29 09:00" in out
+
+
+async def test_abroad_the_prompt_tells_her_the_local_time(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她飞去别的时区时，"现在是几点"和聊天记录的时间戳都按当地写。
+
+    同一段里的起床时刻本来就是按当地算的；"现在"还按家里写的话，
+    她会读到"现在 06:14"，紧接着"你今天 11:07 起"。
+    """
+    from datetime import date
+
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    day = date(2026, 10, 1)
+    while str(app.rhythm.tz_for(day)) == str(persona.tz) and day < date(2027, 9, 1):
+        day += timedelta(days=1)
+    assert day < date(2027, 9, 1), "前提不成立：一年里没有跨时区的出行"
+    there = app.rhythm.tz_for(day + timedelta(days=1))
+    noon = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=there)
+    noon += timedelta(hours=13)
+    home_now = noon.astimezone(TZ)
+    clock.set(home_now)
+
+    situation = await app._build_situation(home_now)
+    assert "13:00，你这边的时间" in situation, situation.splitlines()[0]
+
+    await send(app, "在干嘛", at=home_now, msg_id=77)
+    await _deliver_one_reply(app, clock, memory)
+    assert f"[{noon.strftime('%m-%d')} 13:00" in llm.calls[-1]["messages"][0]["content"]

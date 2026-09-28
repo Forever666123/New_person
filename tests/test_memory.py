@@ -342,3 +342,34 @@ async def test_restoring_unread_only_puts_back_that_one_batch(memory: Memory) ->
 
     # 再放一次什么都不会发生：那批已经是未读了
     assert await memory.restore_unread("owner", batches[3][-1]) == 0
+
+
+async def test_due_jobs_compare_real_instants_across_offsets(memory: Memory) -> None:
+    """到没到期按真实时刻比，不按字符串比。
+
+    她出国时按当地作息排的任务带着当地偏移，而"现在"永远是家里的钟。
+    按字符串比，冰岛那十二天每件事都晚整五小时，调度循环还每半秒空转一次。
+    """
+    home = ZoneInfo("America/New_York")
+    abroad = datetime(2026, 12, 30, 11, 13, tzinfo=ZoneInfo("Atlantic/Reykjavik"))
+    at = abroad.astimezone(home) - timedelta(hours=1)
+    job_id = await memory.add_job(Job(kind="reply", run_at=abroad), at)
+    early = await memory.add_job(
+        Job(kind="proactive", run_at=abroad.astimezone(home) - timedelta(minutes=30)), at
+    )
+
+    assert [j.id for j in await memory.due_jobs(abroad.astimezone(home) - timedelta(minutes=1))] == [early]
+    assert {j.id for j in await memory.due_jobs(abroad.astimezone(home))} == {early, job_id}
+    nxt = await memory.next_job_run_at()
+    assert nxt is not None and nxt == abroad.astimezone(home) - timedelta(minutes=30)
+    pending = [j.id for j in await memory.pending_jobs()]
+    assert pending == [early, job_id], "排序按字符串，家里的钟排在了前面"
+
+
+async def test_a_job_in_the_repeated_hour_is_due_on_time(memory: Memory) -> None:
+    """夏令时结束那一夜，第一个 01:55 的任务在第一个 01:55 到期，不是一小时后。"""
+    home = ZoneInfo("America/New_York")
+    first = datetime(2026, 11, 1, 5, 55, tzinfo=ZoneInfo("UTC")).astimezone(home)
+    job_id = await memory.add_job(Job(kind="reply", run_at=first), first - timedelta(hours=1))
+    second_hour = datetime(2026, 11, 1, 6, 10, tzinfo=ZoneInfo("UTC")).astimezone(home)
+    assert [j.id for j in await memory.due_jobs(second_hour)] == [job_id]

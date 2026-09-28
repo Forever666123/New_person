@@ -1019,8 +1019,13 @@ class Memory:
         return self._row_to_job(row) if row else None
 
     async def due_jobs(self, now: datetime, limit: int = 20) -> list[Job]:
+        # 到没到期按**真实时刻**比，不按字符串比。run_at 带着各自的时区偏移：
+        # 她出国时按当地作息排的任务写的是当地偏移，而 now 永远是家里的钟，
+        # 字符串一比就差出整个时差——冰岛那十二天，每件事都晚整五小时，
+        # 调度循环还会每半秒空转一次。夏令时结束那一夜也会差一小时。
         rows = await self._fetch_all(
-            "SELECT * FROM jobs WHERE status = 'pending' AND run_at <= ? ORDER BY run_at LIMIT ?",
+            "SELECT * FROM jobs WHERE status = 'pending' AND julianday(run_at) <= julianday(?)"
+            " ORDER BY julianday(run_at), id LIMIT ?",
             (now.isoformat(), limit),
         )
         return [self._row_to_job(r) for r in rows]
@@ -1056,7 +1061,8 @@ class Memory:
         """把租约过期的 running 任务放回队列。进程崩了就靠这个。"""
         cur = await self.db.execute(
             "UPDATE jobs SET status = 'pending', lease_until = NULL"
-            " WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)",
+            " WHERE status = 'running'"
+            " AND (lease_until IS NULL OR julianday(lease_until) < julianday(?))",
             (now.isoformat(),),
         )
         await self.db.commit()
@@ -1064,7 +1070,9 @@ class Memory:
 
     async def next_job_run_at(self) -> datetime | None:
         row = await self._fetch_one(
-            "SELECT MIN(run_at) AS t FROM jobs WHERE status = 'pending'", ()
+            "SELECT run_at AS t FROM jobs WHERE status = 'pending'"
+            " ORDER BY julianday(run_at) LIMIT 1",
+            (),
         )
         return parse_dt(row["t"]) if row and row["t"] else None
 
@@ -1076,12 +1084,12 @@ class Memory:
         """
         if conversation_id is None:
             rows = await self._fetch_all(
-                "SELECT * FROM jobs WHERE status = 'failed' ORDER BY run_at"
+                "SELECT * FROM jobs WHERE status = 'failed' ORDER BY julianday(run_at), id"
             )
         else:
             rows = await self._fetch_all(
                 "SELECT * FROM jobs WHERE status = 'failed' AND conversation_id = ?"
-                " ORDER BY run_at",
+                " ORDER BY julianday(run_at), id",
                 (conversation_id,),
             )
         return [self._row_to_job(r) for r in rows]
@@ -1180,7 +1188,7 @@ class Memory:
         if conversation_id:
             sql += " AND conversation_id = ?"
             args.append(conversation_id)
-        rows = await self._fetch_all(sql + " ORDER BY run_at", tuple(args))
+        rows = await self._fetch_all(sql + " ORDER BY julianday(run_at), id", tuple(args))
         return [self._row_to_job(r) for r in rows]
 
     async def jobs_of_kind(self, kind: JobKind, conversation_id: str | None = None) -> list[Job]:

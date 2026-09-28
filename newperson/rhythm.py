@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import random
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .calendar import AcademicCalendar
@@ -34,6 +34,16 @@ from .models import ClassInstance, DailyRhythm, RhythmSnapshot
 from .persona import DayVariant, LifePhase, RhythmConfig, hhmm_to_minutes
 
 _SEARCH_LIMIT = 400
+
+
+def later(dt: datetime, delta: timedelta) -> datetime:
+    """``dt`` 之后真实过去 ``delta`` 的那一刻，时区保持不变。
+
+    带 ZoneInfo 的时刻直接加 timedelta 是**按墙钟加**：夏令时结束那一夜，
+    第二个 01:05 加十分钟会回到第一个 01:15——往回走了一小时。
+    先换到 UTC 加，再换回来。
+    """
+    return (dt.astimezone(UTC) + delta).astimezone(dt.tzinfo)
 """向前搜索的最大步数，防止配置写错时死循环。"""
 
 _PHASE_EPOCH = date(2025, 1, 1)
@@ -138,6 +148,15 @@ class Rhythm:
         """dt 落在她当地的哪一天。先按家里的时区粗算，再用当天的时区校正。"""
         rough = dt.astimezone(self.tz).date()
         return dt.astimezone(self.tz_for(rough)).date()
+
+    def local_time(self, dt: datetime) -> datetime:
+        """同一个时刻，换成她当时人在的那个时区。
+
+        时钟永远按家里的时区走。她飞去冰岛时，提示词里的"现在是几点"、
+        聊天记录的时间戳都得换成当地的，不然会跟同一段里按当地算的
+        起床时刻对不上——"现在 06:14"，紧接着"你今天 11:07 起"。
+        """
+        return dt.astimezone(self.tz_for(self.local_date(dt)))
 
     def _at(self, day: date, minutes: float) -> datetime:
         """把"当天第 N 分钟"变成带时区的时刻，允许跨日。"""
@@ -270,10 +289,15 @@ class Rhythm:
         """``day`` 这一天早上的起床时刻。"""
         return self.for_day(day).wake
 
+    # 下面这些查询，比较前都先把 dt 换成 UTC。同一个 tzinfo 的两个时刻比大小时
+    # Python 只看墙钟、不看 fold：夏令时结束那一夜，第二个 01:10 会被当成
+    # 早于第一个 01:30 的入睡时刻，于是睡着半小时的她被判成醒着，几十秒就回了消息。
+    # 换成 UTC 之后是跨时区比较，Python 按真实时刻比。
+
     def logical_day(self, dt: datetime) -> date:
         """凌晨还没睡的时间算作前一天。用来取当日变体。"""
         d = self.local_date(dt)
-        return d - timedelta(days=1) if dt < self.wake_of(d) else d
+        return d - timedelta(days=1) if dt.astimezone(UTC) < self.wake_of(d) else d
 
     def daily_for(self, dt: datetime) -> DailyRhythm:
         return self.for_day(self.logical_day(dt))
@@ -281,6 +305,7 @@ class Rhythm:
     def sleep_window_containing(self, dt: datetime) -> tuple[datetime, datetime] | None:
         """若 dt 处于某一觉之中，返回 ``(入睡, 起床)``；否则 None。"""
         d = self.local_date(dt)
+        dt = dt.astimezone(UTC)
         for offset in (-1, 0, 1):
             start = self.for_day(d + timedelta(days=offset)).sleep_start
             end = self.for_day(d + timedelta(days=offset + 1)).wake
@@ -294,7 +319,9 @@ class Rhythm:
         return self.sleep_window_containing(dt) is not None
 
     def class_containing(self, dt: datetime) -> ClassInstance | None:
-        for block in self.daily_for(dt).classes:
+        daily = self.daily_for(dt)
+        dt = dt.astimezone(UTC)
+        for block in daily.classes:
             if block.start <= dt < block.end:
                 return block
         return None
@@ -337,6 +364,7 @@ class Rhythm:
         if window is not None:
             return window[1]
         d = self.local_date(dt)
+        dt = dt.astimezone(UTC)
         for offset in range(0, _SEARCH_LIMIT):
             wake = self.for_day(d + timedelta(days=offset)).wake
             if wake > dt:
@@ -346,6 +374,7 @@ class Rhythm:
     def next_sleep_after(self, dt: datetime) -> datetime:
         """dt 之后的下一次入睡。"""
         d = self.local_date(dt)
+        dt = dt.astimezone(UTC)
         for offset in range(-1, _SEARCH_LIMIT):
             start = self.for_day(d + timedelta(days=offset)).sleep_start
             if start > dt:
@@ -395,10 +424,11 @@ class Rhythm:
                 block_title=block.title,
             )
 
-        winding = next_sleep - dt <= timedelta(minutes=self.config.winding_down_minutes)
+        real = dt.astimezone(UTC)
+        winding = next_sleep - real <= timedelta(minutes=self.config.winding_down_minutes)
         # 下一个状态切换点：入睡，或者下一节课开始
         upcoming = [next_sleep]
-        upcoming += [c.start for c in daily.classes if c.start > dt]
+        upcoming += [c.start for c in daily.classes if c.start > real]
         return RhythmSnapshot(
             state="winding_down" if winding else "free",
             at=dt,
@@ -423,8 +453,8 @@ class Rhythm:
     def first_glance_after_waking(self, wake: datetime, rng: random.Random) -> datetime:
         """醒来之后第一次看手机。多数人是躺床上就看了。"""
         if rng.random() < 0.6:
-            return wake + timedelta(minutes=rng.uniform(0, 25))
-        return wake + timedelta(minutes=rng.uniform(25, 90))
+            return later(wake, timedelta(minutes=rng.uniform(0, 25)))
+        return later(wake, timedelta(minutes=rng.uniform(25, 90)))
 
     def next_glance_after(self, dt: datetime, rng: random.Random) -> datetime:
         """从 dt 起，下一次瞄手机是什么时候。睡着就顺延到醒来之后。"""
@@ -433,7 +463,7 @@ class Rhythm:
             activity = self.activity_at(t)
             if activity < self.config.min_activity_to_glance:
                 return self.first_glance_after_waking(self.next_wake_after(t), rng)
-            nxt = t + timedelta(minutes=self._sample_interval_minutes(activity, rng))
+            nxt = later(t, timedelta(minutes=self._sample_interval_minutes(activity, rng)))
             if self.activity_at(nxt) >= self.config.min_activity_to_glance:
                 return nxt
             t = nxt  # 落进了睡眠，下一轮会跳到醒来之后

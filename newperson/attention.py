@@ -16,11 +16,11 @@ from __future__ import annotations
 import math
 import random
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from .models import Heat, MessageFeatures, RhythmSnapshot, TimingDecision
 from .persona import Persona
-from .rhythm import Rhythm
+from .rhythm import Rhythm, later
 
 _QUESTION = re.compile(r"[?？]|吗[\s?？]*$|(在不在|在吗|怎么办|为什么|多少|哪个|要不要|是不是)")
 _URGENT = re.compile(r"(急|快点|救命|出事|紧急|马上|!!!|？？？)")
@@ -111,7 +111,17 @@ class AttentionPolicy:
         rng: random.Random,
         session_started_at: datetime | None = None,
     ) -> TimingDecision:
-        """决定她什么时候看到这批消息、什么时候开始回。"""
+        """决定她什么时候看到这批消息、什么时候开始回。
+
+        里面的比较和加减全在 UTC 上做，出口再换回她的时区。带 ZoneInfo 的时刻
+        按墙钟加减、比大小时不看 fold：夏令时结束那一夜，重复的那一小时里
+        算出来的时刻会倒退一小时，落到"现在"之前——调度器下一拍就发，那就是秒回。
+        """
+        home = now.tzinfo
+        now = now.astimezone(UTC)
+        last_user_message_at = last_user_message_at.astimezone(UTC)
+        if session_started_at is not None:
+            session_started_at = session_started_at.astimezone(UTC)
         timing = self.persona.timing
         snapshot = self.rhythm.state_at(now)
         daily = self.rhythm.daily_for(now)
@@ -164,8 +174,8 @@ class AttentionPolicy:
         )
         notice, reply = self._scale(now, notice, reply)
         return TimingDecision(
-            notice_at=notice,
-            reply_at=reply,
+            notice_at=notice.astimezone(home),
+            reply_at=reply.astimezone(home),
             reason="；".join(steps),
             defers=defers,
             quick_before_sleep=quick_before_sleep,
@@ -204,7 +214,7 @@ class AttentionPolicy:
                 engage = 1 - (1 - engage) * 0.25
             if rng.random() <= engage:
                 break
-            nxt = self.rhythm.next_glance_after(glance + timedelta(seconds=1), rng)
+            nxt = self.rhythm.next_glance_after(later(glance, timedelta(seconds=1)), rng)
             if nxt <= glance:
                 break
             glance = nxt
@@ -213,7 +223,7 @@ class AttentionPolicy:
         if defers:
             steps.append(f"看到了先放着，第 {defers + 1} 次拿手机才处理")
         else:
-            steps.append(f"下次看手机 {glance.strftime('%m-%d %H:%M')}")
+            steps.append(f"下次看手机 {self._show(glance)}")
         return glance, defers
 
     def _push_out_of_sleep(
@@ -223,7 +233,7 @@ class AttentionPolicy:
         if not self.rhythm.is_sleeping(reply):
             return reply
         pushed = self.rhythm.first_glance_after_waking(self.rhythm.next_wake_after(reply), rng)
-        steps.append(f"那会儿在睡觉，推到 {pushed.strftime('%m-%d %H:%M')}")
+        steps.append(f"那会儿在睡觉，推到 {self._show(pushed)}")
         return pushed
 
     def _respect_burst_gap(
@@ -257,7 +267,7 @@ class AttentionPolicy:
         """
         if self.rhythm.is_sleeping(now):
             wake = self.rhythm.next_wake_after(now)
-            cap = wake + timedelta(hours=self.persona.timing.backlog_after_wake_hours)
+            cap = later(wake, timedelta(hours=self.persona.timing.backlog_after_wake_hours))
             if reply > cap:
                 steps.append("睡醒之后不会再拖了")
                 return cap
@@ -267,7 +277,11 @@ class AttentionPolicy:
         if reply - now <= limit or reply - notice <= limit:
             return reply
         steps.append(f"封顶到 {self.persona.timing.max_delay_hours} 小时")
-        return notice + limit
+        return later(notice, limit)
+
+    def _show(self, dt: datetime) -> str:
+        """日志里的时刻按她当时所在的时区写。里面算的是 UTC，直接打出来没人看得懂。"""
+        return dt.astimezone(self.rhythm.tz_for(self.rhythm.local_date(dt))).strftime("%m-%d %H:%M")
 
     def _scale(self, now: datetime, notice: datetime, reply: datetime) -> tuple[datetime, datetime]:
         """调试用的整体加速。1.0 就是真实节奏。"""
@@ -330,10 +344,12 @@ class AttentionPolicy:
         上限就是"四分半钟前"——外层的 min 会挑中它，于是回复被排到过去，
         调度器下一拍立刻发出去。那就是实打实的秒回，这个项目最不能出的事。
         """
-        base = max(existing_reply_at, now)
+        home = now.tzinfo
+        now = now.astimezone(UTC)
+        base = max(existing_reply_at.astimezone(UTC), now)
         gap = max(MIN_DELAY_SECONDS, self._lognormal(25 if heat == "hot" else 40, 0.4, rng))
         cap = base + timedelta(seconds=90 if heat == "hot" else 180)
-        return min(max(base, now + timedelta(seconds=gap)), cap)
+        return min(max(base, now + timedelta(seconds=gap)), cap).astimezone(home)
 
     def typing_duration(self, text: str, rng: random.Random) -> float:
         """打这条话要多久。手机打字比键盘慢。"""

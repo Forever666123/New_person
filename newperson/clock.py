@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
@@ -55,12 +55,19 @@ class FakeClock:
     def set(self, when: datetime) -> None:
         self._now = when.astimezone(self.tz)
 
+    # 往前走一律按真实时间走，跟 RealClock 一样。直接在带 ZoneInfo 的时刻上
+    # 加 timedelta 是按墙钟加：夏令时结束那一夜会倒退一小时，或者整个跳过
+    # 重复的那一小时——测试就永远到不了线上真会经过的那一段。
+
+    def _forward(self, delta: timedelta) -> None:
+        self._now = (self._now.astimezone(UTC) + delta).astimezone(self.tz)
+
     def advance(self, seconds: float = 0, **kwargs: float) -> None:
-        self._now = self._now + timedelta(seconds=seconds, **kwargs)
+        self._forward(timedelta(seconds=seconds, **kwargs))
 
     async def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         if seconds > 0:
-            self._now = self._now + timedelta(seconds=seconds)
+            self._forward(timedelta(seconds=seconds))
         # 让出事件循环，避免死循环里一直不切换
         await asyncio.sleep(0)

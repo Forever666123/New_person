@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import statistics
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -364,3 +364,88 @@ def test_vacation_does_not_flatten_the_phase_mix(persona: Persona) -> None:
     # 退回 phases[0] 的话这个数会停在上课期的水平（约一成）。
     assert easy > 0.13, f"假期里「松」只占 {easy:.0%}，赶due 让出来的概率没分到它头上"
     assert easy < 0.21, f"假期里「松」占到 {easy:.0%}，重抽的权重不对"
+
+
+# -- 夏令时结束那一夜 ----------------------------------------------------------
+#
+# 纽约 2026-11-01 06:00Z 把钟拨回一小时，01:00–02:00 过两遍。同一个 tzinfo 的
+# 两个时刻比大小时 Python 只看墙钟、不看 fold，于是第二个 01:10 被当成早于
+# 第一个 01:30 的入睡时刻——睡着半小时的她在代码里又醒了，几十秒就回消息。
+
+FALL_BACK = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
+
+
+def _minutes(start: datetime, end: datetime, tz):
+    t = start
+    while t < end:
+        yield t.astimezone(tz)
+        t += timedelta(minutes=1)
+
+
+def test_she_stays_asleep_through_the_repeated_hour(rhythm: Rhythm, persona: Persona) -> None:
+    """那一觉从入睡到起床，每一分钟都在睡——包括过第二遍的那一小时。"""
+    night = rhythm.for_day(date(2026, 10, 31))
+    wake = rhythm.for_day(date(2026, 11, 1)).wake
+    assert night.sleep_start.astimezone(UTC) < FALL_BACK + timedelta(hours=1) < wake.astimezone(UTC), (
+        "前提不成立：这个种子那一觉没跨过重复的那一小时"
+    )
+    awake = [
+        t for t in _minutes(night.sleep_start.astimezone(UTC), wake.astimezone(UTC), persona.tz)
+        if not rhythm.is_sleeping(t)
+    ]
+    assert not awake, f"睡着的时候被判成醒着：{awake[0].isoformat()} 起共 {len(awake)} 分钟"
+
+
+def test_she_never_replies_while_asleep_through_the_repeated_hour(
+    rhythm: Rhythm, persona: Persona
+) -> None:
+    """重复的那一小时里他发的消息，一条都不能在她睡着的时候回出去。"""
+    from newperson.attention import AttentionPolicy, extract_features
+
+    policy = AttentionPolicy(persona, rhythm, 1.0)
+    features = extract_features(["在吗"], persona)
+    # 真相按 UTC 算，不借 is_sleeping——被测的正是它。
+    asleep_from = rhythm.for_day(date(2026, 10, 31)).sleep_start.astimezone(UTC)
+    asleep_until = rhythm.for_day(date(2026, 11, 1)).wake.astimezone(UTC)
+    for now in _minutes(FALL_BACK, FALL_BACK + timedelta(minutes=31), persona.tz):
+        for seed in range(5):
+            decision = policy.plan_reply(now, "cold", features, now, random.Random(seed))
+            reply = decision.reply_at.astimezone(UTC)
+            assert reply > now.astimezone(UTC), f"{now.isoformat()} 的消息排到了过去"
+            assert not asleep_from <= reply < asleep_until, (
+                f"{now.isoformat()} 的消息在她睡着时回了：{decision.reply_at.isoformat()}"
+            )
+
+
+def test_glances_move_forward_in_real_time(rhythm: Rhythm, persona: Persona) -> None:
+    """下一次看手机永远在真实时间上往后，不会跨过拨钟倒退一小时。"""
+    for start in _minutes(FALL_BACK, FALL_BACK + timedelta(minutes=30), persona.tz):
+        for seed in range(10):
+            nxt = rhythm.next_glance_after(start, random.Random(seed))
+            assert nxt.astimezone(UTC) > start.astimezone(UTC), (
+                f"从 {start.isoformat()} 起，下一次看手机倒回了 {nxt.isoformat()}"
+            )
+
+
+def test_the_fake_clock_walks_through_the_repeated_hour(persona: Persona) -> None:
+    """测试用的钟也得按真实时间走，不然永远测不到线上真会经过的那一小时。"""
+    from newperson.clock import FakeClock
+
+    clock = FakeClock(datetime(2026, 11, 1, 5, 59, tzinfo=UTC).astimezone(persona.tz))
+    clock.advance(120)
+    assert clock.now().astimezone(UTC) == datetime(2026, 11, 1, 6, 1, tzinfo=UTC)
+    clock.set(datetime(2026, 11, 1, 6, 5, tzinfo=UTC))
+    clock.advance(60)
+    assert clock.now().astimezone(UTC) == datetime(2026, 11, 1, 6, 6, tzinfo=UTC)
+
+
+def test_the_local_time_follows_her_abroad(rhythm: Rhythm, persona: Persona) -> None:
+    """她出国那几天，"现在几点"要按她人在的地方算。"""
+    day = date(2026, 10, 1)
+    while str(rhythm.tz_for(day)) == str(persona.tz) and day < date(2027, 9, 1):
+        day += timedelta(days=1)
+    assert day < date(2027, 9, 1), "前提不成立：一年里没有跨时区的出行"
+    noon_there = datetime.combine(day, datetime.min.time(), tzinfo=rhythm.tz_for(day)) + timedelta(hours=12)
+    shown = rhythm.local_time(noon_there.astimezone(persona.tz))
+    assert shown.strftime("%H:%M") == "12:00"
+    assert str(shown.tzinfo) == str(rhythm.tz_for(day))
