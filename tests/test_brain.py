@@ -883,3 +883,19 @@ def test_a_dated_model_id_is_priced_like_its_alias() -> None:
     assert price_of("claude-haiku-4-5-20251001") == PRICING_PER_MTOK["claude-haiku-4-5"]
     assert price_of("claude-sonnet-5") == PRICING_PER_MTOK["claude-sonnet-5"]
     assert price_of("claude-sonnet-5-5") == (5.0, 25.0)
+
+
+async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """重写回来还是只有禁语：这一批不接话，而不是返回 None 让调度器重试。
+
+    重试只会让模型把同一个词写三遍、烧六次调用，然后任务判死，
+    他那句一直挂在未读里，有未读期间主动消息也全被压住。
+    """
+    bad = ReplyPlan(parts=[ReplyPart(text="没看到")])
+    client = fake_client(bad, ReplyPlan(parts=[ReplyPart(text="没看到啊")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(), TODAY)
+    assert got is not None and got.parts == []
+    assert len(client.messages.calls) == 2

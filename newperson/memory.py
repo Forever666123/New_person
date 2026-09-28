@@ -470,6 +470,17 @@ class Memory:
         row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (message_id,))
         return parse_dt(row["read_at"]) if row else None
 
+    async def cancel_initiatives_due_before(self, moment: datetime) -> int:
+        """把排期不晚于 ``moment`` 的主动消息和 follow_up 作废。从备份恢复之后用。"""
+        cur = await self.db.execute(
+            "UPDATE jobs SET status = 'cancelled' WHERE status = 'pending'"
+            " AND kind IN ('proactive', 'follow_up')"
+            " AND julianday(COALESCE(original_run_at, run_at)) <= julianday(?)",
+            (moment.isoformat(),),
+        )
+        await self.db.commit()
+        return cur.rowcount or 0
+
     async def batch_messages(self, conversation_id: str, upto_id: int) -> list[StoredMessage]:
         """``upto_id`` 那一批的全部消息，按说话的先后。认批靠 ``read_at``，跟下面同一套。"""
         row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (upto_id,))

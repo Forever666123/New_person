@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import random
 import signal
@@ -411,6 +412,8 @@ class App:
         """
         recovered = 0
         restored_hers = 0
+        hers_latest: datetime | None = None
+        command_replies = await self._command_reply_ids()
         latest: tuple[datetime, int | None] | None = None
         """他最后说话的时刻和地方。按时间取最大，**不是按遍历顺序取最后一个**——
         私聊先翻、公开频道后翻的话，取遍历顺序会把他在私聊里说的最后一句
@@ -442,6 +445,8 @@ class App:
             那些页是好好处理完的，``safe`` 照常跟到底。
             """
             stuck = False
+            last_command_at: datetime | None = None
+            """这个频道里他上一条 !np 的时刻。紧跟着的那句是程序的回执，不是她说的。"""
             for _ in range(max_pages):
                 try:
                     batch = [
@@ -458,8 +463,17 @@ class App:
                 for message in batch:
                     cursor = max(cursor, message.id)
                     if self._is_hers(message):
+                        if self._is_command_reply(message, command_replies, last_command_at):
+                            # !np 的回执不入库、不进模型（她不知道你在操控她），
+                            # 也不能算作"她回过了"——那会把他的未读吞掉。
+                            if not stuck:
+                                safe = cursor
+                            continue
                         try:
-                            restored_hers += await self._recover_her_message(message)
+                            got = await self._recover_her_message(message)
+                            if got is not None:
+                                restored_hers += 1
+                                hers_latest = max(hers_latest or got, got)
                         except Exception:  # noqa: BLE001 - 跟他的消息一样：一条不行，别连累整批
                             log.warning("[inbox] 补抓时她这条记不下，跳过 %s", message.id, exc_info=True)
                             stuck = True
@@ -471,6 +485,8 @@ class App:
                         # 不该处理的、以及 !np（给程序看的，补抓时更不该执行）：
                         # 跳过不等于没处理妥当，游标照常跟上，否则别人的闲聊
                         # 会把这个频道永远卡在原地。
+                        if owner_cmds.is_command(message.content):
+                            last_command_at = message.created_at
                         if not stuck:
                             safe = cursor
                         continue
@@ -516,8 +532,13 @@ class App:
             if safe > start:
                 await self.memory.kv_set(key, str(safe))
 
-        if restored_hers:
+        if restored_hers and hers_latest is not None:
             log.info("[inbox] 她自己说过、库里没有的 %d 条也补上了（多半是刚从备份恢复）", restored_hers)
+            # 恢复出来的库里还排着备份那会儿的主动消息。排期早于她补回来的最后一句的，
+            # 多半在备份之后已经发过了（Discord 上就有），再发一遍就是同一句话说两次。
+            dropped = await self.memory.cancel_initiatives_due_before(hers_latest)
+            if dropped:
+                log.info("[inbox] 备份之后多半已经说过的 %d 个主动任务作废", dropped)
         if recovered and await self.memory.unread_messages(CONVERSATION_ID):
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
             # 回到他说话的那个地方，不是默认频道
@@ -534,6 +555,36 @@ class App:
             await self._schedule_reply(self.clock.now())
         return recovered
 
+    COMMAND_REPLY_KEY = "command_reply_ids"
+    COMMAND_REPLY_WINDOW = timedelta(seconds=5)
+    """老版本没记回执的编号，只能认"紧跟在 !np 后面几秒内"的那句。
+    她正常回一句要调模型、要打字，不会这么快。"""
+
+    async def _remember_command_reply(self, message_id: int | None) -> None:
+        """记下 !np 回执的编号。补抓时要认出它：它是程序说的，不是她说的。"""
+        if not message_id:
+            return
+        ids = await self._command_reply_ids()
+        ids.add(int(message_id))
+        await self.memory.kv_set(self.COMMAND_REPLY_KEY, json.dumps(sorted(ids)[-200:]))
+
+    async def _command_reply_ids(self) -> set[int]:
+        raw = await self.memory.kv_get(self.COMMAND_REPLY_KEY)
+        try:
+            return {int(i) for i in json.loads(raw)} if raw else set()
+        except (ValueError, TypeError):
+            return set()
+
+    def _is_command_reply(
+        self, message: discord.Message, known: set[int], last_command_at: datetime | None
+    ) -> bool:
+        if message.id in known:
+            return True
+        if last_command_at is None:
+            return False
+        gap = message.created_at - last_command_at
+        return timedelta(0) <= gap <= self.COMMAND_REPLY_WINDOW
+
     def _is_hers(self, message: discord.Message) -> bool:
         """这条是她自己在私聊（或者那个公开频道）里发的。"""
         me = getattr(getattr(self.client, "user", None), "id", None)
@@ -546,8 +597,8 @@ class App:
             and message.channel.id == self.settings.proactive_channel_id
         )
 
-    async def _recover_her_message(self, message: discord.Message) -> int:
-        """把她在 Discord 上说过、库里却没有的一句补进来。返回补了几条（0 或 1）。
+    async def _recover_her_message(self, message: discord.Message) -> datetime | None:
+        """把她在 Discord 上说过、库里却没有的一句补进来。补了就返回那句的时刻。
 
         平时重启用不上：停机期间她本来就没说话，游标之后只有他的消息。
         **从备份恢复之后才用得上**：备份之后那段时间她其实都回过了，
@@ -564,8 +615,6 @@ class App:
             for m in await self.memory.unread_messages(CONVERSATION_ID)
             if m.created_at <= at
         ]
-        if answered:
-            await self.memory.mark_read(answered, at)
         stored = await self.memory.add_bot_message(
             CONVERSATION_ID,
             message.content,
@@ -573,7 +622,14 @@ class App:
             discord_message_id=message.id,
             reply_batch=at if answered else None,
         )
-        return 1 if stored else 0
+        # **只有真的新补进来的那句才能把之前的未读算作"她回过了"。**
+        # 平时每次重连都会从上次的游标往后重翻，她这段时间说的话早就在库里；
+        # 那些也拿来标已读的话，他在她打字那几秒里插的一句就被吞了。
+        if not stored:
+            return None
+        if answered:
+            await self.memory.mark_read(answered, at)
+        return at
 
     def _should_handle(self, message: discord.Message) -> bool:
         if message.author.bot:
@@ -607,7 +663,8 @@ class App:
                     now=self.clock.now(),
                 ),
             )
-            await message.channel.send(reply)
+            sent = await message.channel.send(reply)
+            await self._remember_command_reply(getattr(sent, "id", None))
             return
 
         now = self.clock.now()
@@ -795,6 +852,8 @@ class App:
             # "你最近出差"——一个在读研究生被告知自己在出差，会在回复里说出来。
             # 写成"他在出差"也不行：那是他没跟她说过的事，她不该知道。
             mood.append("你这几天没什么心思聊天。")
+        if heads_up := self.life.trip_heads_up(day):
+            mood.append(heads_up)
 
         # 作息只知道有没有课，日程才知道她此刻具体在干什么。
         # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。

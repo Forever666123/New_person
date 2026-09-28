@@ -82,6 +82,25 @@ class LifeEngine:
         }[snapshot.state]
         return f"{period}{where}{state}"
 
+    TRIP_HEADS_UP_DAYS = 7
+    """出门前多少天开始"心里挂着"这件事。"""
+
+    def trip_heads_up(self, day: date) -> str | None:
+        """快要出门了就让她知道。
+
+        日历里早就排好了，却从没进过她的上下文：她出发前一个字不提，
+        到了那天忽然"人在冰岛"，跟他的时差和回复节奏一起变了。
+        人出门前几天多半会顺口提一句。
+        """
+        if self.calendar.trip_for(day) is not None:
+            return None
+        trip = self.calendar.upcoming_trip(day, within_days=self.TRIP_HEADS_UP_DAYS)
+        if trip is None:
+            return None
+        days = (trip.start - day).days
+        when = "明天" if days == 1 else f"{days} 天后"
+        return f"你{when}（{trip.start.strftime('%m-%d')}）要去{trip.place}。聊到了可以顺口提一句，不用专门说。"
+
     async def ensure_today_plan(self, conversation_id: str) -> DayPlan | None:
         """今天还没有日程就生成一个，顺便把主动消息的候选排上。
 
@@ -108,7 +127,7 @@ class LifeEngine:
             DayPlanRequest(
                 now=self.rhythm.local_time(now),
                 state_line=self.state_line(now),
-                mood_notes=daily.mood_notes,
+                mood_notes=[*daily.mood_notes, *filter(None, [self.trip_heads_up(day)])],
                 wake_at=daily.wake,
                 sleep_at=daily.sleep_start,
                 classes=[

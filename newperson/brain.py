@@ -473,7 +473,12 @@ class Brain:
 
         **但带禁语的那条气泡不发。** 禁语修剪不了，"用修剪过的版本"
         原来就是原句照发——他抱怨过的"还在睡 没看到"就是这么漏出去的。
-        去掉之后一条不剩，就返回 None，让调度器当作"这会儿没看手机"过一阵再试。
+
+        去掉之后一条不剩时分两种：
+        - 重写那次调用失败了（网络、限流）：返回 None，当作这会儿没看手机，过一阵再试；
+        - 重写回来了、还是只有禁语：这一批就不接话了（空的 parts）。
+          再重试只会让模型把同一个词写三遍、烧六次调用，然后任务判死、
+          他那句一直挂在未读里，连主动消息也被压住。
         """
         fixed, needs_rewrite = style_guard.enforce(
             plan.parts, self.persona.style, self.persona.boundaries
@@ -501,7 +506,7 @@ class Brain:
             second.reaction = style_guard.filter_reaction(second.reaction, self.persona.style)
             log.info("[brain] 重写还是不过，用修剪过的版本（带禁语的那条不发）")
             if refixed and not second.parts:
-                return None
+                log.info("[brain] 剩下的全是禁语，这一批不接话了")
             return second
 
         plan.parts = self._drop_banned(fixed)

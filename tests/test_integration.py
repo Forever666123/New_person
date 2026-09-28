@@ -2701,3 +2701,148 @@ async def test_a_resumed_reply_quotes_the_right_message(tmp_path: Path, persona:
     await drain(app, clock, hops=20)
     assert "这个" in channel.texts
     assert quoted[-1] == mid, f"引用的是 {quoted[-1]}，该是 {mid}"
+
+
+def _dm_said(dm_kind, msg_id: int, text: str, at: datetime, *, hers: bool = False):
+    return SimpleNamespace(
+        id=msg_id, content=text, created_at=at,
+        author=SimpleNamespace(id=999 if hers else 42, display_name="她" if hers else "Leo", bot=hers),
+        channel=dm_kind, attachments=[],
+    )
+
+
+def _wire_dm(app: App, history: list) -> None:
+    dm = FakeHistoryChannel(history)
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_user=lambda _id: SimpleNamespace(dm_channel=dm),
+        get_channel=lambda _cid: None,
+    )
+
+
+async def test_catch_up_never_takes_a_command_reply_for_her_words(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """!np 的回执是程序在私聊里发的，不入库。补抓时不能把它当成她说的话：
+
+    那会让"今天调了几次模型、没有异地备份"进到她的上下文里（不变量 5），
+    还会把回执之前他的未读全标成已读——那两句她就永远不回了（不变量 2）。
+    新的回执按编号认，老版本发的按"紧跟在 !np 后面几秒内"认。
+    """
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "更早的", at=EVENING - timedelta(hours=1), msg_id=100)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+
+    await app._remember_command_reply(105)
+    _wire_dm(app, [
+        _dm_said(dm_kind, 101, "在吗", EVENING),
+        _dm_said(dm_kind, 102, "晚上吃了吗", EVENING + timedelta(minutes=35)),
+        _dm_said(dm_kind, 103, "!np status", EVENING + timedelta(minutes=40)),
+        _dm_said(dm_kind, 104, "**在晚课** 活跃度 0.04", EVENING + timedelta(minutes=40, seconds=1), hers=True),
+        _dm_said(dm_kind, 105, "上次备份 3 小时前", EVENING + timedelta(minutes=50), hers=True),
+    ])
+    clock.set(EVENING + timedelta(minutes=55))
+    await app.catch_up()
+
+    history = await memory.recent_messages(CONVERSATION_ID, 20)
+    assert not [m for m in history if m.author_kind == "bot"], "回执进库了"
+    assert [m.content for m in await memory.unread_messages(CONVERSATION_ID)] == ["在吗", "晚上吃了吗"]
+
+
+async def test_a_reconnect_does_not_swallow_what_he_said_while_she_typed(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """平时重连也会从上次的游标往后重翻，她这段时间说的话早就在库里。
+
+    那些已经在库里的，不能拿来把他的未读标成已读：他在她打字那几秒里
+    插的一句，时间早于她那条气泡，一标就没人回了。
+    """
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "在吗", at=EVENING, msg_id=200)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+    # 游标钉在 200，之后两边的话都照常进了库
+    _wire_dm(app, [_dm_said(dm_kind, 200, "在吗", EVENING)])
+    await app.catch_up()
+    await send(app, "我跟你说个事", at=EVENING + timedelta(seconds=5), msg_id=201)
+    await memory.add_bot_message(
+        CONVERSATION_ID, "在", EVENING + timedelta(seconds=9), discord_message_id=202,
+        reply_batch=EVENING,
+    )
+
+    _wire_dm(app, [
+        _dm_said(dm_kind, 200, "在吗", EVENING),
+        _dm_said(dm_kind, 201, "我跟你说个事", EVENING + timedelta(seconds=5)),
+        _dm_said(dm_kind, 202, "在", EVENING + timedelta(seconds=9), hers=True),
+    ])
+    clock.set(EVENING + timedelta(seconds=19))
+    await app.catch_up()
+    assert [m.content for m in await memory.unread_messages(CONVERSATION_ID)] == ["我跟你说个事"]
+
+
+async def test_after_a_restore_she_does_not_repeat_a_proactive_she_already_sent(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """恢复出来的库里还排着备份那会儿的主动消息。她在 Discord 上其实已经说过了，
+    补抓补回了那句——那个任务就该作废，不然同一句话说两遍。"""
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "明天面试", at=EVENING, msg_id=300)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+    asked_at = EVENING + timedelta(hours=15)
+    job_id = await app.scheduler.schedule(
+        "follow_up", asked_at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "问问面试"}, reason="follow_up",
+    )
+    later_id = await app.scheduler.schedule(
+        "proactive", asked_at + timedelta(hours=6), conversation_id=CONVERSATION_ID,
+        payload={"kind": "own_life", "note": "说说自己"}, reason="own_life",
+    )
+    _wire_dm(app, [
+        _dm_said(dm_kind, 300, "明天面试", EVENING),
+        _dm_said(dm_kind, 301, "面试怎么样了", asked_at, hers=True),
+    ])
+    clock.set(asked_at + timedelta(hours=2))
+    await app.catch_up()
+    assert (await memory.get_job(job_id)).status == "cancelled", "发过的那句又要发一遍"
+    assert (await memory.get_job(later_id)).status == "pending", "还没到点的不该动"
+
+
+async def test_she_knows_a_trip_is_coming_before_she_leaves(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """日历里排好的出行，出发前几天就该进她的上下文。
+
+    原来出发前一个字不提，到了那天忽然"人在冰岛"，时差和回复节奏一起变了。
+    """
+    from datetime import date
+
+    app, _channel, _llm, clock, _memory = await build(tmp_path, persona, [])
+    day = date(2026, 10, 1)
+    while app.calendar.trip_for(day) is None and day < date(2027, 9, 1):
+        day += timedelta(days=1)
+    trip = app.calendar.trip_for(day)
+    assert trip is not None, "前提不成立：一年里没有出行"
+    before = trip.start - timedelta(days=3)
+    moment = datetime.combine(before, datetime.min.time(), tzinfo=TZ) + timedelta(hours=15)
+    clock.set(moment)
+    situation = await app._build_situation(moment)
+    assert trip.place in situation and "3 天后" in situation
+    far = datetime.combine(trip.start - timedelta(days=20), datetime.min.time(), tzinfo=TZ)
+    assert trip.place not in await app._build_situation(far + timedelta(hours=15))
