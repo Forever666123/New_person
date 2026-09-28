@@ -2443,7 +2443,9 @@ async def test_after_a_restore_she_does_not_answer_what_she_already_answered(
         get_channel=lambda _cid: None,
     )
     clock.set(later + timedelta(hours=3))
+    marker = _just_restored(app)
     await app.catch_up()
+    assert not marker.exists(), "补完了，记号该清掉"
 
     unread = await memory.unread_messages(CONVERSATION_ID)
     assert [m.content for m in unread] == ["晚上去吃拉面"], "她回过的话又变成了未读"
@@ -2490,6 +2492,7 @@ async def test_after_a_restore_with_nothing_new_she_stays_quiet(
         get_channel=lambda _cid: None,
     )
     clock.set(EVENING + timedelta(hours=2))
+    _just_restored(app)
     await app.catch_up()
     assert await memory.unread_messages(CONVERSATION_ID) == []
     assert await memory.pending_jobs("reply", CONVERSATION_ID) == []
@@ -2751,6 +2754,13 @@ async def test_a_resumed_reply_quotes_the_right_message(tmp_path: Path, persona:
     assert quoted[-1] == mid, f"引用的是 {quoted[-1]}，该是 {mid}"
 
 
+def _just_restored(app: App) -> Path:
+    """restore.sh --install 留的记号。有它，补抓才补她自己说过的话。"""
+    marker = Path(app.settings.db_path).parent / ".just_restored"
+    marker.write_text("2026-09-28T16:00:00Z\n", encoding="utf-8")
+    return marker
+
+
 def _dm_said(dm_kind, msg_id: int, text: str, at: datetime, *, hers: bool = False):
     return SimpleNamespace(
         id=msg_id, content=text, created_at=at,
@@ -2796,6 +2806,7 @@ async def test_catch_up_never_takes_a_command_reply_for_her_words(
         _dm_said(dm_kind, 105, "上次备份 3 小时前", EVENING + timedelta(minutes=50), hers=True),
     ])
     clock.set(EVENING + timedelta(minutes=55))
+    _just_restored(app)  # 最要紧的是恢复之后那一轮：那时才会补她的话
     await app.catch_up()
 
     history = await memory.recent_messages(CONVERSATION_ID, 20)
@@ -2837,6 +2848,10 @@ async def test_a_reconnect_does_not_swallow_what_he_said_while_she_typed(
     clock.set(EVENING + timedelta(seconds=19))
     await app.catch_up()
     assert [m.content for m in await memory.unread_messages(CONVERSATION_ID)] == ["我跟你说个事"]
+    # 恢复之后那一轮也一样：已经在库里的那句不能拿来标已读
+    _just_restored(app)
+    await app.catch_up()
+    assert [m.content for m in await memory.unread_messages(CONVERSATION_ID)] == ["我跟你说个事"]
 
 
 async def test_after_a_restore_she_does_not_repeat_a_proactive_she_already_sent(
@@ -2867,6 +2882,7 @@ async def test_after_a_restore_she_does_not_repeat_a_proactive_she_already_sent(
         _dm_said(dm_kind, 301, "面试怎么样了", asked_at, hers=True),
     ])
     clock.set(asked_at + timedelta(hours=2))
+    _just_restored(app)
     await app.catch_up()
     assert (await memory.get_job(job_id)).status == "cancelled", "发过的那句又要发一遍"
     assert (await memory.get_job(later_id)).status == "pending", "还没到点的不该动"
@@ -2974,3 +2990,76 @@ async def test_a_far_off_plan_does_not_hold_her_own_promise_for_weeks(
     await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他查到的参数")
     follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
     assert follow.run_at - HIS_1_30 < timedelta(days=2), f"被压到了 {follow.run_at}"
+
+
+
+async def test_a_normal_reconnect_leaves_her_side_alone(tmp_path: Path, persona: Persona) -> None:
+    """平时重连（没有刚恢复的记号）不补她的话。
+
+    库里本来就不是她发过的每一条都有：纯图片那条不记。平时也补的话，
+    它会被补成一条空白的"她说的话"，体检多数一次主动开口；恢复专用的清理
+    还会跟着触发，把她被挪后的承诺作废。
+    """
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "吃饭了吗", at=EVENING, msg_id=400)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+    promise = await app.scheduler.schedule(
+        "follow_up", EVENING + timedelta(hours=1), conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他查到的"}, reason="follow_up",
+    )
+    await memory.reschedule_job(promise, EVENING + timedelta(hours=1))
+    await memory.db.execute(
+        "UPDATE jobs SET original_run_at = ? WHERE id = ?",
+        ((EVENING - timedelta(minutes=30)).isoformat(), promise),
+    )
+    await memory.db.commit()
+    _wire_dm(app, [
+        _dm_said(dm_kind, 400, "吃饭了吗", EVENING),
+        _dm_said(dm_kind, 401, "", EVENING + timedelta(minutes=5), hers=True),
+    ])
+    clock.set(EVENING + timedelta(minutes=20))
+    await app.catch_up()
+    history = await memory.recent_messages(CONVERSATION_ID, 10)
+    assert not [m for m in history if m.author_kind == "bot"], "平时重连也把她的话补进来了"
+    assert (await memory.get_job(promise)).status == "pending", "她的承诺被当成恢复后的旧任务作废了"
+
+
+async def test_after_a_restore_several_bubbles_are_one_reply(tmp_path: Path, persona: Persona) -> None:
+    """恢复后补回来的连着几个气泡是同一次回复，体检不能把后面那几个算成主动开口。"""
+    import discord
+
+    from newperson import doctor
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "更早的", at=EVENING - timedelta(hours=1), msg_id=500)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+    _wire_dm(app, [
+        _dm_said(dm_kind, 501, "明天面试", EVENING + timedelta(minutes=1)),
+        _dm_said(dm_kind, 502, "加油", EVENING + timedelta(minutes=11), hers=True),
+        _dm_said(dm_kind, 503, "你可以的", EVENING + timedelta(minutes=11, seconds=4), hers=True),
+    ])
+    clock.set(EVENING + timedelta(hours=1))
+    _just_restored(app)
+    await app.catch_up()
+    rows = await memory.db.execute(
+        "SELECT reply_batch FROM messages WHERE author_kind = 'bot' ORDER BY id"
+    )
+    batches = [r[0] for r in await rows.fetchall()]
+    assert len(batches) == 2 and batches[0] and batches[0] == batches[1], batches
+    import sqlite3
+
+    conn = sqlite3.connect(app.settings.db_path)
+    conn.row_factory = sqlite3.Row
+    _b, opened, _floor = doctor._batches_and_runs(conn, EVENING - timedelta(days=1))
+    conn.close()
+    assert opened == 0, f"一次回复被算成了 {opened} 次主动开口"

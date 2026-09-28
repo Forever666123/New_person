@@ -414,6 +414,11 @@ class App:
         restored_hers = 0
         hers_latest: datetime | None = None
         command_replies = await self._command_reply_ids()
+        marker = self._restore_marker()
+        restoring = marker.exists()
+        """刚从备份恢复。只有这时才补她自己说过的话。"""
+        complete = True
+        """这一轮每个频道都翻到底、没出错。没有的话恢复记号留着，下次重连接着补。"""
         latest: tuple[datetime, int | None] | None = None
         """他最后说话的时刻和地方。按时间取最大，**不是按遍历顺序取最后一个**——
         私聊先翻、公开频道后翻的话，取遍历顺序会把他在私聊里说的最后一句
@@ -447,6 +452,8 @@ class App:
             stuck = False
             last_command_at: datetime | None = None
             """这个频道里他上一条 !np 的时刻。紧跟着的那句是程序的回执，不是她说的。"""
+            her_batch: datetime | None = None
+            """她正在回的那一批（补回来的连续几个气泡属于同一批）。他一开口就清掉。"""
             for _ in range(max_pages):
                 try:
                     batch = [
@@ -457,12 +464,18 @@ class App:
                     ]
                 except Exception:  # noqa: BLE001 - 限流、权限变更都不该让启动失败
                     log.warning("[inbox] 补抓历史失败，跳过", exc_info=True)
+                    complete = False
                     break
                 if not batch:
                     break
                 for message in batch:
                     cursor = max(cursor, message.id)
                     if self._is_hers(message):
+                        if not restoring:
+                            # 平时重连：她说过的话库里都有了（或者本来就不记，比如纯图片）。
+                            if not stuck:
+                                safe = cursor
+                            continue
                         if self._is_command_reply(message, command_replies, last_command_at):
                             # !np 的回执不入库、不进模型（她不知道你在操控她），
                             # 也不能算作"她回过了"——那会把他的未读吞掉。
@@ -470,7 +483,7 @@ class App:
                                 safe = cursor
                             continue
                         try:
-                            got = await self._recover_her_message(message)
+                            got, her_batch = await self._recover_her_message(message, her_batch)
                             if got is not None:
                                 restored_hers += 1
                                 hers_latest = max(hers_latest or got, got)
@@ -490,6 +503,7 @@ class App:
                         if not stuck:
                             safe = cursor
                         continue
+                    her_batch = None
                     at = message.created_at.astimezone(self.persona.tz)
                     # **一条处理不了不能连累整批。** 下附件要联网、要写盘，
                     # 磁盘满了或者 aiohttp 抛一下就够了。往外抛的后果不是少补几条：
@@ -529,9 +543,16 @@ class App:
                 log.info(
                     "[inbox] 补抓翻满 %d 页，剩下的下次重连接着翻", max_pages
                 )
+                complete = False
+            if stuck:
+                complete = False
             if safe > start:
                 await self.memory.kv_set(key, str(safe))
 
+        if restoring and complete:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            log.info("[inbox] 恢复之后的补抓做完了")
         if restored_hers and hers_latest is not None:
             log.info("[inbox] 她自己说过、库里没有的 %d 条也补上了（多半是刚从备份恢复）", restored_hers)
             # 恢复出来的库里还排着备份那会儿的主动消息。排期早于她补回来的最后一句的，
@@ -597,8 +618,18 @@ class App:
             and message.channel.id == self.settings.proactive_channel_id
         )
 
-    async def _recover_her_message(self, message: discord.Message) -> datetime | None:
-        """把她在 Discord 上说过、库里却没有的一句补进来。补了就返回那句的时刻。
+    def _restore_marker(self) -> Path:
+        """restore.sh --install 装好库之后留的记号，跟 .last_backup_at 放在一起。"""
+        return Path(self.settings.db_path).parent / ".just_restored"
+
+    async def _recover_her_message(
+        self, message: discord.Message, continuing: datetime | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """把她在 Discord 上说过、库里却没有的一句补进来。
+
+        返回 ``(补进来的那句的时刻或 None, 这一批的批次)``。``continuing`` 是
+        她上一个气泡所在的那一批：连着发的几个气泡是同一次回复，体检才不会把
+        后面那几个算成主动开口。
 
         平时重启用不上：停机期间她本来就没说话，游标之后只有他的消息。
         **从备份恢复之后才用得上**：备份之后那段时间她其实都回过了，
@@ -615,21 +646,21 @@ class App:
             for m in await self.memory.unread_messages(CONVERSATION_ID)
             if m.created_at <= at
         ]
+        batch = at if answered else continuing
         stored = await self.memory.add_bot_message(
             CONVERSATION_ID,
             message.content,
             at,
             discord_message_id=message.id,
-            reply_batch=at if answered else None,
+            reply_batch=batch,
         )
         # **只有真的新补进来的那句才能把之前的未读算作"她回过了"。**
-        # 平时每次重连都会从上次的游标往后重翻，她这段时间说的话早就在库里；
-        # 那些也拿来标已读的话，他在她打字那几秒里插的一句就被吞了。
+        # 库里已经有的那句拿来标已读的话，他在她打字那几秒里插的一句就被吞了。
         if not stored:
-            return None
+            return None, continuing
         if answered:
             await self.memory.mark_read(answered, at)
-        return at
+        return at, batch
 
     def _should_handle(self, message: discord.Message) -> bool:
         if message.author.bot:

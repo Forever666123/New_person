@@ -390,6 +390,9 @@ def test_restoring_keeps_the_replaced_database_wal_and_all(tmp_path: Path) -> No
     old.close()
     assert "这句只在 wal 里" in kept, f"旧库里少了只在 wal 里的那句：{kept}"
 
+    # 留了"刚恢复"的记号：她上线补抓时才会把备份之后她说过的话也补回来
+    assert (live.parent / ".just_restored").exists()
+
     # 旧库的旁文件不能留在新库旁边，那些和新库对不上
     assert not (live.parent / "newperson.db-wal").exists()
     assert not backup.integrity_errors(live), "装回去的库自己就是坏的"

@@ -146,6 +146,10 @@ mv "$NEW" "$DB_PATH"
 # 兜一下：上面没进 if 分支（$DB_PATH 本来就不在）时，旁文件可能还留着，
 # 那些是旧库的，和新库对不上。
 rm -f "$DB_PATH-wal" "$DB_PATH-shm"
+# 留个记号：她下次上线补抓时，才把她自己在 Discord 上说过、库里没有的话也补回来。
+# 平时重连不做这件事——库里本来就不是她发过的每一条都有（纯图片那种），
+# 那样补会把空白的"她说的话"补进来。
+date -u +%FT%TZ > "$DATA_DIR/.just_restored"
 
 say "起服务"
 trap 'rm -rf "$WORK"' EXIT   # 下面自己起，不用兜底的那次了

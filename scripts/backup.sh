@@ -145,11 +145,15 @@ if [ "$PRUNE" = yes ]; then
         TOTAL="$(printf '%s\n' "$OURS" | grep -c . || true)"
         SPARE=$(( TOTAL > KEEP_MIN ? TOTAL - KEEP_MIN : 0 ))
         say "清理 $KEEP_DAYS 天以前的远端备份（最新的 $KEEP_MIN 份无论多老都留着）"
-        printf '%s\n' "$OURS" | head -n "$SPARE" | while read -r old; do
-            [ -n "$old" ] || continue
-            [[ "$old" < "$CUTOFF" ]] || continue
-            rclone deletefile "$RCLONE_REMOTE$old" || say "!! 删不掉 $old"
-        done
+        # SPARE 是 0 时整段跳过：head -n 0 不读输入就退出，printf 偶尔会吃到
+        # SIGPIPE，在 pipefail 下整个脚本就以 141 退出、不记时间——一次假的备份失败。
+        if [ "$SPARE" -gt 0 ]; then
+            printf '%s\n' "$OURS" | sed -n "1,${SPARE}p" | while read -r old; do
+                [ -n "$old" ] || continue
+                [[ "$old" < "$CUTOFF" ]] || continue
+                rclone deletefile "$RCLONE_REMOTE$old" || say "!! 删不掉 $old"
+            done
+        fi
         # B2 删除只是打个隐藏标记，旧版本还在按量收钱。cleanup 才是真的删。
         rclone cleanup "$RCLONE_REMOTE" 2>/dev/null || true
     else
