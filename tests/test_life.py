@@ -179,6 +179,38 @@ async def test_a_follow_up_lands_when_she_is_awake(harness: Harness) -> None:
     assert not harness.life.rhythm.is_sleeping(jobs[0].run_at)
 
 
+async def test_only_one_follow_up_is_ever_waiting(harness: Harness) -> None:
+    """同一时间最多挂一个"回头再说"。
+
+    线上真出过：他说了几件"明天早上我要做 X"，她每条回复都给自己定一个
+    "过 N 分钟问问他"，队列里同时挂着三个。分钟数是模型自己心算的，
+    个个偏早——他还没起床她就来问"做了吗"。三个叠在一起，
+    她就成了一张待办清单。
+    """
+    harness.clock.set(datetime(2026, 10, 1, 14, 0, tzinfo=TZ))
+    first = await harness.life.schedule_follow_up("owner", 60, "看完他那段代码")
+    second = await harness.life.schedule_follow_up("owner", 90, "问问他做了没")
+    third = await harness.life.schedule_follow_up("owner", 30, "提醒他")
+
+    assert first, "第一个该排上"
+    assert not second and not third, "已经挂着一个了，后面的不该再叠上去"
+    assert len(await harness.memory.pending_jobs("follow_up", "owner")) == 1
+
+
+def test_his_plans_are_not_her_follow_ups(persona: Persona) -> None:
+    """提示词要讲清楚：他说他要做什么，那是他的计划，记进台账，不是她的"回头再说"。
+
+    台账那一套是他自己定的规矩——"只记我主动说出口的，追问的时机按事情本身的
+    周期走"。让模型把他的计划塞进 follow_up，等于绕开这条规矩，
+    用一个它自己心算的分钟数去追问他，而心算的分钟数总是偏早。
+    """
+    from newperson.prompts import build_system
+
+    rules = build_system(persona)
+    assert "只用于你自己答应过的事" in rules
+    assert "不是你的 follow_up" in rules
+
+
 def test_proactive_moments_follow_her_activity_curve(persona: Persona) -> None:
     """她主动开口的时刻要偏向"她本来就在看手机"的那几段。
 

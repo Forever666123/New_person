@@ -469,7 +469,16 @@ class LifeEngine:
         return count
 
     async def schedule_follow_up(self, conversation_id: str, delay_minutes: int, note: str) -> int:
-        """她说了"我查完告诉你"，就真的要记得回来说。"""
+        """她说了"我查完告诉你"，就真的要记得回来说。
+
+        **同一时间最多排一个。** 分钟数是模型自己心算的，而它会把他的计划
+        （"明天早上我要做 X"）也当成自己的待办，一条回复排一个，
+        于是好几个"做了吗"挂在队列里，每个都算得偏早——他还没起床她就来问。
+        他的计划本来有台账那一套管着（按事情本身的周期问），这里不该再叠一层。
+        """
+        if await self.memory.pending_jobs("follow_up", conversation_id):
+            log.info("[life] 已经有一个 follow_up 排着了，这个不排")
+            return 0
         run_at = self.clock.now() + timedelta(minutes=delay_minutes * self.scheduler.delay_scale)
         if self.rhythm.is_sleeping(run_at):
             run_at = self.rhythm.first_glance_after_waking(
