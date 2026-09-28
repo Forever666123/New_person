@@ -2498,3 +2498,49 @@ async def test_after_a_restore_with_nothing_new_she_stays_quiet(
     answer = next(m for m in history if m.author_kind == "bot")
     assert answer.content == "在"
     assert asked.read_at == answer.created_at, "他那句该算作被她这句回掉的那一批"
+
+
+async def test_a_faded_fact_can_be_learned_again(tmp_path: Path, persona: Persona) -> None:
+    """记忆整理时，"别重复"的名单只列她现在还记得的，最清楚的在前。
+
+    原来列的是全量、从老到新截四十条：淡忘了的还挂在"别重复"里，
+    他再提一次模型也被要求别记——每件事满九十天必忘，之后也学不回来。
+    最新记下的反而被截掉，换个说法又记一遍。
+    """
+    from newperson.models import MemoryUpdate
+
+    seen = []
+
+    class RecordingBrain:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def update_memory(self, request, _day):
+            seen.append(request)
+            return MemoryUpdate(summary="摘要", owner_facts=[], self_facts=[])
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app.brain = RecordingBrain(app.brain)
+
+    await memory.add_facts("owner", ["很久以前说过的事"], EVENING - timedelta(days=120))
+    for i in range(45):
+        await memory.add_facts("owner", [f"事实{i:02d}"], EVENING - timedelta(days=45 - i))
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID, discord_message_id=7001, author_id=42,
+            author_name="Leo", content="又提起那件很久以前的事", created_at=EVENING,
+        )
+    )
+    job_id = await app.scheduler.schedule(
+        "memory_update", EVENING, conversation_id=CONVERSATION_ID, payload={}
+    )
+    assert job_id
+    await app.scheduler.run_due_once()
+
+    assert seen, "记忆整理没跑"
+    listed = seen[-1].existing_owner_facts
+    assert "很久以前说过的事" not in listed, "已经淡忘的还挂在'别重复'里，他再提也记不回来"
+    assert "事实44" in listed, "最新记下的反而不在名单上"

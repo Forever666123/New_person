@@ -1298,8 +1298,12 @@ class App:
         if not messages:
             return
 
-        owner_facts = [f for s, f in await self.memory.all_facts("owner")]
-        self_facts = [f for s, f in await self.memory.all_facts("self")]
+        # "别重复"的名单只列她**现在还记得**的，最清楚的在前。
+        # 原来列的是全量、按 id 从老到新截四十条：已经淡忘的还挂在"别重复"里，
+        # 他再提一次模型也被要求别记，于是每件事满九十天必忘、之后也学不回来；
+        # 最新记下的几条反而被截掉，换个说法又记一遍。
+        # 现在淡忘的不在名单上，他再提起就会重新记下——记不清就问，问完记回来。
+        owner_facts, self_facts = await self._recall(now)
         update = await self.brain.update_memory(
             MemoryUpdateRequest(
                 previous_summary=conv.summary,
