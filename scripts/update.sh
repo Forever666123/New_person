@@ -23,20 +23,30 @@ say "拉代码"
 git pull --ff-only
 after="$(git rev-parse --short HEAD)"
 
+# 这个脚本自己也会被上面那句 git pull 换掉。git 是删掉旧文件再新建，
+# 正在跑的 bash 读的仍是旧版本——这里的改动要下一次运行才生效。
+# 所以脚本变了就用新的重跑一遍（带个记号，只重跑一次）。
+if [ -z "${NP_UPDATE_REEXEC:-}" ] && [ "$before" != "$after" ] \
+    && ! git diff --quiet "$before" "$after" -- scripts/update.sh; then
+    say "更新脚本自己也变了，用新的重跑一遍"
+    exec env NP_UPDATE_REEXEC=1 NP_UPDATE_FROM="$before" bash "$SCRIPT_DIR/update.sh"
+fi
+before="${NP_UPDATE_FROM:-$before}"
+
 # 看的是"上次真正装好、重启成功的是哪个版本"，不是"这次拉没拉到新东西"。
 # 原来按拉取前后比：上一次在装依赖或检查那一步失败了，代码已经拉下来，
 # 再跑一次就会说"已经是最新的"然后退出 0——服务其实还在跑旧进程。
-#
-# （这个脚本自己也可能被上面那句 git pull 换掉。bash 是边读边跑的，
-#  所以 git pull 那一行和它之前的内容一个字节都不要改。）
+# 还没有这个记录（头一回用这个版本的脚本）时照老办法按拉取前后比，
+# 免得白白重启她一次。
 deployed="$(cat "$NP_DIR/.deployed_rev" 2>/dev/null || true)"
-if [ "$before" = "$after" ] && [ "$deployed" = "$after" ]; then
+if [ "$before" = "$after" ] && { [ -z "$deployed" ] || [ "$deployed" = "$after" ]; }; then
+    [ -n "$deployed" ] || echo "$after" > "$NP_DIR/.deployed_rev"
     say "已经是最新的（$after），不用重启"
     exit 0
 fi
 
 if [ "$before" = "$after" ]; then
-    say "代码已经是 $after，但上次没装完（或者头一回用这个脚本），这次补上"
+    say "代码已经是 $after，但上次没装完，这次补上"
 else
     say "$before → $after"
     git --no-pager log --oneline "$before..$after" | sed 's/^/    /'
@@ -69,15 +79,20 @@ up=0
 for _ in $(seq 60); do
     n="$(journalctl -u "$SERVICE_NAME" --since "$since" -o cat 2>/dev/null | grep -c '记忆在' || true)"
     if [ "${n:-0}" -gt 0 ]; then up=1; break; fi
+    systemctl is-active --quiet "$SERVICE_NAME" || break
     sleep 2
 done
-[ "$up" = 1 ] || say "!! 两分钟了还没看到她上线（多半是 Discord 连得慢），下面的体检可能不准"
 systemctl is-active --quiet "$SERVICE_NAME" || {
     echo "✗ 起来之后又挂了。最近的日志：" >&2
     journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2 || true
     exit 1
 }
-echo "$after" > "$NP_DIR/.deployed_rev"
+if [ "$up" = 1 ]; then
+    echo "$after" > "$NP_DIR/.deployed_rev"
+else
+    # 没看到她把记忆打开，就不算装好：下次再跑会重来一遍。
+    say "!! 两分钟了还没看到她上线（Discord 连得慢，或者她卡在启动里），下面的体检可能不准"
+fi
 
 # 顺手体检一遍。**故意不让它决定退出码**：她刚起来，
 # 重启前那几条还没回的消息会让 doctor 判 BAD，而那不是这次更新的问题，

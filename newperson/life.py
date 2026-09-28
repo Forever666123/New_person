@@ -568,7 +568,9 @@ class LifeEngine:
             )
         return moment
 
-    async def follow_up_hold(self, now: datetime, noted_at: datetime) -> datetime | None:
+    async def follow_up_hold(
+        self, now: datetime, noted_at: datetime, due: datetime | None = None
+    ) -> datetime | None:
         """这个 follow_up 最早能在什么时候发。不用等就返回 None。
 
         ``noted_at`` 前后 ``follow_up_guard_hours`` 里记下的、他说了时间的计划，
@@ -578,11 +580,15 @@ class LifeEngine:
         """
         cfg = self.persona.proactive.ledger_timed
         guard = timedelta(hours=cfg.follow_up_guard_hours)
+        noted = noted_at.astimezone(UTC)
+        # 上限从这个 follow_up **本来**该发的时刻算，不从"现在"算：从现在算的话，
+        # 考试周连着几件事，每到点一次上限就往后滑一次，两天的上限压成了四五天。
+        base = (due or now).astimezone(UTC)
         hold = await self.memory.latest_timed_ask_after(
             now,
-            since=noted_at - guard,
-            until=noted_at + guard,
-            cap=now + timedelta(hours=cfg.follow_up_hold_max_hours),
+            since=noted - guard,
+            until=noted + guard,
+            cap=base + timedelta(hours=cfg.follow_up_hold_max_hours),
         )
         if hold is None or hold <= now:
             return None
@@ -602,9 +608,10 @@ class LifeEngine:
             return 0
         now = self.clock.now()
         run_at = later(now, timedelta(minutes=delay_minutes * self.scheduler.delay_scale))
+        due = run_at
         # 他刚说了带时间的计划的话，这个 follow_up 不能比那件事该问的时候还早。
         # 靠提示词让模型别把他的计划塞进来是请求，不是约束。
-        hold = await self.follow_up_hold(now, now)
+        hold = await self.follow_up_hold(now, now, due=run_at)
         if hold is not None and hold > run_at:
             log.info(
                 "[life] 这个 follow_up 比他说的时间还早，推到 %s", hold.strftime("%m-%d %H:%M")
@@ -615,7 +622,8 @@ class LifeEngine:
             "follow_up",
             run_at,
             conversation_id=conversation_id,
-            payload={"kind": "follow_up", "note": note},
+            # 记下本来该发的时刻：被时间闸压着的时候，"最多压多久"从这里算
+            payload={"kind": "follow_up", "note": note, "due": due.isoformat()},
             reason="follow_up",
         )
 

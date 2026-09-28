@@ -737,31 +737,31 @@ class Memory:
             # 存的也得是去掉首尾空白的那个。查的时候 strip、存的时候不 strip，
             # 带个尾随空格的同一句话就能再进一行，被按周期再问一遍。
             dupe = await self._fetch_one(
-                "SELECT id, due_at, ask_after, asked_count FROM ledger"
+                "SELECT id, due_at, ask_after FROM ledger"
                 " WHERE kind = ? AND claim = ? AND resolved = 0",
                 (entry.kind, claim),
             )
             if dupe is not None:
                 # 比的是他说的那个时间；宽限是随机抽的，拿它比会让更早的时间赢。
                 # 能问的时刻也只往后挪，不往前。
-                later = timing is not None and (
-                    dupe["due_at"] is None or utc_text(timing.due_at) > dupe["due_at"]
-                )
-                if later and timing is not None and int(dupe["asked_count"]) == 0:
+                if timing is None:
+                    continue
+                # 问过一次的也要写：他回"还没做完，明早九点做完"，这个时间要是丢了，
+                # 她照样在九点之前再问一遍。再问本身还有类别周期挡着。
+                later = dupe["due_at"] is None or utc_text(timing.due_at) > dupe["due_at"]
+                if later:
                     ask_after = utc_text(timing.ask_after)
                     if dupe["ask_after"] is not None:
                         ask_after = max(ask_after, dupe["ask_after"])
                     await self.db.execute(
-                        "UPDATE ledger SET when_there = ?, due_at = ?, ask_after = ?, timed_at = ?"
-                        " WHERE id = ?",
-                        (
-                            timing.when_there,
-                            utc_text(timing.due_at),
-                            ask_after,
-                            utc_text(at),
-                            int(dupe["id"]),
-                        ),
+                        "UPDATE ledger SET when_there = ?, due_at = ?, ask_after = ? WHERE id = ?",
+                        (timing.when_there, utc_text(timing.due_at), ask_after, int(dupe["id"])),
                     )
+                # 时间只往后挪，但"刚刚又说起过"总要记下：follow_up 的闸按它圈窗口。
+                await self.db.execute(
+                    "UPDATE ledger SET timed_at = ? WHERE id = ? AND ask_after IS NOT NULL",
+                    (utc_text(at), int(dupe["id"])),
+                )
                 continue
             await self.db.execute(
                 "INSERT INTO ledger (kind, claim, reason, committed_to, created_at,"

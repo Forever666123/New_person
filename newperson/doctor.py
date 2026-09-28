@@ -583,10 +583,19 @@ def check_memory(report: Report, conn: sqlite3.Connection, summarize_after: int 
     total = rows[0]["n"] if rows else 0
     done = (rows[0]["done"] or 0) if rows else 0
     line = f"消息 {messages} 条　她记住的事 {facts} 条　台账 {total} 条（{done} 条已了结）"
-    if facts == 0 and messages < summarize_after:
-        # 光印一个 0，看不出是正常还是坏了。
-        line += f"\n第一次整理记忆要等消息攒够 {summarize_after} 条，还差 {summarize_after - messages} 条"
-    report.add(OK, line)
+    # 还没整理过一次的话，光印一个 0 看不出是正常还是坏了。口径跟触发整理的那个判据一样：
+    # 没整理过的全部消息，撤回的也算。
+    rows = _rows(conn, "SELECT MAX(summary_upto_message_id) AS s FROM conversations")
+    upto = (rows[0]["s"] or 0) if rows else 0
+    rows = _rows(conn, "SELECT COUNT(*) AS n FROM messages WHERE id > ?", (upto,))
+    pending = rows[0]["n"] if rows else 0
+    never = upto == 0
+    if never and pending < summarize_after:
+        report.add(
+            OK, line, f"第一次整理记忆要等消息攒够 {summarize_after} 条，还差 {summarize_after - pending} 条"
+        )
+    else:
+        report.add(OK, line)
 
     rows = _rows(
         conn,

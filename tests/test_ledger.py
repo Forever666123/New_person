@@ -661,7 +661,7 @@ async def test_saying_it_again_keeps_the_later_time(tmp_path: Path, persona: Per
     """同一件事再说一遍又带了时间，取更晚的那个。
 
     写晚了只是问得晚，写早了就是凌晨被问——模型第二次读错钟，不能把时间往前挪。
-    问过一次的条目，时间就不动了。尾随空格不算另一件事。
+    尾随空格不算另一件事。
     """
     life, memory, _clock, _now = await build(tmp_path, persona)
     try:
@@ -749,3 +749,28 @@ def test_check_warns_when_the_grace_is_zero_or_the_window_outlives_the_ledger(
     assert any("太老" in msg for _lvl, msg in validate_persona(long))
 
     assert not any("ledger_timed" in msg for _lvl, msg in validate_persona(persona))
+
+
+
+async def test_a_time_given_after_she_asked_is_kept(tmp_path: Path, persona: Persona) -> None:
+    """她问过一次"做完没"，他回"还没，明早九点做完"：这个时间不能丢。
+
+    原来问过的条目一律不写新时间，于是她照样在九点之前再问一遍——线上那一幕换条路再来。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 29, 1, 30)
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="study", claim="把第三章习题做完")], said - timedelta(days=10)
+        )
+        entry_id = (await memory.ledger("study"))[0][0]
+        await memory.mark_ledger_asked(entry_id, said - timedelta(days=5))
+        timing = life.resolve_when_there("09-29 09:00", said)
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="study", claim="把第三章习题做完", when_there="09-29 09:00")],
+            said, [timing],
+        )
+        assert (await memory.ledger("study"))[0][2].when_there == "09-29 09:00"
+        assert await memory.due_ledger_entry("study", _his(9, 29, 4, 30), 4) is None
+    finally:
+        await memory.close()

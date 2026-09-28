@@ -600,3 +600,23 @@ async def test_a_forbidden_reaction_alongside_text_is_still_just_skipped(
     )
     assert result.sent_texts == ["在的"]
     assert not result.reacted
+
+
+
+async def test_a_photo_in_the_middle_does_not_shift_the_ids(
+    deliverer: Deliverer, channel: FakeChannel, tmp_path
+) -> None:
+    """中间夹一张单独的图时，后面那句字配的还是它自己的消息编号。
+
+    原来纯图片那条也进编号列表，后面的字全配错一位：补抓时真正那句被当成缺的，
+    她同一句话在记忆里出现两遍。
+    """
+    from newperson.models import ResolvedPhoto
+
+    img = tmp_path / "p.jpg"
+    img.write_bytes(b"\xff\xd8\xff")
+    photo = ResolvedPhoto(path=str(img), photo_id="p1", is_fresh=False)
+    result = await deliverer.deliver(channel, parts("刚吃完", "{photo}", "好看吧"), photo)
+    assert result.sent_texts == ["刚吃完", "好看吧"]
+    assert len(result.sent_message_ids) == 2
+    assert result.sent_message_ids[1] == max(result.sent_message_ids)

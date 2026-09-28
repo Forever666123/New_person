@@ -3063,3 +3063,125 @@ async def test_after_a_restore_several_bubbles_are_one_reply(tmp_path: Path, per
     _b, opened, _floor = doctor._batches_and_runs(conn, EVENING - timedelta(days=1))
     conn.close()
     assert opened == 0, f"一次回复被算成了 {opened} 次主动开口"
+
+
+
+async def test_a_chain_of_plans_cannot_stretch_the_hold_past_its_cap(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """考试周连着几件事：她答应的 follow_up 被压着，每到点一次上限不能跟着往后滑。"""
+    from newperson.models import LedgerEntry
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    app.scheduler.delay_scale = 1.0
+    entries, timings = [], []
+    for day in (30, 1, 2, 3):
+        month = 9 if day == 30 else 10
+        when = f"{month:02d}-{day:02d} 09:00"
+        entries.append(LedgerEntry(kind="study", claim=f"考试{day}", when_there=when))
+        timings.append(app.life.resolve_when_there(when, HIS_1_30))
+    await memory.add_ledger_entries(entries, HIS_1_30, timings)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他查到的参数")
+    cap = HIS_1_30 + timedelta(minutes=30) + timedelta(
+        hours=persona.proactive.ledger_timed.follow_up_hold_max_hours
+    )
+    for _ in range(6):
+        job = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+        assert job.run_at <= cap + timedelta(hours=12), f"被压到了 {job.run_at}"
+        clock.set(job.run_at + timedelta(seconds=1))
+        with contextlib.suppress(RuntimeError):  # 放行之后会去调模型，这里没准备脚本
+            await app.handle_proactive_job(await memory.get_job(job.id or 0))
+        moved = await memory.get_job(job.id or 0)
+        if moved.status != "pending" or moved.run_at == job.run_at:
+            break
+
+
+async def test_a_merged_promise_survives_an_interrupted_reply(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """并进回复的承诺在后面那个气泡里，回复发到一半被他打断：承诺还在，不作废。"""
+    plan = ReplyPlan(parts=[ReplyPart(text="到家啦"), ReplyPart(text="对了 那个参数是0.3")])
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [plan])
+    clock.set(EVENING)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他参数是0.3")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    at = follow.run_at - timedelta(seconds=5)
+    clock.set(at)
+    await send(app, "你到家没", at=at, msg_id=870)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, follow.run_at + timedelta(minutes=5))
+    clock.set(follow.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+
+    original = channel.send
+
+    async def and_he_speaks(content=None, *, file=None, reference=None):
+        sent = await original(content, file=file, reference=reference)
+        if len(channel.sent) == 1:
+            await send(app, "哈哈", at=clock.now(), msg_id=871)
+        return sent
+
+    channel.send = and_he_speaks
+    reply_job = await memory.get_job(reply.id or 0)
+    clock.set(reply_job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["到家啦"]
+    assert (await memory.get_job(follow.id or 0)).status == "pending", "没说出口的承诺被作废了"
+
+
+async def test_restore_waits_for_a_channel_it_could_not_reach(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """恢复后第一次补抓有个频道拿不到：记号要留着，下次重连接着补她的话。"""
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "更早的", at=EVENING - timedelta(hours=1), msg_id=900)
+    _wire_dm(app, [_dm_said(dm_kind, 900, "更早的", EVENING - timedelta(hours=1))])
+    app.settings.proactive_channel_id = 555
+
+    async def unreachable(_cid=None):
+        raise RuntimeError("503")
+
+    original = app.resolve_channel
+
+    async def resolve(channel_id=None):
+        if channel_id == 555:
+            return await unreachable()
+        return await original(channel_id)
+
+    app.resolve_channel = resolve
+    marker = _just_restored(app)
+    clock.set(EVENING)
+    await app.catch_up()
+    assert marker.exists(), "有个频道没翻到，恢复记号却清掉了"
+
+
+async def test_after_a_restore_a_later_opener_is_not_part_of_the_reply(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她回完一句，几个小时后自己又开口：那是主动开口，不能继承那次回复的批次。"""
+    import discord
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    await send(app, "更早的", at=EVENING - timedelta(hours=1), msg_id=950)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+    _wire_dm(app, [
+        _dm_said(dm_kind, 951, "明天面试", EVENING + timedelta(minutes=1)),
+        _dm_said(dm_kind, 952, "加油", EVENING + timedelta(minutes=11), hers=True),
+        _dm_said(dm_kind, 953, "今天实验室好冷", EVENING + timedelta(hours=3), hers=True),
+    ])
+    clock.set(EVENING + timedelta(hours=4))
+    _just_restored(app)
+    await app.catch_up()
+    rows = await memory.db.execute(
+        "SELECT content, reply_batch FROM messages WHERE author_kind = 'bot' ORDER BY id"
+    )
+    got = {r[0]: r[1] for r in await rows.fetchall()}
+    assert got["加油"] and got["今天实验室好冷"] is None, got

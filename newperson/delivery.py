@@ -265,7 +265,9 @@ class Deliverer:
                 if attach and photo:
                     result.photo_sent = photo
                 message_id = getattr(message, "id", None)
-                if isinstance(message_id, int):
+                # 跟 sent_texts 一一对应：纯图片那条（没有字）不进这个列表。
+                # 原来每条都进，中间夹一张单独的图时，后面的字全配错了编号。
+                if isinstance(message_id, int) and part.text:
                     result.sent_message_ids.append(message_id)
                 result.next_index = index + 1
 

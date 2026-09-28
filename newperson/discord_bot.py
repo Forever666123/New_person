@@ -127,6 +127,8 @@ class App:
         self._started = False
         self._catching_up = False
         """补抓正在跑。重连风暴时两个 on_ready 会重叠。"""
+        self._missing_channel = False
+        """上一轮补抓有没有该翻却拿不到的频道。"""
         self._tasks: set[asyncio.Task] = set()
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
         # 照片库空着的时候，要照片的那几种主动不进当天的候选。
@@ -363,7 +365,8 @@ class App:
         await self.memory.kv_set(CATCHUP_SEEN, ",".join(str(i) for i in sorted(known)))
 
     async def _inbound_channels(self) -> list[Any]:
-        """他可能说话的所有地方。私聊永远算一个。"""
+        """他可能说话的所有地方。私聊永远算一个。拿不到的记在 ``_missing_channel`` 上。"""
+        self._missing_channel = False
         found: list[Any] = []
         seen: set[int] = set()
         targets = [None]
@@ -378,7 +381,10 @@ class App:
                 )
             except Exception:  # noqa: BLE001 - 拿不到一个不该拖垮另一个
                 log.warning("[inbox] 补抓时拿不到频道 %s，跳过", target)
+                self._missing_channel = True
                 continue
+            if channel is None:
+                self._missing_channel = True
             # 按频道 id 去重，不按对象身份：私聊和 PROACTIVE_CHANNEL_ID
             # 指同一个地方时，两条路径未必拿到同一个对象，重了就会数两遍。
             key = getattr(channel, "id", None)
@@ -549,12 +555,24 @@ class App:
             if safe > start:
                 await self.memory.kv_set(key, str(safe))
 
+        if self._missing_channel:
+            complete = False
         if restoring and complete:
             with contextlib.suppress(OSError):
                 marker.unlink()
             log.info("[inbox] 恢复之后的补抓做完了")
         if restored_hers and hers_latest is not None:
             log.info("[inbox] 她自己说过、库里没有的 %d 条也补上了（多半是刚从备份恢复）", restored_hers)
+            # 频道是一个一个翻的：他在公开频道说的那句，翻私聊时还没入库，
+            # 她在私聊那句回复就没法把它算成回过了。一次回复本来就合并所有频道的未读，
+            # 所以翻完之后，早于她补回来的最后一句的未读都是她当时回过的。
+            older = [
+                m.id
+                for m in await self.memory.unread_messages(CONVERSATION_ID)
+                if m.created_at <= hers_latest
+            ]
+            if older:
+                await self.memory.mark_read(older, hers_latest)
             # 恢复出来的库里还排着备份那会儿的主动消息。排期早于她补回来的最后一句的，
             # 多半在备份之后已经发过了（Discord 上就有），再发一遍就是同一句话说两次。
             dropped = await self.memory.cancel_initiatives_due_before(hers_latest)
@@ -575,6 +593,9 @@ class App:
             log.warning("[inbox] 有未读却没有排着的回复，补排一条")
             await self._schedule_reply(self.clock.now())
         return recovered
+
+    BUBBLE_GAP = timedelta(minutes=3)
+    """补回来的她的气泡，彼此隔多久以内算同一次回复。"""
 
     COMMAND_REPLY_KEY = "command_reply_ids"
     COMMAND_REPLY_WINDOW = timedelta(seconds=5)
@@ -646,12 +667,20 @@ class App:
             for m in await self.memory.unread_messages(CONVERSATION_ID)
             if m.created_at <= at
         ]
+        # 连着发的几个气泡才算同一次回复。隔了几个小时她自己又开口，那是主动开口。
+        if continuing is not None and at - continuing > self.BUBBLE_GAP:
+            continuing = None
         batch = at if answered else continuing
         stored = await self.memory.add_bot_message(
             CONVERSATION_ID,
             message.content,
             at,
             discord_message_id=message.id,
+            # 纯图片那条也要记上"有张图"，不然上下文里是一行空白的"我："
+            attachments=[
+                {"url": getattr(a, "url", ""), "filename": getattr(a, "filename", "")}
+                for a in getattr(message, "attachments", []) or []
+            ],
             reply_batch=batch,
         )
         # **只有真的新补进来的那句才能把之前的未读算作"她回过了"。**
@@ -1120,7 +1149,8 @@ class App:
             raise
 
         await self._record_sent(result, now, batch)
-        if result.sent_texts and (riding := job.payload.get("riding_follow_up")):
+        riding = job.payload.get("riding_follow_up")
+        if riding and result.sent_texts and not result.interrupted:
             # 答应他的那件事跟着这次回复说出口了
             rider = await self.memory.get_job(int(riding))
             if rider is not None and rider.status == "pending":
@@ -1281,7 +1311,10 @@ class App:
             # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
             # **必须在"有未读就并进回复"之前**：并进去之后这道闸就走不到了，
             # 那句"跑完没"会跟着回复在他凌晨发出去。
-            hold = await self.life.follow_up_hold(now, job.created_at)
+            due = job.payload.get("due")
+            hold = await self.life.follow_up_hold(
+                now, job.created_at, datetime.fromisoformat(due) if due else job.created_at
+            )
             if hold is not None:
                 log.info(
                     "[proactive] 这个 follow_up 比他说的时间还早，推到 %s",
