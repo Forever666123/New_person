@@ -2390,3 +2390,111 @@ async def test_abroad_the_prompt_tells_her_the_local_time(
     await send(app, "在干嘛", at=home_now, msg_id=77)
     await _deliver_one_reply(app, clock, memory)
     assert f"[{noon.strftime('%m-%d')} 13:00" in llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_after_a_restore_she_does_not_answer_what_she_already_answered(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """从备份恢复之后，备份之后那段时间她其实都回过了，回复还留在他手机上。
+
+    原来补抓只捞他那一半（她自己的话被 _should_handle 当成机器人跳过），
+    于是他那些话全变成未读，她把几小时前、早就回过的话再回一遍，
+    上下文里还没有自己当时说了什么。**这条走真的 _should_handle**——
+    别的补抓测试都把它换成了 lambda，这个 bug 就是那么漏过去的。
+    """
+    import discord
+
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+
+    def said(msg_id: int, text: str, at: datetime, *, hers: bool = False):
+        return SimpleNamespace(
+            id=msg_id,
+            content=text,
+            created_at=at,
+            author=SimpleNamespace(
+                id=999 if hers else 42, display_name="她" if hers else "Leo", bot=hers
+            ),
+            channel=dm_kind,
+            attachments=[],
+        )
+
+    # 备份停在这里：库里最后一条是他 100 号那句，她还没回
+    await send(app, "备份之前说的", at=EVENING, msg_id=100)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+
+    later = EVENING + timedelta(hours=1)
+    dm = FakeHistoryChannel(
+        [
+            said(101, "她当时回的第一句", EVENING + timedelta(minutes=20), hers=True),
+            said(102, "我明天要去面试", later),
+            said(103, "有点紧张", later + timedelta(minutes=1)),
+            said(104, "你可以的", later + timedelta(minutes=9), hers=True),
+            said(105, "晚上去吃拉面", later + timedelta(hours=2)),
+        ]
+    )
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_user=lambda _id: SimpleNamespace(dm_channel=dm),
+        get_channel=lambda _cid: None,
+    )
+    clock.set(later + timedelta(hours=3))
+    await app.catch_up()
+
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    assert [m.content for m in unread] == ["晚上去吃拉面"], "她回过的话又变成了未读"
+    history = await memory.recent_messages(CONVERSATION_ID, 20)
+    hers = [m.content for m in history if m.author_kind == "bot"]
+    assert hers == ["她当时回的第一句", "你可以的"], "她当时说过的话没补进来"
+
+    await drain(app, clock)
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    mine = prompt.split("## 他刚发的")[1]
+    assert "我明天要去面试" not in mine and "晚上去吃拉面" in mine
+    assert "你可以的" in prompt, "上下文里没有她自己当时的回复"
+
+
+async def test_after_a_restore_with_nothing_new_she_stays_quiet(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """备份之后的每一句她都回过了：补回来的全是已读，不排回复。"""
+    import discord
+
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    dm_kind = object.__new__(discord.DMChannel)
+    dm_kind.id = 999
+    his = SimpleNamespace(
+        id=201, content="在吗", created_at=EVENING + timedelta(minutes=1),
+        author=SimpleNamespace(id=42, display_name="Leo", bot=False),
+        channel=dm_kind, attachments=[],
+    )
+    hers = SimpleNamespace(
+        id=202, content="在", created_at=EVENING + timedelta(minutes=4),
+        author=SimpleNamespace(id=999, display_name="她", bot=True),
+        channel=dm_kind, attachments=[],
+    )
+    # 备份里最后一条是更早的一句，已经回过
+    await send(app, "更早的", at=EVENING - timedelta(hours=1), msg_id=200)
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    for job in await memory.pending_jobs("reply", CONVERSATION_ID):
+        await app.scheduler.cancel(job.id or 0)
+
+    dm = FakeHistoryChannel([his, hers])
+    app.client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_user=lambda _id: SimpleNamespace(dm_channel=dm),
+        get_channel=lambda _cid: None,
+    )
+    clock.set(EVENING + timedelta(hours=2))
+    await app.catch_up()
+    assert await memory.unread_messages(CONVERSATION_ID) == []
+    assert await memory.pending_jobs("reply", CONVERSATION_ID) == []
+    history = await memory.recent_messages(CONVERSATION_ID, 5)
+    asked = next(m for m in history if m.content == "在吗")
+    answer = next(m for m in history if m.author_kind == "bot")
+    assert answer.content == "在"
+    assert asked.read_at == answer.created_at, "他那句该算作被她这句回掉的那一批"

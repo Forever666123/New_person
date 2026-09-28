@@ -404,6 +404,7 @@ class App:
         游标照常跟到底，否则下次重连会从同一个位置重翻同样的内容，永远翻不过去。
         """
         recovered = 0
+        restored_hers = 0
         latest: tuple[datetime, int | None] | None = None
         """他最后说话的时刻和地方。按时间取最大，**不是按遍历顺序取最后一个**——
         私聊先翻、公开频道后翻的话，取遍历顺序会把他在私聊里说的最后一句
@@ -450,6 +451,16 @@ class App:
                     break
                 for message in batch:
                     cursor = max(cursor, message.id)
+                    if self._is_hers(message):
+                        try:
+                            restored_hers += await self._recover_her_message(message)
+                        except Exception:  # noqa: BLE001 - 跟他的消息一样：一条不行，别连累整批
+                            log.warning("[inbox] 补抓时她这条记不下，跳过 %s", message.id, exc_info=True)
+                            stuck = True
+                            continue
+                        if not stuck:
+                            safe = cursor
+                        continue
                     if not self._should_handle(message) or owner_cmds.is_command(message.content):
                         # 不该处理的、以及 !np（给程序看的，补抓时更不该执行）：
                         # 跳过不等于没处理妥当，游标照常跟上，否则别人的闲聊
@@ -499,10 +510,14 @@ class App:
             if safe > start:
                 await self.memory.kv_set(key, str(safe))
 
-        if recovered:
+        if restored_hers:
+            log.info("[inbox] 她自己说过、库里没有的 %d 条也补上了（多半是刚从备份恢复）", restored_hers)
+        if recovered and await self.memory.unread_messages(CONVERSATION_ID):
             log.info("[inbox] 停机期间漏了 %d 条，补回来了", recovered)
             # 回到他说话的那个地方，不是默认频道
             await self._schedule_reply(self.clock.now(), channel_id=latest[1] if latest else None)
+        elif recovered:
+            log.info("[inbox] 补回 %d 条，她当时都回过了，不用再回", recovered)
         elif await self.memory.unread_messages(CONVERSATION_ID) and not await self.memory.pending_jobs(
             "reply", CONVERSATION_ID
         ):
@@ -512,6 +527,47 @@ class App:
             log.warning("[inbox] 有未读却没有排着的回复，补排一条")
             await self._schedule_reply(self.clock.now())
         return recovered
+
+    def _is_hers(self, message: discord.Message) -> bool:
+        """这条是她自己在私聊（或者那个公开频道）里发的。"""
+        me = getattr(getattr(self.client, "user", None), "id", None)
+        if me is None or message.author.id != me:
+            return False
+        if isinstance(message.channel, discord.DMChannel):
+            return True
+        return bool(
+            self.settings.proactive_channel_id
+            and message.channel.id == self.settings.proactive_channel_id
+        )
+
+    async def _recover_her_message(self, message: discord.Message) -> int:
+        """把她在 Discord 上说过、库里却没有的一句补进来。返回补了几条（0 或 1）。
+
+        平时重启用不上：停机期间她本来就没说话，游标之后只有他的消息。
+        **从备份恢复之后才用得上**：备份之后那段时间她其实都回过了，
+        那些回复还留在他手机上。只补他那一半的话，他的话全变成未读，
+        她会把几小时前、早就回过的话再回一遍，而上下文里又没有自己当时说了什么。
+
+        她这句之前、还挂在未读里的他的话，就是她当时在回的那一批：
+        标成已读（read_at 取她这句的时刻），她这句的 reply_batch 也记成它，
+        体检才分得清哪句是回复、哪句是主动开口。
+        """
+        at = message.created_at.astimezone(self.persona.tz)
+        answered = [
+            m.id
+            for m in await self.memory.unread_messages(CONVERSATION_ID)
+            if m.created_at <= at
+        ]
+        if answered:
+            await self.memory.mark_read(answered, at)
+        stored = await self.memory.add_bot_message(
+            CONVERSATION_ID,
+            message.content,
+            at,
+            discord_message_id=message.id,
+            reply_batch=at if answered else None,
+        )
+        return 1 if stored else 0
 
     def _should_handle(self, message: discord.Message) -> bool:
         if message.author.bot:

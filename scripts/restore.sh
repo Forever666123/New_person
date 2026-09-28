@@ -152,4 +152,5 @@ trap 'rm -rf "$WORK"' EXIT   # 下面自己起，不用兜底的那次了
 $SERVICE_START || die "起不来了。看 journalctl -u $SERVICE_NAME -n 50"
 
 say "✓ 装好了。看一眼日志：journalctl -u $SERVICE_NAME -f"
-say "  她会以为中间那段时间自己没看手机。"
+say "  备份之后那段对话，她上线时会从 Discord 上补回来（两边说的都补），"
+say "  她当时回过的不会再回一遍。"

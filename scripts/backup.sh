@@ -6,12 +6,11 @@
 # 代码和人设都在 git 里，丢了十分钟就能重来；data/newperson.db 不行，
 # 它是你们全部的对话，只此一份。
 #
-# 流程：一致快照 -> 当场验 -> 加密 -> 传走 -> 确认传到了 -> 删旧的 -> 记时间。
+# 流程：一致快照 -> 当场验 -> 加密 -> 传走 -> 取回来解开再验一遍 -> 删旧的 -> 记时间。
 # 任何一步失败都退出非零，并且**不写** .last_backup_at，
 # 这样 `!np status` 会一直显示"上次备份是很久以前"，而不是骗你说刚备过。
 #
-# 不依赖任何特定的跑法。取快照只需要一个能 import newperson 的 Python，
-# 剩下的步骤跟她是 systemd 起的还是容器里跑的没有关系。
+# 取快照只需要一个能 import newperson 的 Python（默认是 .venv 里那个）。
 #
 # 装：cp scripts/backup.env.example scripts/backup.env && nano scripts/backup.env
 # 跑：scripts/backup.sh
@@ -29,6 +28,7 @@ cd "$NP_DIR"
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:-/root/.chloe-backup-pass}"
 KEEP_DAYS="${KEEP_DAYS:-30}"
+KEEP_MIN="${KEEP_MIN:-7}"
 KEEP_LOCAL="${KEEP_LOCAL:-3}"
 PYTHON_BIN="${PYTHON_BIN:-$NP_DIR/.venv/bin/python}"
 DB_PATH="${DB_PATH:-$NP_DIR/data/newperson.db}"
@@ -69,8 +69,6 @@ trap 'rm -rf "$WORK"' EXIT
 # 所以**不用停服务**：她一边写，我们一边拷，拿到的仍然是一致的快照。
 # 拷完那一步自己会跑 integrity_check，坏了它删掉文件并退非零。
 #
-# $PYTHON_BIN 故意不加引号：允许它是一条多词命令，
-# 比如容器部署可以写 PYTHON_BIN="docker compose exec -T newperson python"。
 # 返回 3 表示拷出来了但里面一条消息都没有（见 __main__.EMPTY_BACKUP）。
 # 那种情况照传，但**不清理旧备份**——否则 DB_PATH 配错的那天起，
 # 每天一份空备份，一个月之后把所有真备份全顶掉了，而全程没有一句报错。
@@ -112,20 +110,51 @@ case "$REMOTE_SIZE" in
 esac
 [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ] || die "大小对不上：本地 $LOCAL_SIZE，对面 $REMOTE_SIZE。这一轮不清理旧备份"
 
+# 大小对得上不等于解得开。把刚传上去的那份取回来，解密、再验一遍——
+# 这就是一次恢复演练，每天都做，不用另装定时任务。
+# "每天都在传、传上去的东西却解不开"这种事，体检只看备份时间是看不出来的。
+say "取回来解开再验一遍"
+mkdir -p "$WORK/check"
+rclone copy "$RCLONE_REMOTE$NAME" "$WORK/check/" || die "取不回刚传的那份。这一轮不清理旧备份"
+gpg --batch --yes --quiet --decrypt --passphrase-file "$GPG_PASSPHRASE_FILE" \
+    --output "$WORK/check/restored.db" "$WORK/check/$NAME" \
+    || die "刚传上去的那份解不开。这一轮不清理旧备份"
+# shellcheck disable=SC2086
+$PYTHON_BIN -m newperson verify "$WORK/check/restored.db" >/dev/null \
+    || [ "$PRUNE" = no ] || die "刚传上去的那份验不过。这一轮不清理旧备份"
+
 # ---- 4. 本地也留几份，顺手清掉旧的 ----------------------------------------
 # 本地这几份是为了"手滑删了数据库"这种当场就发现的事故，不算异地备份。
-mkdir -p "$NP_DIR/backups"
-cp "$WORK/$NAME" "$NP_DIR/backups/$NAME"
-ls -1t "$NP_DIR/backups"/newperson-*.db.gpg 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)) | while read -r old; do
-    rm -f "$old"
-done
+# **空备份不进本地、也不轮换**：轮换的话，连着三次空备份就把三份好的全顶掉了，
+# 而本地这几份存在的意义恰恰就是防"库被换掉了"。
+if [ "$PRUNE" = yes ]; then
+    mkdir -p "$NP_DIR/backups"
+    cp "$WORK/$NAME" "$NP_DIR/backups/$NAME"
+    ls -1t "$NP_DIR/backups"/newperson-*.db.gpg 2>/dev/null | tail -n +$((KEEP_LOCAL + 1)) | while read -r old; do
+        rm -f "$old"
+    done
+fi
 
 if [ "$PRUNE" = yes ]; then
-    say "清理 $KEEP_DAYS 天以前的远端备份"
-    # 限定文件名：这个 bucket 里可能还有别的东西，别替人家做主
-    rclone delete --min-age "${KEEP_DAYS}d" --include 'newperson-*.db.gpg' "$RCLONE_REMOTE" || true
-    # B2 删除只是打个隐藏标记，旧版本还在按量收钱。cleanup 才是真的删。
-    rclone cleanup "$RCLONE_REMOTE" 2>/dev/null || true
+    # 新旧按**文件名里的时间**判断，只看 bucket 最外层、我们自己起名的那些。
+    # **最新的 KEEP_MIN 份无论多老都留着**：备份断了一个多月、刚恢复的那天，
+    # 只按天数删的话，远端会被删到只剩当天这一份。
+    CUTOFF="newperson-$(date -u -d "-${KEEP_DAYS} days" +%Y%m%dT%H%M%SZ).db.gpg"
+    if LISTED="$(rclone lsf "$RCLONE_REMOTE" 2>/dev/null)"; then
+        OURS="$(printf '%s\n' "$LISTED" | grep -x 'newperson-[0-9]\{8\}T[0-9]\{6\}Z\.db\.gpg' | sort || true)"
+        TOTAL="$(printf '%s\n' "$OURS" | grep -c . || true)"
+        SPARE=$(( TOTAL > KEEP_MIN ? TOTAL - KEEP_MIN : 0 ))
+        say "清理 $KEEP_DAYS 天以前的远端备份（最新的 $KEEP_MIN 份无论多老都留着）"
+        printf '%s\n' "$OURS" | head -n "$SPARE" | while read -r old; do
+            [ -n "$old" ] || continue
+            [[ "$old" < "$CUTOFF" ]] || continue
+            rclone deletefile "$RCLONE_REMOTE$old" || say "!! 删不掉 $old"
+        done
+        # B2 删除只是打个隐藏标记，旧版本还在按量收钱。cleanup 才是真的删。
+        rclone cleanup "$RCLONE_REMOTE" 2>/dev/null || true
+    else
+        say "!! 列不出远端有哪些，这一轮不清理"
+    fi
 fi
 
 # ---- 5. 记时间。只有走到这里才算真的备份过 --------------------------------

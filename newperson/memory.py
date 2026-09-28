@@ -351,12 +351,15 @@ class Memory:
                 reply_batch.isoformat() if reply_batch else None,
             ),
         )
+        # 只往后挪。补抓会按原时间戳补回她以前说过的话，那些比现在早。
         await self.db.execute(
-            "UPDATE conversations SET last_bot_message_at = ? WHERE id = ?",
-            (created_at.isoformat(), conversation_id),
+            "UPDATE conversations SET last_bot_message_at = ? WHERE id = ?"
+            " AND (last_bot_message_at IS NULL"
+            "      OR julianday(last_bot_message_at) < julianday(?))",
+            (created_at.isoformat(), conversation_id, created_at.isoformat()),
         )
         await self.db.commit()
-        return int(cur.lastrowid or 0)
+        return int(cur.lastrowid or 0) if cur.rowcount else 0
 
     async def unread_messages(self, conversation_id: str) -> list[StoredMessage]:
         """还没读的消息，**按他说话的先后排**。

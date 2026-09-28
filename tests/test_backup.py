@@ -431,3 +431,128 @@ def test_export_prints_the_conversation_in_order_and_marks_when_she_spoke_first(
     assert "她·主动" not in out[1], "接他那一批的回复不是主动"
     assert "她·主动" in out[2] and "做了吗" in out[2], "自己开口问的那句要标出来"
     assert "（他 09-28" in out[2], "要同时给出他那边的时间，才看得出是不是半夜问的"
+
+
+def _fake_remote_rclone(bin_dir: Path, *, corrupt_downloads: bool = False) -> None:
+    """backup.sh 用到的那几个子命令：lsf / copy / size / deletefile / cleanup。
+
+    "远端"是一个本地目录。``corrupt_downloads`` 让取回来的文件变成乱码——
+    传上去的东西解不开，大小却对得上，就是这个样子。
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "rclone"
+    mangle = 'printf "garbage" > "$3/$(basename "$2")"' if corrupt_downloads else 'cp "$2" "$3"'
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        'case "$1" in\n'
+        '  lsf) ls -1 "${2%/}" ;;\n'
+        '  copy)\n'
+        '    if [ -d "$3" ] && [ -f "$2" ] && [ "$(dirname "$2")/" != "$3" ] '
+        '&& [ "${2#"$REMOTE_DIR"}" != "$2" ]; then\n'
+        f"      {mangle}\n"
+        "    else\n"
+        '      cp "$2" "$3"\n'
+        "    fi ;;\n"
+        '  size) printf \'{"count":1,"bytes":%s}\' "$(wc -c < "$3")" ;;\n'
+        '  deletefile) rm -f "$2" ;;\n'
+        '  *) exit 0 ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+
+def _run_backup(tmp_path: Path, *, corrupt: bool = False, rows: int = 5, old_days=()):
+    import os
+    import sys
+
+    import pytest
+
+    if shutil.which("gpg") is None:
+        pytest.skip("这台机器上没有 gpg")
+    root = Path(__file__).resolve().parent.parent
+    # 脚本拷一份到临时目录里跑：它把本地副本写在自己上一级的 backups/ 里，
+    # 在仓库里跑会往仓库里写文件。
+    app = tmp_path / "app"
+    (app / "scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy(root / "scripts" / "backup.sh", app / "scripts" / "backup.sh")
+
+    live = app / "data" / "newperson.db"
+    live.parent.mkdir(exist_ok=True)
+    if not live.exists():
+        make_db(live, rows=rows).close()
+    remote = tmp_path / "remote"
+    remote.mkdir(exist_ok=True)
+    now = datetime.now(UTC)
+    from datetime import timedelta
+
+    for days in old_days:
+        stamp = (now - timedelta(days=days)).strftime("%Y%m%dT%H%M%SZ")
+        (remote / f"newperson-{stamp}.db.gpg").write_bytes(b"old")
+    passfile = tmp_path / "pass"
+    passfile.write_text("backup-passphrase\n", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    _fake_remote_rclone(bin_dir, corrupt_downloads=corrupt)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "REMOTE_DIR": f"{remote}/",
+        "RCLONE_REMOTE": f"{remote}/",
+        "GPG_PASSPHRASE_FILE": str(passfile),
+        "PYTHON_BIN": sys.executable,
+        "PYTHONPATH": str(root),
+        "DB_PATH": str(live),
+    }
+    result = subprocess.run(
+        ["bash", str(app / "scripts" / "backup.sh")],
+        capture_output=True, text=True, env=env, check=False, cwd=app,
+    )
+    return result, remote, live
+
+
+def test_a_long_outage_does_not_wipe_the_remote_down_to_one_copy(tmp_path: Path) -> None:
+    """备份断了一个多月，恢复的第一天：远端不能被删到只剩当天那一份。
+
+    只按天数删的话，三十多天前的全删——而那时候远端恰好全是三十多天前的。
+    """
+    result, remote, _live = _run_backup(tmp_path, old_days=range(32, 62))
+    assert result.returncode == 0, result.stdout + result.stderr
+    left = sorted(p.name for p in remote.glob("newperson-*.db.gpg"))
+    assert len(left) >= 7, f"只剩 {len(left)} 份：{left}"
+
+
+def test_old_copies_still_expire_normally(tmp_path: Path) -> None:
+    """平时每天都在备：满三十天的删掉，没满的留着。"""
+    fresh = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    result, remote, _live = _run_backup(tmp_path, old_days=[*fresh, 31, 40, 45])
+    assert result.returncode == 0, result.stdout + result.stderr
+    left = sorted(p.name for p in remote.glob("newperson-*.db.gpg"))
+    assert len(left) == len(fresh) + 1, left  # 没满三十天的，加今天这份
+
+
+def test_a_backup_that_cannot_be_decrypted_is_not_counted(tmp_path: Path) -> None:
+    """大小对得上、取回来却解不开：不算备份过，也不清理旧的。"""
+    result, remote, live = _run_backup(tmp_path, corrupt=True, old_days=[40])
+    assert result.returncode != 0
+    assert not (live.parent / ".last_backup_at").exists(), "解不开还记成备份过了"
+    assert len(list(remote.glob("newperson-*.db.gpg"))) == 2, "解不开还去删旧的"
+
+
+def test_an_empty_backup_does_not_push_out_the_local_copies(tmp_path: Path) -> None:
+    """库被换成空的那几天，本地那三份好的不能被顶掉。"""
+    result, _remote, live = _run_backup(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    local = tmp_path / "app" / "backups"
+    before = sorted(local.glob("newperson-*.db.gpg"))
+    assert before, "前提不成立：正常那一次没在本地留副本"
+
+    live.unlink()
+    for side in ("-wal", "-shm"):
+        live.with_name(live.name + side).unlink(missing_ok=True)
+    make_db(live, rows=0).close()
+    for _ in range(3):
+        result, _remote, _live = _run_backup(tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+    after = sorted(local.glob("newperson-*.db.gpg"))
+    assert after == before, "空备份把本地的好副本顶掉了"
