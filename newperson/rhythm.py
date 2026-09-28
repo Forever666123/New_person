@@ -30,20 +30,14 @@ from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .calendar import AcademicCalendar
+from .clock import later
 from .models import ClassInstance, DailyRhythm, RhythmSnapshot
 from .persona import DayVariant, LifePhase, RhythmConfig, hhmm_to_minutes
 
 _SEARCH_LIMIT = 400
 
 
-def later(dt: datetime, delta: timedelta) -> datetime:
-    """``dt`` 之后真实过去 ``delta`` 的那一刻，时区保持不变。
 
-    带 ZoneInfo 的时刻直接加 timedelta 是**按墙钟加**：夏令时结束那一夜，
-    第二个 01:05 加十分钟会回到第一个 01:15——往回走了一小时。
-    先换到 UTC 加，再换回来。
-    """
-    return (dt.astimezone(UTC) + delta).astimezone(dt.tzinfo)
 """向前搜索的最大步数，防止配置写错时死循环。"""
 
 _PHASE_EPOCH = date(2025, 1, 1)

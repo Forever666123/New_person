@@ -449,6 +449,7 @@ proactive:
     grace_hours: [3, 10]       # 过了他说的时间再等多久才问。一过点就问，那是闹钟不是人
     max_days_ahead: 30         # 他说的时间比这还远，就当没说，按类别周期走
     follow_up_guard_hours: 12  # 记下这种计划前后半天里她排的 follow_up，也不早于那件事该问的时候
+    follow_up_hold_max_hours: 48  # 但最多压两天：远处的计划压不住她今晚答应的事
 
   # 第一次上线的那一句。一辈子一次，只在数据库还是空的时候。
   #

@@ -155,6 +155,7 @@ proactive:
     grace_hours: [3, 10]       # 过了他说的时间再等多久才问
     max_days_ahead: 30         # 比这还远就当没说，按类别周期走
     follow_up_guard_hours: 12  # 记下这种计划前后半天里排的 follow_up 也不早于那时候
+    follow_up_hold_max_hours: 48  # 但最多压两天
   kinds:
     - name: own_life
       weight: 40

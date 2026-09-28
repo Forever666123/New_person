@@ -22,7 +22,7 @@ from datetime import UTC, date, datetime, time, timedelta
 
 from .brain import Brain, DayPlanRequest
 from .calendar import AcademicCalendar
-from .clock import Clock
+from .clock import Clock, later
 from .memory import Memory
 from .models import DayPlan, Job, LedgerEntry, LedgerTiming, PlanEvent
 from .persona import OpenerConfig, Persona, ProactiveKind, parse_hhmm
@@ -199,13 +199,13 @@ class LifeEngine:
         两条底线：不能是启动后一分钟（那是程序开机的样子），
         也不能是她正睡着的时候。
         """
-        earliest = now + timedelta(minutes=cfg.min_delay_minutes)
-        latest = now + timedelta(hours=cfg.max_delay_hours)
+        earliest = later(now, timedelta(minutes=cfg.min_delay_minutes))
+        latest = later(now, timedelta(hours=cfg.max_delay_hours))
         span = max((latest - earliest).total_seconds(), 1.0)
 
         # 先在窗口里按活跃度抽：她越可能在看手机的时刻，越容易被抽中。
         for _ in range(80):
-            moment = earliest + timedelta(seconds=self.rng.uniform(0, span))
+            moment = later(earliest, timedelta(seconds=self.rng.uniform(0, span)))
             if self.rhythm.is_sleeping(moment):
                 continue
             if self.rng.random() <= self.rhythm.engage_probability_at(moment):
@@ -221,12 +221,12 @@ class LifeEngine:
         # 任务标记成 done，kv 里的标记和全局唯一的 dedupe_key 让它再也排不上了。
         # 这一句不发，就是永远不发。
         probe = earliest
-        limit = now + timedelta(hours=cfg.fallback_search_hours)
+        limit = later(now, timedelta(hours=cfg.fallback_search_hours))
         step = timedelta(minutes=15)
         low, high = cfg.after_waking_minutes
         while probe < limit:
             if not self.rhythm.is_sleeping(probe):
-                candidate = probe + timedelta(minutes=self.rng.uniform(low, high))
+                candidate = later(probe, timedelta(minutes=self.rng.uniform(low, high)))
                 if candidate < limit and not self.rhythm.is_sleeping(candidate):
                     return candidate
             probe += step
@@ -239,7 +239,7 @@ class LifeEngine:
         day = self.rhythm.local_date(wake)
         return await self.scheduler.schedule(
             "day_plan",
-            wake + timedelta(minutes=self.rng.uniform(0, 20)),
+            later(wake, timedelta(minutes=self.rng.uniform(0, 20))),
             dedupe_key=f"day_plan:{day}",
             reason=f"{day} 醒来",
         )
@@ -576,9 +576,13 @@ class LifeEngine:
         窗口两头都要有边：只有下限的话，被推迟过的 follow_up 会被几天后
         一件不相干的新计划再拖住。
         """
-        guard = timedelta(hours=self.persona.proactive.ledger_timed.follow_up_guard_hours)
+        cfg = self.persona.proactive.ledger_timed
+        guard = timedelta(hours=cfg.follow_up_guard_hours)
         hold = await self.memory.latest_timed_ask_after(
-            now, since=noted_at - guard, until=noted_at + guard
+            now,
+            since=noted_at - guard,
+            until=noted_at + guard,
+            cap=now + timedelta(hours=cfg.follow_up_hold_max_hours),
         )
         if hold is None or hold <= now:
             return None
@@ -597,7 +601,7 @@ class LifeEngine:
             log.info("[life] 已经有一个 follow_up 排着了，这个不排")
             return 0
         now = self.clock.now()
-        run_at = now + timedelta(minutes=delay_minutes * self.scheduler.delay_scale)
+        run_at = later(now, timedelta(minutes=delay_minutes * self.scheduler.delay_scale))
         # 他刚说了带时间的计划的话，这个 follow_up 不能比那件事该问的时候还早。
         # 靠提示词让模型别把他的计划塞进来是请求，不是约束。
         hold = await self.follow_up_hold(now, now)
@@ -650,7 +654,7 @@ class LifeEngine:
         tries = int(job.payload.get("retry", 0))
         if await self.memory.get_day_plan(day) is not None or tries >= self.DAY_PLAN_RETRIES:
             return
-        run_at = now + timedelta(minutes=self.rng.uniform(30, 60))
+        run_at = later(now, timedelta(minutes=self.rng.uniform(30, 60)))
         if self.rhythm.is_sleeping(run_at) or self.rhythm.local_date(run_at) != day:
             return
         await self.scheduler.schedule(

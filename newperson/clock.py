@@ -12,6 +12,18 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 
+def later(dt: datetime, delta: timedelta) -> datetime:
+    """``dt`` 之后真实过去 ``delta`` 的那一刻，时区保持不变。
+
+    带 ZoneInfo 的时刻直接加 timedelta 是**按墙钟加**：夏令时结束那一夜，
+    第二个 01:05 加十分钟会回到第一个 01:15——往回走了一小时。
+    任务到期是按真实时刻比的，这样排出来的任务一入库就已经过期了：
+    重试十几秒内烧光、开机打散失效、答应"晚点告诉你"三分钟就说。
+    **往后排任务一律用它**，别直接加。
+    """
+    return (dt.astimezone(UTC) + delta).astimezone(dt.tzinfo)
+
+
 class Clock(Protocol):
     tz: ZoneInfo
 

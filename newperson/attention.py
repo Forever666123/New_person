@@ -117,7 +117,6 @@ class AttentionPolicy:
         按墙钟加减、比大小时不看 fold：夏令时结束那一夜，重复的那一小时里
         算出来的时刻会倒退一小时，落到"现在"之前——调度器下一拍就发，那就是秒回。
         """
-        home = now.tzinfo
         now = now.astimezone(UTC)
         last_user_message_at = last_user_message_at.astimezone(UTC)
         if session_started_at is not None:
@@ -173,9 +172,11 @@ class AttentionPolicy:
             reply, now, last_user_message_at, snapshot, defers, fatigue
         )
         notice, reply = self._scale(now, notice, reply)
+        # 出口换回她此刻人在的那个时区：日志、!np status 里跟"下次看手机""起床"
+        # 同一个钟。时刻本身不变，库里按真实时刻比。
         return TimingDecision(
-            notice_at=notice.astimezone(home),
-            reply_at=reply.astimezone(home),
+            notice_at=self.rhythm.local_time(notice),
+            reply_at=self.rhythm.local_time(reply),
             reason="；".join(steps),
             defers=defers,
             quick_before_sleep=quick_before_sleep,
@@ -344,12 +345,11 @@ class AttentionPolicy:
         上限就是"四分半钟前"——外层的 min 会挑中它，于是回复被排到过去，
         调度器下一拍立刻发出去。那就是实打实的秒回，这个项目最不能出的事。
         """
-        home = now.tzinfo
         now = now.astimezone(UTC)
         base = max(existing_reply_at.astimezone(UTC), now)
         gap = max(MIN_DELAY_SECONDS, self._lognormal(25 if heat == "hot" else 40, 0.4, rng))
         cap = base + timedelta(seconds=90 if heat == "hot" else 180)
-        return min(max(base, now + timedelta(seconds=gap)), cap).astimezone(home)
+        return self.rhythm.local_time(min(max(base, now + timedelta(seconds=gap)), cap))
 
     def typing_duration(self, text: str, rng: random.Random) -> float:
         """打这条话要多久。手机打字比键盘慢。"""

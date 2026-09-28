@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from .clock import Clock
+from .clock import Clock, later
 from .memory import Memory
 from .models import Job, JobKind
 
@@ -162,7 +162,7 @@ class Scheduler:
                 continue
             low, high = spread.get(job.kind, (30.0, 300.0))
             delay = self.rng.uniform(low, high) * max(self.delay_scale, 0.0)
-            await self.memory.reschedule_job(job.id or 0, now + timedelta(seconds=delay))
+            await self.memory.reschedule_job(job.id or 0, later(now, timedelta(seconds=delay)))
             moved += 1
         return moved
 
@@ -254,7 +254,7 @@ class Scheduler:
             return
 
         backoff = RETRY_BACKOFF_SECONDS[min(job.attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
-        retry_at = self.clock.now() + timedelta(seconds=backoff * self.delay_scale)
+        retry_at = later(self.clock.now(), timedelta(seconds=backoff * self.delay_scale))
         log.warning(
             "[job] %s#%s 第 %d 次失败，%s 后重试：%s",
             job.kind,

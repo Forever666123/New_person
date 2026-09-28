@@ -393,6 +393,9 @@ class LedgerTimedConfig(BaseModel):
     普遍偏早——他凌晨一两点说"明早九点做"，她四五点就来问。
     分不清那个 follow_up 是不是在问这件事，所以宁可让她自己答应的事晚一点。
     """
+    follow_up_hold_max_hours: float = 48.0
+    """最多压多久。一件三周以后的事不该把她今晚答应的"查完告诉你"压上三周——
+    同一时间只排一个 follow_up，压着的那个还会把她后来答应的全挤掉。"""
 
 
 class ProactiveConfig(BaseModel):

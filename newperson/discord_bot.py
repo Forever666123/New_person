@@ -21,7 +21,7 @@ import logging
 import random
 import signal
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +31,7 @@ from . import owner as owner_cmds
 from .attention import AttentionPolicy, extract_features, heat_of
 from .brain import Brain, MemoryUpdateRequest, ProactiveRequest, ReplyRequest, build_client
 from .calendar import AcademicCalendar
-from .clock import Clock, RealClock
+from .clock import Clock, RealClock, later
 from .config import Settings
 from .delivery import Deliverer, DeliveryBlocked
 from .life import LEDGER_CHECK, LifeEngine
@@ -914,7 +914,7 @@ class App:
     async def handle_reply_job(self, job: Job) -> None:
         if await owner_cmds.is_paused(self.memory):
             log.info("[job] 暂停中，回复先不发")
-            await self.scheduler.defer(job.id or 0, self.clock.now() + timedelta(minutes=10))
+            await self.scheduler.defer(job.id or 0, later(self.clock.now(), timedelta(minutes=10)))
             return
 
         now = self.clock.now()
@@ -1189,7 +1189,7 @@ class App:
             return
         await self.scheduler.schedule(
             "memory_update",
-            self.clock.now() + timedelta(seconds=30),
+            later(self.clock.now(), timedelta(seconds=30)),
             conversation_id=CONVERSATION_ID,
             reason="对话攒够了，整理一下",
         )
@@ -1216,7 +1216,7 @@ class App:
     async def _later(self, job: Job, now: datetime, minutes: tuple[float, float], why: str) -> None:
         """过一会儿再说。挪到她醒着的时候。"""
         run_at = self.life._awake_at_or_after(
-            now + timedelta(minutes=self.rng.uniform(*minutes))
+            later(now, timedelta(minutes=self.rng.uniform(*minutes)))
         )
         log.info("[proactive] %s，%s 再说", why, run_at.strftime("%m-%d %H:%M"))
         await self.scheduler.defer(job.id or 0, run_at)
@@ -1240,6 +1240,20 @@ class App:
             await self._skip(job, "这会儿在睡觉，算了")
             return
 
+        if promised and job.created_at:
+            # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
+            # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
+            # **必须在"有未读就并进回复"之前**：并进去之后这道闸就走不到了，
+            # 那句"跑完没"会跟着回复在他凌晨发出去。
+            hold = await self.life.follow_up_hold(now, job.created_at)
+            if hold is not None:
+                log.info(
+                    "[proactive] 这个 follow_up 比他说的时间还早，推到 %s",
+                    hold.strftime("%m-%d %H:%M"),
+                )
+                await self.scheduler.defer(job.id or 0, hold)
+                return
+
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         if not conv.deliverable:
             await self._skip(job, "发不出去")
@@ -1258,7 +1272,7 @@ class App:
                              f"你之前答应过他的事，这次顺便说：{job.payload.get('note', '')}"]
                     payload = {**reply.payload, "hints": hints}
                 await self.scheduler.reschedule(
-                    reply.id or 0, now + timedelta(seconds=self.rng.uniform(20, 90)), payload
+                    reply.id or 0, later(now, timedelta(seconds=self.rng.uniform(20, 90))), payload
                 )
                 if payload is not None:
                     await self._skip(job, "有未读，答应他的事并进这次回复里说")
@@ -1284,17 +1298,6 @@ class App:
             return
 
         day = self.rhythm.local_date(now)
-        if kind == "follow_up" and job.created_at:
-            # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
-            # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
-            hold = await self.life.follow_up_hold(now, job.created_at)
-            if hold is not None:
-                log.info(
-                    "[proactive] 这个 follow_up 比他说的时间还早，推到 %s",
-                    hold.strftime("%m-%d %H:%M"),
-                )
-                await self.scheduler.defer(job.id or 0, hold)
-                return
         if not await self.life.can_initiate_today(CONVERSATION_ID, day):
             await self._skip(job, "今天已经主动过而且他没回，不追了")
             return
@@ -1497,7 +1500,7 @@ class PresenceManager:
     def note_activity(self, minutes: float | None = None) -> None:
         """她刚看了手机。接下来几分钟显示在线。"""
         span = minutes if minutes is not None else self.rng.uniform(1, 8)
-        self._online_until = self.clock.now() + timedelta(minutes=span)
+        self._online_until = later(self.clock.now(), timedelta(minutes=span))
 
     async def apply_once(self) -> None:
         now = self.clock.now()
@@ -1505,7 +1508,7 @@ class PresenceManager:
 
         if snapshot.state == "sleeping":
             status, text = "invisible", None
-        elif self._online_until and now < self._online_until:
+        elif self._online_until and now.astimezone(UTC) < self._online_until.astimezone(UTC):
             status, text = "online", await self._status_text(now)
         elif snapshot.state == "busy":
             status, text = self._busy_status(snapshot), await self._status_text(now)

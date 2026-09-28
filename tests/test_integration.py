@@ -2846,3 +2846,83 @@ async def test_she_knows_a_trip_is_coming_before_she_leaves(
     assert trip.place in situation and "3 天后" in situation
     far = datetime.combine(trip.start - timedelta(days=20), datetime.min.time(), tzinfo=TZ)
     assert trip.place not in await app._build_situation(far + timedelta(hours=15))
+
+
+async def test_a_follow_up_is_held_even_when_it_would_ride_along_with_a_reply(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """follow_up 到点时正好有回复要发：先过时间闸，再谈并进回复。
+
+    原来"有未读就并进回复"排在闸前面，那句"跑完没"跟着回复在他凌晨发了出去。
+    """
+    from newperson.models import LedgerEntry
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 60, "问问他回测跑完没")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    await memory.reschedule_job(follow.id or 0, HIS_1_30 + timedelta(minutes=60))
+
+    clock.set(HIS_1_30 + timedelta(minutes=10))
+    timing = app.life.resolve_when_there("09-29 09:00", clock.now())
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="明早九点跑回测", when_there="09-29 09:00")],
+        clock.now(), [timing],
+    )
+    at = HIS_1_30 + timedelta(minutes=60) - timedelta(seconds=5)
+    clock.set(at)
+    await send(app, "对了", at=at, msg_id=77)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, HIS_1_30 + timedelta(minutes=65))
+
+    clock.set(HIS_1_30 + timedelta(minutes=60, seconds=1))
+    await app.scheduler.run_due_once()
+    held = await memory.get_job(follow.id or 0)
+    assert held.status == "pending", "并进回复里，在他说的时间之前问出口了"
+    assert held.run_at >= timing.ask_after
+    hints = (await memory.get_job(reply.id or 0)).payload.get("hints", [])
+    assert not any("跑完" in h for h in hints)
+
+
+async def test_saying_it_again_with_a_time_is_seen_by_the_follow_up_guard(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """同一件事三天前记过（没带时间），今天才说"明早九点"：follow_up 的闸也得认得它。
+
+    原来闸按 created_at 圈窗口，那条还是三天前记的，圈不进来，follow_up 在他凌晨照发。
+    """
+    from newperson.models import LedgerEntry
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="把回测跑完")], HIS_1_30 - timedelta(days=3)
+    )
+    timing = app.life.resolve_when_there("09-29 09:00", HIS_1_30)
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="把回测跑完", when_there="09-29 09:00")],
+        HIS_1_30, [timing],
+    )
+    await app.life.schedule_follow_up(CONVERSATION_ID, 180, "问问他回测跑完没")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    assert follow.run_at >= timing.ask_after
+
+
+async def test_a_far_off_plan_does_not_hold_her_own_promise_for_weeks(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他说"10 月 20 号早上考试"，她说"那个参数我查完告诉你"：她的承诺不能被压三周。
+
+    同一时间只排一个 follow_up，被压着的那个还会把她后来答应的全挤掉。
+    """
+    from newperson.models import LedgerEntry
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    app.scheduler.delay_scale = 1.0
+    timing = app.life.resolve_when_there("10-20 09:00", HIS_1_30)
+    assert timing is not None
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="study", claim="期中考试", when_there="10-20 09:00")],
+        HIS_1_30, [timing],
+    )
+    await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他查到的参数")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    assert follow.run_at - HIS_1_30 < timedelta(days=2), f"被压到了 {follow.run_at}"

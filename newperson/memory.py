@@ -22,6 +22,7 @@ from typing import Any
 
 import aiosqlite
 
+from .clock import later
 from .models import (
     Attachment,
     ConversationState,
@@ -94,7 +95,8 @@ CREATE TABLE IF NOT EXISTS ledger (
     asked_count INTEGER NOT NULL DEFAULT 0,
     when_there TEXT,
     due_at TEXT,
-    ask_after TEXT
+    ask_after TEXT,
+    timed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_kind ON ledger(kind, resolved);
 
@@ -215,6 +217,9 @@ class Memory:
                 "when_there": "TEXT",
                 "due_at": "TEXT",
                 "ask_after": "TEXT",
+                # 这个时间是什么时候记下（或者更新）的，UTC。follow_up 的闸按它圈窗口：
+                # 同一件事几天前记过、今天才带上时间，created_at 还是几天前，圈不进来。
+                "timed_at": "TEXT",
             },
             # 任务**真的执行完**是几点。`run_at` 记的是排期时刻，
             # 崩溃恢复之后那两个数差着几小时，而体检要看的恰恰是"一堆事挤在同一分钟发生"。
@@ -747,13 +752,20 @@ class Memory:
                     if dupe["ask_after"] is not None:
                         ask_after = max(ask_after, dupe["ask_after"])
                     await self.db.execute(
-                        "UPDATE ledger SET when_there = ?, due_at = ?, ask_after = ? WHERE id = ?",
-                        (timing.when_there, utc_text(timing.due_at), ask_after, int(dupe["id"])),
+                        "UPDATE ledger SET when_there = ?, due_at = ?, ask_after = ?, timed_at = ?"
+                        " WHERE id = ?",
+                        (
+                            timing.when_there,
+                            utc_text(timing.due_at),
+                            ask_after,
+                            utc_text(at),
+                            int(dupe["id"]),
+                        ),
                     )
                 continue
             await self.db.execute(
                 "INSERT INTO ledger (kind, claim, reason, committed_to, created_at,"
-                " when_there, due_at, ask_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " when_there, due_at, ask_after, timed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry.kind,
                     claim,
@@ -763,6 +775,7 @@ class Memory:
                     timing.when_there if timing else None,
                     utc_text(timing.due_at) if timing else None,
                     utc_text(timing.ask_after) if timing else None,
+                    utc_text(at) if timing else None,
                 ),
             )
         await self.db.commit()
@@ -797,17 +810,19 @@ class Memory:
         ]
 
     async def latest_timed_ask_after(
-        self, now: datetime, since: datetime, until: datetime
+        self, now: datetime, since: datetime, until: datetime, cap: datetime
     ) -> datetime | None:
-        """``[since, until]`` 里记下的、还没到时间的计划里，最晚的那个"可以问了"的时刻。
+        """``[since, until]`` 里记下时间的、还没到的计划里，最晚的那个"可以问了"的时刻。
 
         follow_up 最早也得等到这时候——分不清它是不是在问那件事。
+        ``cap`` 之后才能问的不算：一件三周以后的事，压不住她今晚答应的"查完告诉你"。
+        全是 UTC 串对 UTC 串，夏令时那一夜也比得对。
         """
         row = await self._fetch_one(
             "SELECT MAX(ask_after) AS latest FROM ledger WHERE resolved = 0"
-            " AND ask_after IS NOT NULL AND ask_after > ?"
-            " AND created_at >= ? AND created_at <= ?",
-            (utc_text(now), since.isoformat(), until.isoformat()),
+            " AND ask_after IS NOT NULL AND ask_after > ? AND ask_after <= ?"
+            " AND timed_at >= ? AND timed_at <= ?",
+            (utc_text(now), utc_text(cap), utc_text(since), utc_text(until)),
         )
         if row is None or not row["latest"]:
             return None
@@ -1067,7 +1082,7 @@ class Memory:
         cur = await self.db.execute(
             "UPDATE jobs SET status = 'running', attempts = attempts + 1, lease_until = ?"
             " WHERE id = ? AND status = 'pending'",
-            ((now + timedelta(seconds=lease_seconds)).isoformat(), job_id),
+            (later(now, timedelta(seconds=lease_seconds)).isoformat(), job_id),
         )
         await self.db.commit()
         if cur.rowcount == 0:

@@ -304,3 +304,37 @@ async def test_a_cancelled_one_shot_can_be_scheduled_again(parts) -> None:
 
     second = await sched.schedule("proactive", clock.now(), conversation_id="c", dedupe_key="opener")
     assert second, "作废之后应该能重新排"
+
+
+async def test_a_retry_in_the_repeated_hour_is_not_due_immediately(tmp_path) -> None:
+    """夏令时结束那一夜的第二遍 01:00–02:00：失败重试要真的往后排。
+
+    按墙钟加的话，第二个 01:10 加一分钟是第一个 01:11——一小时之前，一入库就到期，
+    三次重试十几秒内烧光，任务判死，他那句话再也没人回。
+    """
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from newperson.clock import FakeClock
+    from newperson.memory import Memory
+    from newperson.scheduler import Scheduler
+
+    memory = Memory(tmp_path / "s.db")
+    await memory.open()
+    try:
+        tz = ZoneInfo("America/New_York")
+        clock = FakeClock(datetime(2026, 11, 1, 6, 10, tzinfo=UTC).astimezone(tz))
+        scheduler = Scheduler(memory, clock, 1.0)
+        calls = []
+
+        async def boom(_job):
+            calls.append(clock.now())
+            raise RuntimeError("模型抖了一下")
+
+        scheduler.register("reply", boom)
+        await scheduler.schedule("reply", clock.now(), conversation_id="owner")
+        for _ in range(3):
+            await scheduler.run_due_once()
+        assert len(calls) == 1, f"不拨钟连跑三轮，被调了 {len(calls)} 次"
+    finally:
+        await memory.close()
