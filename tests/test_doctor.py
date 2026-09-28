@@ -1001,3 +1001,42 @@ def test_the_burst_line_does_not_claim_there_is_no_data_when_everything_is_fine(
     )
     assert "没有带执行时刻" not in finding.line, f"库里十二个都带着，却说没有：{finding.line}"
     assert "12" in finding.line, finding.line
+
+
+def test_zero_facts_says_how_far_the_first_summary_is(tmp_path: Path) -> None:
+    """"她记住的事 0 条"光印一个 0，看不出是正常还是坏了。"""
+    db = tmp_path / "fresh.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(SCHEMA)
+    for i in range(35):
+        say(conn, datetime(2026, 9, 20, 12, tzinfo=UTC) + timedelta(minutes=i))
+    conn.commit()
+    conn.close()
+    report = doctor.run(db, datetime(2026, 9, 21, tzinfo=UTC), summarize_after=60)
+    text = report.render()
+    assert "还差 25 条" in text
+
+
+def test_doctor_finds_her_from_any_directory(tmp_path: Path, monkeypatch) -> None:
+    """在 ~ 下敲 doctor，原来只说"找不到数据库 data/newperson.db"，像是她的库没了。"""
+    from newperson.__main__ import _from_repo
+
+    monkeypatch.chdir(tmp_path)
+    root = Path(__file__).resolve().parent.parent
+    assert _from_repo(Path("persona/persona.yaml")) == root / "persona" / "persona.yaml"
+    assert _from_repo(Path("no/such/thing.db")) == Path("no/such/thing.db")
+
+
+def test_check_refuses_when_a_runtime_module_is_broken(monkeypatch, capsys) -> None:
+    """update.sh 靠 check 决定重不重启。她要用的模块导入不了，check 必须不过。
+
+    原来 check 只导入算作息、读人设的那几个，discord_bot 里一个语法错误照样放行，
+    重启之后她直接下线。
+    """
+    import argparse
+
+    import newperson.__main__ as cli
+
+    monkeypatch.setattr(cli, "RUNTIME_MODULES", (*cli.RUNTIME_MODULES, "no_such_module"))
+    assert cli.cmd_check(argparse.Namespace(online=False)) != 0
+    assert "导入不了 no_such_module" in capsys.readouterr().out

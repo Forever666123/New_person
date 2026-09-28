@@ -113,7 +113,7 @@ class ClassBlock(BaseModel):
     title: str = "上课"
     probability: float = 1.0
     activity: float | None = None
-    """这段时间的活跃度覆盖值；None 表示用曲线里 class_activity。"""
+    """本想做这段时间的活跃度覆盖值。**目前没接上**：上课一律用 class_activity。"""
 
     @field_validator("start", "end")
     @classmethod
@@ -335,10 +335,11 @@ class ProactiveKind(BaseModel):
     """给模型的触发说明，描述这次主动是出于什么。"""
     hours: list[str] = Field(default_factory=list, description="限定时段，如 ['00:00-04:00']；空表示不限")
     photo_tags: list[str] = Field(default_factory=list)
+    """本想按标签挑照片。**目前没接上**：挑照片只看时段和冷却。"""
     requires_photo: bool = False
-    """为真时如果挑不到合适的照片，这次主动就取消。"""
+    """为真时如果挑不到合适的照片，这次主动就取消；照片库空着时也不进当天的候选。"""
     text_optional: bool = False
-    """为真时允许只发照片不配字。"""
+    """本想控制能不能只发照片不配字。**目前没接上**：配不配字由模型自己定。"""
     min_days_since_last: float = 0.0
     """距离上次同类主动至少隔多少天。"""
     only_while_travelling: bool = False

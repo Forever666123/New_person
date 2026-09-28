@@ -76,9 +76,33 @@ def load_all(args: argparse.Namespace) -> tuple[Settings, Persona] | None:
 # ---------------------------------------------------------------------------
 
 
+RUNTIME_MODULES = (
+    "discord_bot", "life", "scheduler", "delivery", "owner", "memory", "doctor", "backup",
+)
+"""她跑起来要用、而 check 自己平时不碰的模块。"""
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     settings = load_settings()
     problems = 0
+
+    # update.sh 靠这一关决定重不重启。原来这里只导入了算作息、读人设的那几个模块，
+    # 真正跑起来要用的（discord_bot、life、scheduler……）哪个坏了照样放行，
+    # 重启之后她直接下线，而旧代码已经被 git pull 换掉了。
+    print("代码")
+    import importlib
+
+    broken = []
+    for name in RUNTIME_MODULES:
+        try:
+            importlib.import_module(f"newperson.{name}")
+        except Exception as exc:  # noqa: BLE001 - 什么错都得拦下来
+            broken.append(f"{name}：{exc!r}"[:200])
+    for line in broken:
+        print(f"  {BAD} 导入不了 {line}")
+    problems += len(broken)
+    if not broken:
+        print(f"  {OK} 她要用的模块都能加载")
 
     print("配置")
     for name in settings.missing_required():
@@ -580,6 +604,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _from_repo(path: Path) -> Path:
+    """相对路径在当前目录下找不到，就按仓库根目录找。
+
+    `DB_PATH` 和 `PERSONA_PATH` 默认都是相对路径。在 `~` 下敲 doctor，
+    原来只会说"找不到数据库 data/newperson.db"，看着像她的库没了。
+    """
+    if path.is_absolute() or path.exists():
+        return path
+    candidate = Path(__file__).resolve().parents[1] / path
+    return candidate if candidate.exists() else path
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """体检。**只读元数据，不读一个字的聊天内容。**
 
@@ -588,15 +624,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """
     from . import doctor
 
-    settings = load_settings()
+    settings = load_settings(_from_repo(Path(".env")))
     persona = None
     load_error = ""
     try:
-        persona = load_persona(settings.persona_path)
+        persona = load_persona(_from_repo(settings.persona_path))
     except Exception as exc:  # noqa: BLE001 - 人设读不了也要能体检
         load_error = str(exc)
     tz = persona.tz if persona else UTC
-    db = Path(args.db) if args.db else settings.db_path
+    db = Path(args.db) if args.db else _from_repo(settings.db_path)
 
     report = doctor.run(
         db,
@@ -604,6 +640,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         days=args.days,
         max_per_day=persona.proactive.max_per_day if persona else 2.0,
         kinds_known=frozenset(k.name for k in persona.proactive.kinds) if persona else frozenset(),
+        summarize_after=persona.memory.summarize_after if persona else 60,
     )
     if persona is None:
         # **不能不吭声。** 读不到人设就退回 UTC，而窗口的两端会整体挪一个时区偏移

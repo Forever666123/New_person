@@ -307,3 +307,26 @@ async def test_a_hand_saved_plan_still_gets_her_proactive_moments(harness: Harne
         assert await memory.kv_get(f"{PROACTIVE_PENDING}{day}") is None
         scheduled += len(await memory.pending_jobs("proactive"))
     assert scheduled > 0, "手动存过日程的日子一次都没排主动"
+
+
+@pytest.mark.parametrize("name", ["persona.yaml", "persona.example.yaml"])
+def test_persona_files_have_no_duplicate_keys(name: str) -> None:
+    """同一层里写了两个同名的键，yaml 静默保留后一个，前一段整段作废。
+
+    模板里真出过：两个顶层 style:，前面那段预算全丢了，后面那段用的还是
+    代码不认识的开关，被悄悄忽略。改了人设却没效果，而且没有任何症状。
+    """
+    import yaml
+
+    class Strict(yaml.SafeLoader):
+        pass
+
+    def no_dupes(loader, node, deep=False):
+        keys = [loader.construct_object(k, deep=deep) for k, _ in node.value]
+        dupes = {k for k in keys if keys.count(k) > 1}
+        assert not dupes, f"{name} 里重复的键：{dupes}"
+        return loader.construct_mapping(node, deep)
+
+    Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_dupes)
+    root = Path(__file__).resolve().parent.parent
+    yaml.load((root / "persona" / name).read_text(encoding="utf-8"), Loader=Strict)  # noqa: S506

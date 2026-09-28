@@ -43,12 +43,24 @@ say "检查配置和人设"
 }
 
 say "重启"
+since="$(date '+%Y-%m-%d %H:%M:%S')"
 systemctl restart "$SERVICE_NAME"
 sleep 3
 systemctl is-active --quiet "$SERVICE_NAME" || {
     echo "✗ 起不来了。看 journalctl -u $SERVICE_NAME -n 50" >&2
     exit 1
 }
+
+# 等她连上 Discord、把记忆打开。数据库要是加了新列，就是这一步补上的；
+# 不等的话体检会抢在前面，报一串"这一项没查成"，看着像更新坏了。
+say "等她上线"
+up=0
+for _ in $(seq 60); do
+    n="$(journalctl -u "$SERVICE_NAME" --since "$since" -o cat 2>/dev/null | grep -c '记忆在' || true)"
+    if [ "${n:-0}" -gt 0 ]; then up=1; break; fi
+    sleep 2
+done
+[ "$up" = 1 ] || say "!! 两分钟了还没看到她上线（多半是 Discord 连得慢），下面的体检可能不准"
 
 # 顺手体检一遍。**故意不让它决定退出码**：她刚起来，
 # 重启前那几条还没回的消息会让 doctor 判 BAD，而那不是这次更新的问题，

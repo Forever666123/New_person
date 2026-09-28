@@ -571,7 +571,7 @@ def check_deliverable(report: Report, conn: sqlite3.Connection) -> None:
         )
 
 
-def check_memory(report: Report, conn: sqlite3.Connection) -> None:
+def check_memory(report: Report, conn: sqlite3.Connection, summarize_after: int = 60) -> None:
     """记忆和台账的规模，顺便看看有没有只进不出。"""
     rows = _rows(conn, "SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")
     messages = rows[0]["n"] if rows else 0
@@ -582,7 +582,11 @@ def check_memory(report: Report, conn: sqlite3.Connection) -> None:
     )
     total = rows[0]["n"] if rows else 0
     done = (rows[0]["done"] or 0) if rows else 0
-    report.add(OK, f"消息 {messages} 条　她记住的事 {facts} 条　台账 {total} 条（{done} 条已了结）")
+    line = f"消息 {messages} 条　她记住的事 {facts} 条　台账 {total} 条（{done} 条已了结）"
+    if facts == 0 and messages < summarize_after:
+        # 光印一个 0，看不出是正常还是坏了。
+        line += f"\n第一次整理记忆要等消息攒够 {summarize_after} 条，还差 {summarize_after - messages} 条"
+    report.add(OK, line)
 
     rows = _rows(
         conn,
@@ -603,10 +607,12 @@ def run(
     days: int = 14,
     max_per_day: float = 2.0,
     kinds_known: frozenset[str] = frozenset(),
+    summarize_after: int = 60,
 ) -> Report:
     """跑一遍体检。**全程只读，不改任何东西。**
 
-    ``max_per_day`` 和 ``kinds_known`` 从人设里来：判据和种类名都不该写死在代码里。
+    ``max_per_day``、``kinds_known``、``summarize_after`` 从人设里来：
+    判据和种类名都不该写死在代码里。
     """
     report = Report(days=days)
     if not db_path.exists():
@@ -648,7 +654,7 @@ def run(
         ("沉默比例", lambda: check_silence(report, conn, since)),
         ("主动开口", lambda: check_proactive(report, conn, since, max_per_day, kinds_known)),
         ("事情挤不挤", lambda: check_bursts(report, conn, since)),
-        ("记忆和台账", lambda: check_memory(report, conn)),
+        ("记忆和台账", lambda: check_memory(report, conn, summarize_after)),
     ]
     try:
         for name, check in checks:
