@@ -23,13 +23,24 @@ say "拉代码"
 git pull --ff-only
 after="$(git rev-parse --short HEAD)"
 
-if [ "$before" = "$after" ]; then
+# 看的是"上次真正装好、重启成功的是哪个版本"，不是"这次拉没拉到新东西"。
+# 原来按拉取前后比：上一次在装依赖或检查那一步失败了，代码已经拉下来，
+# 再跑一次就会说"已经是最新的"然后退出 0——服务其实还在跑旧进程。
+#
+# （这个脚本自己也可能被上面那句 git pull 换掉。bash 是边读边跑的，
+#  所以 git pull 那一行和它之前的内容一个字节都不要改。）
+deployed="$(cat "$NP_DIR/.deployed_rev" 2>/dev/null || true)"
+if [ "$before" = "$after" ] && [ "$deployed" = "$after" ]; then
     say "已经是最新的（$after），不用重启"
     exit 0
 fi
 
-say "$before → $after"
-git --no-pager log --oneline "$before..$after" | sed 's/^/    /'
+if [ "$before" = "$after" ]; then
+    say "代码已经是 $after，但上次没装完（或者头一回用这个脚本），这次补上"
+else
+    say "$before → $after"
+    git --no-pager log --oneline "$before..$after" | sed 's/^/    /'
+fi
 
 say "装依赖"
 "$PYTHON_BIN" -m pip install -q -e .
@@ -61,6 +72,12 @@ for _ in $(seq 60); do
     sleep 2
 done
 [ "$up" = 1 ] || say "!! 两分钟了还没看到她上线（多半是 Discord 连得慢），下面的体检可能不准"
+systemctl is-active --quiet "$SERVICE_NAME" || {
+    echo "✗ 起来之后又挂了。最近的日志：" >&2
+    journalctl -u "$SERVICE_NAME" -n 20 --no-pager >&2 || true
+    exit 1
+}
+echo "$after" > "$NP_DIR/.deployed_rev"
 
 # 顺手体检一遍。**故意不让它决定退出码**：她刚起来，
 # 重启前那几条还没回的消息会让 doctor 判 BAD，而那不是这次更新的问题，

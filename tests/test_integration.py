@@ -2664,3 +2664,40 @@ async def test_leave_notes_are_not_put_in_her_mouth(tmp_path: Path, persona: Per
     situation = await app._build_situation(EVENING)
     assert "出差" not in situation
     assert "没什么心思聊天" in situation
+
+
+async def test_a_resumed_reply_quotes_the_right_message(tmp_path: Path, persona: Persona) -> None:
+    """发到一半断了、重试接着发时，引用的还得是这一批里的那一条。
+
+    原来续发时"这一批"被重建成最近四十行里 id 不超过 covers 的全部，
+    早就回过的旧话也在里面；reply_to_index 按原来那一批算的下标一错位，
+    她就引用九个小时前的一句去回。
+    """
+    script = [ReplyPlan(parts=[ReplyPart(text=f"回{i}")]) for i in range(3)]
+    script.append(ReplyPlan(parts=[ReplyPart(text="这个")], reply_to_index=0))
+    app, channel, _llm, clock, _memory = await build(tmp_path, persona, script)
+    at = EVENING
+    mid = 100
+    for i in range(3):
+        await send(app, f"老消息{i}", at=at, msg_id=mid)
+        mid += 1
+        await drain(app, clock, hops=12)
+        at = clock.now() + timedelta(hours=3)
+    await send(app, "新消息A", at=at, msg_id=mid)
+    await send(app, "新消息B", at=at + timedelta(seconds=30), msg_id=mid + 1)
+
+    quoted: list[int | None] = []
+    original = channel.send
+    state = {"fail": True}
+
+    async def flaky(content=None, *, file=None, reference=None):
+        if state["fail"]:
+            state["fail"] = False
+            raise ConnectionResetError("网络断了一下")
+        quoted.append(getattr(reference, "id", None))
+        return await original(content, file=file, reference=reference)
+
+    channel.send = flaky
+    await drain(app, clock, hops=20)
+    assert "这个" in channel.texts
+    assert quoted[-1] == mid, f"引用的是 {quoted[-1]}，该是 {mid}"

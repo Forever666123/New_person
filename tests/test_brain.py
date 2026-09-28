@@ -419,13 +419,44 @@ async def test_a_clean_reply_is_not_rewritten(
 async def test_it_gives_up_after_one_rewrite(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:
-    """重写只给一次机会，卡在这里既费钱又会让她很久不回。"""
+    """重写只给一次机会，卡在这里既费钱又会让她很久不回。
+
+    重写完还是禁语的话，那一条**不发**。原来是原句照发——
+    "还在睡 没看到"就是这么漏出去的。一条不剩就当这会儿没看手机，
+    交给调度器过一阵再试，这一次不再多调模型。
+    """
     bad = ReplyPlan(parts=[ReplyPart(text="加油")])
     client = fake_client(bad, bad, bad)
     brain = Brain(client, settings(tmp_path), persona, memory)
     got = await brain.generate_reply(reply_request(), TODAY)
-    assert got is not None
+    assert got is None or "加油" not in [p.text for p in got.parts]
     assert len(client.messages.calls) == 2
+
+
+async def test_a_banned_bubble_is_dropped_but_the_rest_still_goes(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """重写那次调用失败了：带禁语的那条不发，别的照发。"""
+    first = ReplyPlan(parts=[ReplyPart(text="还在睡 没看到"), ReplyPart(text="soxl后来怎么样了")])
+    request = httpx.Request("POST", "http://x")
+    outage = anthropic.APIConnectionError(request=request)
+    client = fake_client(first, outage)
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(), TODAY)
+    assert got is not None
+    assert [p.text for p in got.parts] == ["soxl后来怎么样了"]
+
+
+async def test_a_proactive_rewrite_that_is_still_banned_is_not_sent(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """主动消息重写回来还是寒暄：这次就不说。"""
+    first = ProactivePlan(send=True, parts=[ReplyPart(text="在吗")])
+    again = ProactivePlan(send=True, parts=[ReplyPart(text="在吗 好久不见")])
+    brain = Brain(fake_client(first, again), settings(tmp_path), persona, memory)
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+    assert got is not None and (not got.send or not got.parts)
+
 
 
 async def test_trailing_periods_are_stripped_without_a_rewrite(

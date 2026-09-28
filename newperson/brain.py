@@ -464,11 +464,15 @@ class Brain:
         prompt: str,
         images: list[tuple[str, bytes]],
         today: date,
-    ) -> ReplyPlan:
+    ) -> ReplyPlan | None:
         """过 style_guard。能机械修的直接修，修不了的让它重写一次。
 
         重写只给一次机会。再不行就用机械修剪的版本发出去，
         卡在这里反复调模型既费钱又会让她显得很久不回。
+
+        **但带禁语的那条气泡不发。** 禁语修剪不了，"用修剪过的版本"
+        原来就是原句照发——他抱怨过的"还在睡 没看到"就是这么漏出去的。
+        去掉之后一条不剩，就返回 None，让调度器当作"这会儿没看手机"过一阵再试。
         """
         fixed, needs_rewrite = style_guard.enforce(
             plan.parts, self.persona.style, self.persona.boundaries
@@ -492,13 +496,27 @@ class Brain:
                 second.parts = refixed
                 second.reaction = style_guard.filter_reaction(second.reaction, self.persona.style)
                 return second
-            second.parts = refixed
+            second.parts = self._drop_banned(refixed)
             second.reaction = style_guard.filter_reaction(second.reaction, self.persona.style)
-            log.info("[brain] 重写还是不过，用修剪过的版本")
+            log.info("[brain] 重写还是不过，用修剪过的版本（带禁语的那条不发）")
+            if refixed and not second.parts:
+                return None
             return second
 
-        plan.parts = fixed
+        plan.parts = self._drop_banned(fixed)
+        if fixed and not plan.parts:
+            log.info("[brain] 重写没出来，剩下的全是禁语，这次先不回")
+            return None
         return plan
+
+    def _drop_banned(self, parts: list[ReplyPart]) -> list[ReplyPart]:
+        """去掉还带着禁语的气泡。别的毛病机械修剪已经处理过了。"""
+        bad = {
+            v.part_index
+            for v in style_guard.check(parts, self.persona.style, self.persona.boundaries)
+            if v.kind == "banned_phrase"
+        }
+        return [part for i, part in enumerate(parts) if i not in bad]
 
     async def generate_proactive(self, req: ProactiveRequest, today: date) -> ProactivePlan | None:
         prompt = build_proactive_user(
@@ -550,6 +568,12 @@ class Brain:
         again.parts, _ = style_guard.enforce(
             again.parts, self.persona.style, self.persona.boundaries
         )
+        # 重写回来还带禁语的那条不发；一条不剩就这次不说。
+        kept = self._drop_banned(again.parts)
+        if again.parts and not kept:
+            log.info("[brain] 主动消息重写后还是禁语，这次就不说了")
+            again.send = False
+        again.parts = kept
         return again
 
     async def generate_day_plan(self, req: DayPlanRequest, today: date) -> DayPlan | None:

@@ -879,11 +879,10 @@ class App:
                 saved = None
             else:
                 log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
-                unread = [
-                    m
-                    for m in await self.memory.recent_messages(CONVERSATION_ID, 40)
-                    if m.author_kind == "user" and m.id <= covers
-                ]
+                # 只取**那一批**。reply_to_index 是按那一批的下标算的；原来取的是
+                # "最近四十行里 id 不超过 covers 的全部"，早就回过的旧话也在里面，
+                # 下标一错位，她就引用几个小时前的一句去回。
+                unread = await self.memory.batch_messages(CONVERSATION_ID, covers)
                 await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
                 return
 

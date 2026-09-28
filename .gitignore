@@ -13,3 +13,4 @@ persona/photos/*
 !persona/photos/index.example.yaml
 !persona/photos/.gitkeep
 generated/
+.deployed_rev

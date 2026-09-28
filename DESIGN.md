@@ -37,7 +37,7 @@ Discord Gateway ──► discord_bot.py（收消息 / 发消息 / 在线状态 
  日程、记忆更新）     收尾提醒）
         │
         ▼
-   delivery.py（气泡拆分、打字模拟、错字后编辑、引用回复、发图、表情反应、被打断检测、进度持久化）
+   delivery.py（气泡拆分、打字模拟、引用回复、发图、表情反应、被打断检测、进度持久化）
         │
         ▼
    memory.py（SQLite/aiosqlite：消息、会话、事实、日记、任务、照片使用、用量、KV）
@@ -112,7 +112,7 @@ Northeastern 2026–2027 的真实日期，超出范围的年份按典型模式�
   三五分钟才回一句是常态。
 - warm：`notice_at = min(next_glance, now + LN(4min, σ0.8))`（刚聊过，手机还在附近）；`reply_at = notice_at + LN(40s, σ0.7)`。
 - cold：`notice_at = next_glance`；`reply_at = notice_at + LN(60s, σ0.7)`；**另以 p=0.15 "看了忘了回"**：`reply_at` 推到再下一次 glance + 短滞后（reason 里注明 `forgot_once`）。
-- sleeping：按 glance 规则自然落到起床后。**例外**：heat==hot 且入睡不到 20 min → 允许一次快速回复（`quick_before_sleep=True`），上下文告诉模型"你已经准备睡了"。
+- sleeping：按 glance 规则自然落到起床后。（原设想"heat==hot 且入睡不到 20 min 允许快速回一句"**没有接上**：`quick_before_sleep` 永远是 False、也没人读。实际起作用的是回复落在入睡前 25 分钟内时，提示模型"你差不多要睡了"。）
 - **看到了不一定当场处理**：每次 notice 之后按 `DailyRhythm.engage_probability` 掷一次骰子，
   没中就**先放着**，等下一次看手机再说，最多放 `max_defers` 次。
   注意这不是"把消息丢掉"，而是延迟自然被拉长到几小时。真正的"不回"由模型决定（`parts` 为空），
@@ -163,7 +163,7 @@ Northeastern 2026–2027 的真实日期，超出范围的年份按典型模式�
 2. 打字模拟：时长 = `1.0 + len(text) / cps + N(0, 0.5)`，`cps` 来自 persona（默认 **2.0**，手机打字），限制在 `[1.5, 40]` 秒；用 `async with channel.typing():`（discord.py 会每 ~5 s 自动续），**不要**用 `trigger_typing()`。
    组稿噪声：若时长 > 8 s，以 p=0.4 中途停 2–6 s 再继续（退出并重新进入 typing 上下文）。
 3. 发送。超过 2000 字的气泡按句号/换行拆分。
-4. **错字后编辑**：若该条带 `typo_text`，先发 `typo_text`，4–20 s 后 `message.edit(content=text)`。
+4. ~~错字后编辑~~：**没有实现**。`typo_text` 不存在，`typo_probability` 没人读。要不要做由 Leo 定。
 5. **引用回复**：若这批未读消息里最早一条距今 > 2 h，或未读消息 > 3 条且第一条气泡明显是在回某一条（brain 给出 `reply_to_index`），用 Discord reply reference。
 6. 照片：`{photo}` 占位的那条带图发送；没有占位但有图 → 最后单独发；有占位没图 → 去掉占位符，去掉后为空则丢弃。
 7. 表情反应：`reaction` 对对方最后一条消息 `add_reaction`。可只有反应没有文字。
@@ -279,7 +279,7 @@ datetime 一律存 ISO8601 含时区偏移的字符串。
 
 ## 3. 数据结构（models.py）
 
-见 `newperson/models.py`。相较 v1 新增：`ReplyPart.typo_text`、`ReplyPlan.reply_to_index`、`PhotoRequest.photo_id`、`Job.dedupe_key/lease_until/progress/covers_upto_message_id/original_run_at/reason`、`Photo.time_of_day/location/freshness`、`ResolvedPhoto.is_fresh`、`UsageRecord`。
+见 `newperson/models.py`。相较 v1 新增：`ReplyPlan.reply_to_index`、`PhotoRequest.photo_id`、`Job.dedupe_key/lease_until/progress/covers_upto_message_id/original_run_at/reason`、`Photo.time_of_day/location/freshness`、`ResolvedPhoto.is_fresh`、`UsageRecord`。
 
 ## 4. 配置
 
@@ -316,8 +316,8 @@ python -m newperson photos
 - `attention`：固定种子；glance 序列落在清醒时段；hot/warm/cold 的分布区间；forgot 分支；sleeping 推迟；quick_before_sleep；防抖上限不饿死；疲劳倍率；边界提示；delay_scale。
 - `memory`/`scheduler`：临时 SQLite；租约认领只成功一次；清扫过期租约；重启恢复 running；dedupe_key；过期策略；续发从 sent_parts 开始；每会话单飞。
 - `brain`：假 client；system 稳定块字节级不变；cache_control 存在；refusal → None；错误链；用量记录与日限。
-- `delivery`：假 channel；顺序、打字时长、打断、错字编辑、引用、2000 字拆分、{photo} 处理、Forbidden 分类。
-- `life`/`media`：候选抽样、未回应衰减、每日上限、sign_off、照片 30 天冷却与 time_of_day 过滤。
+- `delivery`：假 channel；顺序、打字时长、打断、引用、2000 字拆分、{photo} 处理、Forbidden 分类。
+- `life`/`media`：候选抽样、未回应衰减、每日上限、照片 30 天冷却与 time_of_day 过滤。（sign_off 从来没有被排过，是死代码。）
 - `discord_bot`：权限过滤（bot/self/非 owner）、`!np` 命令不入库、edit/delete 处理、on_typing 推迟。
 
 ## 8. 部署

@@ -470,6 +470,21 @@ class Memory:
         row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (message_id,))
         return parse_dt(row["read_at"]) if row else None
 
+    async def batch_messages(self, conversation_id: str, upto_id: int) -> list[StoredMessage]:
+        """``upto_id`` 那一批的全部消息，按说话的先后。认批靠 ``read_at``，跟下面同一套。"""
+        row = await self._fetch_one("SELECT read_at FROM messages WHERE id = ?", (upto_id,))
+        stamp = row["read_at"] if row else None
+        if stamp is None:
+            return []
+        rows = await self._fetch_all(
+            "SELECT * FROM messages WHERE conversation_id = ? AND author_kind = 'user'"
+            " AND deleted = 0 AND id <= ? AND read_at = ?",
+            (conversation_id, upto_id, stamp),
+        )
+        found = [self._row_to_message(r) for r in rows]
+        found.sort(key=lambda m: (m.created_at, m.id))
+        return found
+
     async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
         """把**那一批**消息放回未读。
 
