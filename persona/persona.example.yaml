@@ -163,6 +163,13 @@ proactive:
   unanswered_decay: 0.35       # 主动开场没被回应，下次概率乘这个
   max_unanswered_per_day: 1
   quiet_days_before_callback: 3
+  ledger_max_follow_ups: 2     # 同一件事最多问几次
+  ledger_max_age_days: 45      # 多少天以前说的就不再回头问了
+  # 他说了时间的事，那之前不问。不是"避开他睡觉"，是"不在他说的时间之前问"。
+  ledger_timed:
+    grace_hours: [3, 10]       # 过了他说的时间再等多久才问
+    max_days_ahead: 30         # 比这还远就当没说，按类别周期走
+    follow_up_guard_hours: 12  # 记下这种计划前后半天里排的 follow_up 也不早于那时候
   kinds:
     - name: own_life
       weight: 40

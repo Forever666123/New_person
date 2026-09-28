@@ -2173,3 +2173,189 @@ async def test_a_reminder_that_fires_after_he_has_spoken_knows_it_may_be_stale(
 
     assert seen, "前提不成立：这条提醒根本没走到模型（她在睡觉？正热聊？）"
     assert seen[-1].he_spoke_since_noted, "他明明说过话了，提醒却不知道"
+
+
+# -- 他说了时间的事，那之前不问 ------------------------------------------------
+
+# 他那边 09-29 01:30（悉尼）= 她那边 09-28 11:30。她那天九点半就醒了。
+HIS_1_30 = datetime(2026, 9, 28, 11, 30, tzinfo=TZ)
+SYDNEY = ZoneInfo("Australia/Sydney")
+
+
+async def _deliver_one_reply(app: App, clock: FakeClock, memory: Memory) -> None:
+    """只把回复那一个任务跑掉，别的任务留在队列里。"""
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+
+
+async def test_his_morning_plan_is_not_asked_about_at_his_dawn(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """复现线上那一幕，走完整条路。
+
+    他凌晨一点半说"明天早上9点起来把回测跑完"。模型不听话：记了台账，
+    又顺手排了一个三小时后的 follow_up——按原来的算法，那就是他那边四点半。
+    现在：follow_up 被推到他说的时间加宽限之后；四点半排着的回访到点作废，
+    连模型都不调；过了时间（也过了这一类的周期）才问得出去。
+    """
+    from newperson.models import FollowUp, LedgerEntry
+
+    reply = ReplyPlan(
+        parts=[ReplyPart(text="行")],
+        ledger_entries=[
+            LedgerEntry(
+                kind="trading", claim="明天早上9点起来把回测跑完", when_there="09-29 09:00"
+            )
+        ],
+        follow_up=FollowUp(delay_minutes=180, note="问问他回测跑完没"),
+    )
+    ask = ProactivePlan(send=True, parts=[ReplyPart(text="回测跑完了没")])
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [reply, ask], now=HIS_1_30
+    )
+    assert not app.rhythm.is_sleeping(HIS_1_30), "前提不成立：她这会儿在睡"
+
+    await send(app, "我打算明天早上9点起来把回测跑完", at=HIS_1_30)
+    await _deliver_one_reply(app, clock, memory)
+    assert channel.texts == ["行"]
+
+    nine_there = datetime(2026, 9, 29, 9, 0, tzinfo=SYDNEY)
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    assert follow.run_at >= nine_there + timedelta(hours=3), (
+        f"follow_up 排在他那边 {follow.run_at.astimezone(SYDNEY):%m-%d %H:%M}"
+    )
+
+    # 另一条路：当天排好的回访正好落在他那边四点半
+    dawn = datetime(2026, 9, 29, 4, 30, tzinfo=SYDNEY).astimezone(TZ)
+    job_id = await app.scheduler.schedule(
+        "proactive", dawn, conversation_id=CONVERSATION_ID,
+        payload={"kind": "ledger_check", "note": "问一句他之前说要做的事"},
+        reason="ledger_check",
+    )
+    calls = len(llm.calls)
+    clock.set(dawn + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["行"], "他那边四点半就来问了"
+    assert len(llm.calls) == calls, "还没到时间，连模型都不该调"
+    assert (await memory.get_job(job_id)).status == "cancelled", "什么都没问，别记成做完"
+
+    # 过了他说的时间加宽限、也过了交易那一类两天的周期，才问
+    later = HIS_1_30 + timedelta(days=2, hours=2)
+    assert not app.rhythm.is_sleeping(later), "前提不成立：挑的时刻她在睡"
+    await memory.update_conversation(CONVERSATION_ID, deliverable=True)
+    await app.scheduler.schedule(
+        "proactive", later, conversation_id=CONVERSATION_ID,
+        payload={"kind": "ledger_check", "note": "问一句他之前说要做的事"},
+        reason="ledger_check",
+    )
+    for pending in await memory.pending_jobs("follow_up", CONVERSATION_ID):
+        await app.scheduler.cancel(pending.id or 0)
+    clock.set(later + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["行", "回测跑完了没"]
+    note = llm.calls[-1]["messages"][0]["content"]
+    assert "他那边 09-29 09:00（已经过了）" in note
+
+
+async def test_a_follow_up_waits_for_a_plan_noted_after_it(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """follow_up 先排上，带时间的计划下一条回复才记下——到点那一刻也要挡住。
+
+    排的时候看不见那条计划，只有发之前再查一次才拦得住。
+    """
+    from newperson.models import LedgerEntry
+
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 180, "问问他回测跑完没")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+
+    clock.set(HIS_1_30 + timedelta(minutes=10))
+    timing = app.life.resolve_when_there("09-29 09:00", clock.now())
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="明早九点跑回测", when_there="09-29 09:00")],
+        clock.now(),
+        [timing],
+    )
+
+    clock.set(follow.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == []
+    assert llm.calls == []
+    moved = await memory.get_job(follow.id or 0)
+    assert moved.status == "pending"
+    assert moved.run_at >= timing.ask_after
+    assert moved.attempts == 0, "推迟不是失败，别吃掉重试次数"
+
+
+async def test_the_prompt_says_not_yet_for_a_pending_timed_plan(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他九点之前自己来说话，回复的上下文里要明明白白写着"还没到，别问"。
+
+    回访那条路代码拦得住；回他消息这条路拦不住，只能靠这一段。
+    过了时间，这一段就不在了。
+    """
+    from newperson.models import LedgerEntry
+
+    app, _channel, llm, clock, memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="早")]), ReplyPlan(parts=[ReplyPart(text="嗯")])],
+        now=HIS_1_30,
+    )
+    timing = app.life.resolve_when_there("09-29 09:00", HIS_1_30)
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="明早九点跑回测", when_there="09-29 09:00")],
+        HIS_1_30,
+        [timing],
+    )
+
+    seven_there = datetime(2026, 9, 29, 7, 0, tzinfo=SYDNEY).astimezone(TZ)
+    clock.set(seven_there)
+    await send(app, "起了", at=seven_there, msg_id=11)
+    await _deliver_one_reply(app, clock, memory)
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert "他说了时间、还没到的" in prompt
+    assert "明早九点跑回测（他那边 09-29 09:00）" in prompt
+
+    after = timing.ask_after.astimezone(TZ) + timedelta(hours=1)
+    if app.rhythm.is_sleeping(after):
+        after = app.rhythm.next_wake_after(after) + timedelta(hours=1)
+    clock.set(after)
+    await send(app, "跑完了", at=after, msg_id=12)
+    await _deliver_one_reply(app, clock, memory)
+    assert "他说了时间、还没到的" not in llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_unread_lines_carry_his_clock(tmp_path: Path, persona: Persona) -> None:
+    """未读每一行都标着他那边几点。"明天"是相对他那一天说的。"""
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])], now=HIS_1_30
+    )
+    await send(app, "明早九点跑回测", at=HIS_1_30)
+    await _deliver_one_reply(app, clock, memory)
+    assert "[09-28 11:30｜他那边 09-29 01:30] 明早九点跑回测" in llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_the_ledger_command_shows_the_time_he_named(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她记下的时间对不对，他一眼就能核对。写错了往早的方向，就是凌晨被问。"""
+    from newperson.models import LedgerEntry
+    from newperson.owner import OwnerContext, handle
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [], now=HIS_1_30)
+    timing = app.life.resolve_when_there("09-29 09:00", HIS_1_30)
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="明早九点跑回测", when_there="09-29 09:00")],
+        HIS_1_30,
+        [timing],
+    )
+    ctx = OwnerContext(
+        memory=memory, rhythm=app.rhythm, scheduler=app.scheduler, life=app.life,
+        conversation_id=CONVERSATION_ID, now=HIS_1_30,
+    )
+    out = await handle("!np ledger trading", ctx)
+    assert "你说的时间：09-29 09:00" in out

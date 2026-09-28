@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import math
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,7 @@ from .models import (
     JobKind,
     JobStatus,
     LedgerEntry,
+    LedgerTiming,
     StoredMessage,
 )
 
@@ -90,7 +91,10 @@ CREATE TABLE IF NOT EXISTS ledger (
     created_at TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0,
     asked_at TEXT,
-    asked_count INTEGER NOT NULL DEFAULT 0
+    asked_count INTEGER NOT NULL DEFAULT 0,
+    when_there TEXT,
+    due_at TEXT,
+    ask_after TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_kind ON ledger(kind, resolved);
 
@@ -151,6 +155,15 @@ def parse_dt(raw: str | None) -> datetime | None:
     return datetime.fromisoformat(raw) if raw else None
 
 
+def utc_text(dt: datetime) -> str:
+    """存进库、拿来按字符串比较的时刻：统一 UTC、精确到秒。
+
+    带不同时区偏移的 ISO 串按字符串比是错的；有没有微秒也会让同一秒内的比较出错
+    （'.' 和 '+' 的字节序）。两样都抹平了，字符串序才等于时间序。
+    """
+    return dt.astimezone(UTC).isoformat(timespec="seconds")
+
+
 class Memory:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -192,7 +205,17 @@ class Memory:
         不可能推倒重来。每加一列就在这儿写一行，跑过就跳过。
         """
         wanted = {
-            "ledger": {"asked_at": "TEXT", "asked_count": "INTEGER NOT NULL DEFAULT 0"},
+            "ledger": {
+                "asked_at": "TEXT",
+                "asked_count": "INTEGER NOT NULL DEFAULT 0",
+                # 他说要在什么时候做：他那边的 MM-DD HH:MM（给人看），
+                # 换算成的 UTC 时刻，以及过了宽限、可以问的 UTC 时刻。
+                # **全存 UTC、精确到秒**：created_at 那种带她时区偏移的串
+                # 拿来互相比较，夏令时那一小时就会比错。
+                "when_there": "TEXT",
+                "due_at": "TEXT",
+                "ask_after": "TEXT",
+            },
             # 任务**真的执行完**是几点。`run_at` 记的是排期时刻，
             # 崩溃恢复之后那两个数差着几小时，而体检要看的恰恰是"一堆事挤在同一分钟发生"。
             "jobs": {"finished_at": "TEXT"},
@@ -219,6 +242,18 @@ class Memory:
                             " SELECT 'reply_batch_since', COALESCE(MAX(created_at), '')"
                             " FROM messages"
                         )
+                    if (table, name) == ("ledger", "ask_after"):
+                        # 旧版排下的 follow_up 一律作废，只在加这一列时做一次。
+                        # 那些多半是模型把他的计划当成自己的待办、按心算的分钟数排的，
+                        # 比他说的时间早——他凌晨说"明早九点做"，她四五点就来问。
+                        # 重启清不掉它们（六小时内的任务恢复时只会往后挪），
+                        # 分不清哪个是她自己答应的事，宁可一起放掉。
+                        cur = await self._db.execute(
+                            "UPDATE jobs SET status = 'cancelled'"
+                            " WHERE kind = 'follow_up' AND status IN ('pending', 'running')"
+                        )
+                        if cur.rowcount:
+                            log.info("[db] 旧版排下的 follow_up 作废 %d 个", cur.rowcount)
 
     async def close(self) -> None:
         if self._db is not None:
@@ -645,27 +680,109 @@ class Memory:
 
     # ---- 台账（用来对质） -------------------------------------------------
 
-    async def add_ledger_entries(self, entries: list[LedgerEntry], at: datetime) -> None:
+    async def add_ledger_entries(
+        self,
+        entries: list[LedgerEntry],
+        at: datetime,
+        timings: list[LedgerTiming | None] | None = None,
+    ) -> None:
         """记下他说过的话。同一件事重复说不占多个位置。
 
         他为一件事连发三条消息是常态，而每一条都入库的话，
         这件事就在回访队列里占了三个位置，被问三遍。
+
+        ``timings`` 跟 ``entries`` 按下标对齐：他说了时间、而且换算得出来的，
+        那之前不问。同一件事再说一遍又带了时间，**取两次里更晚的那个**——
+        写晚了只是问得晚，写早了就是凌晨被问"做了没"。
         """
-        for entry in entries:
-            if not entry.claim.strip():
+        for i, entry in enumerate(entries):
+            claim = entry.claim.strip()
+            if not claim:
                 continue
+            timing = timings[i] if timings is not None and i < len(timings) else None
+            # 存的也得是去掉首尾空白的那个。查的时候 strip、存的时候不 strip，
+            # 带个尾随空格的同一句话就能再进一行，被按周期再问一遍。
             dupe = await self._fetch_one(
-                "SELECT id FROM ledger WHERE kind = ? AND claim = ? AND resolved = 0",
-                (entry.kind, entry.claim.strip()),
+                "SELECT id, due_at, ask_after, asked_count FROM ledger"
+                " WHERE kind = ? AND claim = ? AND resolved = 0",
+                (entry.kind, claim),
             )
             if dupe is not None:
+                # 比的是他说的那个时间；宽限是随机抽的，拿它比会让更早的时间赢。
+                # 能问的时刻也只往后挪，不往前。
+                later = timing is not None and (
+                    dupe["due_at"] is None or utc_text(timing.due_at) > dupe["due_at"]
+                )
+                if later and timing is not None and int(dupe["asked_count"]) == 0:
+                    ask_after = utc_text(timing.ask_after)
+                    if dupe["ask_after"] is not None:
+                        ask_after = max(ask_after, dupe["ask_after"])
+                    await self.db.execute(
+                        "UPDATE ledger SET when_there = ?, due_at = ?, ask_after = ? WHERE id = ?",
+                        (timing.when_there, utc_text(timing.due_at), ask_after, int(dupe["id"])),
+                    )
                 continue
             await self.db.execute(
-                "INSERT INTO ledger (kind, claim, reason, committed_to, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (entry.kind, entry.claim, entry.reason, entry.committed_to, at.isoformat()),
+                "INSERT INTO ledger (kind, claim, reason, committed_to, created_at,"
+                " when_there, due_at, ask_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entry.kind,
+                    claim,
+                    entry.reason,
+                    entry.committed_to,
+                    at.isoformat(),
+                    timing.when_there if timing else None,
+                    utc_text(timing.due_at) if timing else None,
+                    utc_text(timing.ask_after) if timing else None,
+                ),
             )
         await self.db.commit()
+
+    @staticmethod
+    def _row_to_ledger(row: aiosqlite.Row) -> LedgerEntry:
+        return LedgerEntry(
+            kind=row["kind"],
+            claim=row["claim"],
+            reason=row["reason"],
+            committed_to=row["committed_to"],
+            when_there=row["when_there"] or "",
+        )
+
+    async def pending_timed(
+        self, now: datetime, limit: int = 5
+    ) -> list[tuple[int, datetime, LedgerEntry]]:
+        """他说了时间、还没到该问的时候的那几条。
+
+        代码只拦得住"回访"这一条路。她主动说自己的事、回他消息的时候，
+        上下文里有他的原话，模型顺口就会问一句"跑完没"——
+        能挡住那几条路的只有上下文里一句明明白白的"还没到"。
+        """
+        rows = await self._fetch_all(
+            "SELECT * FROM ledger WHERE resolved = 0 AND ask_after IS NOT NULL"
+            " AND ask_after > ? ORDER BY due_at LIMIT ?",
+            (utc_text(now), limit),
+        )
+        return [
+            (int(r["id"]), datetime.fromisoformat(r["due_at"]), self._row_to_ledger(r))
+            for r in rows
+        ]
+
+    async def latest_timed_ask_after(
+        self, now: datetime, since: datetime, until: datetime
+    ) -> datetime | None:
+        """``[since, until]`` 里记下的、还没到时间的计划里，最晚的那个"可以问了"的时刻。
+
+        follow_up 最早也得等到这时候——分不清它是不是在问那件事。
+        """
+        row = await self._fetch_one(
+            "SELECT MAX(ask_after) AS latest FROM ledger WHERE resolved = 0"
+            " AND ask_after IS NOT NULL AND ask_after > ?"
+            " AND created_at >= ? AND created_at <= ?",
+            (utc_text(now), since.isoformat(), until.isoformat()),
+        )
+        if row is None or not row["latest"]:
+            return None
+        return datetime.fromisoformat(row["latest"])
 
     async def due_ledger_entry(
         self,
@@ -684,13 +801,16 @@ class Memory:
         """
         cutoff = (now - timedelta(days=after_days)).isoformat()
         oldest = (now - timedelta(days=max_age_days)).isoformat()
+        # 他说了时间的，过了那个时间加宽限之前绝不入选。闸门写在 WHERE 里：
+        # 没到时间的那条不会挡住同一类里别的条目。
         row = await self._fetch_one(
             "SELECT * FROM ledger WHERE kind = ? AND resolved = 0"
             " AND asked_count < ?"
             " AND created_at >= ?"
             " AND COALESCE(asked_at, created_at) <= ?"
+            " AND (ask_after IS NULL OR ask_after <= ?)"
             " ORDER BY COALESCE(asked_at, created_at) LIMIT 1",
-            (kind, max_follow_ups, oldest, cutoff),
+            (kind, max_follow_ups, oldest, cutoff, utc_text(now)),
         )
         if row is None:
             return None
@@ -700,12 +820,7 @@ class Memory:
         return (
             int(row["id"]),
             datetime.fromisoformat(row["asked_at"] or row["created_at"]),
-            LedgerEntry(
-                kind=row["kind"],
-                claim=row["claim"],
-                reason=row["reason"],
-                committed_to=row["committed_to"],
-            ),
+            self._row_to_ledger(row),
         )
 
     async def mark_ledger_asked(self, entry_id: int, at: datetime) -> None:
@@ -742,10 +857,7 @@ class Memory:
             (
                 int(r["id"]),
                 datetime.fromisoformat(r["created_at"]),
-                LedgerEntry(
-                    kind=r["kind"], claim=r["claim"], reason=r["reason"],
-                    committed_to=r["committed_to"],
-                ),
+                self._row_to_ledger(r),
             )
             for r in rows
         ]
@@ -779,12 +891,7 @@ class Memory:
             (
                 int(r["id"]),
                 datetime.fromisoformat(r["created_at"]),
-                LedgerEntry(
-                    kind=r["kind"],
-                    claim=r["claim"],
-                    reason=r["reason"],
-                    committed_to=r["committed_to"],
-                ),
+                self._row_to_ledger(r),
             )
             for r in rows
         ]

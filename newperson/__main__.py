@@ -477,6 +477,8 @@ def cmd_ledger(args: argparse.Namespace) -> int:
                     print(f"{'':20}理由：{entry.reason}")
                 if entry.committed_to:
                     print(f"{'':20}你答应：{entry.committed_to}")
+                if entry.when_there:
+                    print(f"{'':20}你说的时间：{entry.when_there}（那之前她不会问）")
                 print()
             return 0
         finally:

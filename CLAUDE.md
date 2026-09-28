@@ -68,6 +68,12 @@ python -m newperson check                # 检查配置和人设
 6. **风格约束用预算不用开关。** 偶尔一个 emoji 是正常的，满屏才不正常。
    频率交给提示词描述，`style_guard` 只管上限。
    → `tests/test_style_guard.py` 整个文件
+7. **他说了时间的事，回访和 follow_up 不早于那个时间加宽限。**
+   模型只写他那边的 `MM-DD HH:MM`（`LedgerEntry.when_there`），换算和算术全在代码里：
+   按他的时区解析、在 `due_ledger_entry` 的 WHERE 里设闸，follow_up 排期时和发出前各挡一次。
+   代码只保证这两条路。她说自己的事、回他消息时顺口问一句，拦不住，
+   只靠上下文里"还没到"那一段——别把这条写成"那之前绝不问"。
+   → `test_she_never_asks_before_the_time_he_named`、`test_his_morning_plan_is_not_asked_about_at_his_dawn`
 
 还有一条不是不变量、但这几天反复咬人的经验：
 **合成的库测的是"我以为她怎么工作"。** 体检那两个计数器合成数据全过，

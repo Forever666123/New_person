@@ -95,6 +95,8 @@ class ReplyRequest:
     """台账那一段的小标题，跟着话题类别走。"""
     open_questions: list[tuple[int, datetime, LedgerEntry]] = field(default_factory=list)
     """她问过、还没听到下文的那几条。跟话题模式无关，永远带着。"""
+    not_yet: list[tuple[int, datetime, LedgerEntry]] = field(default_factory=list)
+    """他说了时间、还没到该问的时候的那几条。"""
 
 
 @dataclass
@@ -110,6 +112,8 @@ class ProactiveRequest:
     photos: list[Photo]
     he_spoke_since_noted: bool = False
     """这件事记下之后他又说过话。那样的话她要先看看他是不是已经答过了。"""
+    not_yet: list[tuple[int, datetime, LedgerEntry]] = field(default_factory=list)
+    """他说了时间、还没到该问的时候的那几条。"""
 
 
 @dataclass
@@ -371,6 +375,7 @@ class Brain:
             ledger=req.ledger,
             ledger_topic=req.ledger_topic,
             open_questions=req.open_questions,
+            not_yet=req.not_yet,
             mode_instruction=req.mode_instruction,
             recent=req.recent,
             unread=req.unread,
@@ -458,6 +463,7 @@ class Brain:
             unanswered_initiations=req.unanswered_initiations,
             photos=req.photos,
             he_spoke_since_noted=req.he_spoke_since_noted,
+            not_yet=req.not_yet,
         )
         plan = await self._call(ProactivePlan, prompt, purpose="proactive", today=today)
         if plan is None or not plan.send:

@@ -82,6 +82,11 @@ def time_of_day_at(dt: datetime) -> TimeOfDay:
     return "evening"
 
 
+def _said_at(unread: list) -> datetime | None:
+    """他这一批里最晚那句是几点说的。续发那条路上可能拿不到，就是 None。"""
+    return max((m.created_at for m in unread), default=None)
+
+
 class App:
     """组合根。所有任务的 handler 都挂在这里。"""
 
@@ -827,7 +832,7 @@ class App:
 
         if not reply_plan.parts and not reply_plan.reaction:
             log.info("[brain] 这条她不打算回")
-            await self._after_reply(reply_plan, now, sent_any=False)
+            await self._after_reply(reply_plan, now, sent_any=False, said_at=_said_at(unread))
             return
 
         await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
@@ -872,6 +877,7 @@ class App:
                 # 跟话题模式无关，永远带着：他回"跑完了"的时候那句话里
                 # 通常一个触发词都没有，模式匹配不上，她就没办法把这件事记成翻篇。
                 open_questions=await self.memory.open_questions(now),
+                not_yet=await self.memory.pending_timed(now),
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
                 unread=unread,
@@ -948,7 +954,9 @@ class App:
             # 不收的话，一次 403（你临时退了共同服务器、关了私信）之后
             # 她就永远只回话、再也不主动了——而回复照常，你根本不会发现。
             await self._mark_deliverable(True)
-        await self._after_reply(plan, now, sent_any=bool(result.sent_texts))
+        await self._after_reply(
+            plan, now, sent_any=bool(result.sent_texts), said_at=_said_at(unread)
+        )
 
         if result.interrupted:
             log.info("[delivery] 他又发了，剩下的不发了，重新排一次")
@@ -999,12 +1007,17 @@ class App:
                 result.photo_sent.photo_id, CONVERSATION_ID, now, result.photo_sent.is_fresh
             )
 
-    async def _after_reply(self, plan, now: datetime, sent_any: bool) -> None:
+    async def _after_reply(
+        self, plan, now: datetime, sent_any: bool, said_at: datetime | None = None
+    ) -> None:
+        """``said_at`` 是他这一批里最晚那句的时刻，"明早九点"就是相对它说的。"""
         day = self.rhythm.local_date(now)
         if plan.inner_note:
             await self.memory.add_diary_note(day, plan.inner_note, now)
         if plan.ledger_entries:
-            await self.memory.add_ledger_entries(plan.ledger_entries, now)
+            anchor = said_at or now
+            timings = [self.life.resolve_when_there(e.when_there, anchor) for e in plan.ledger_entries]
+            await self.memory.add_ledger_entries(plan.ledger_entries, now, timings)
         if plan.resolved_ledger_ids:
             closed = await self.memory.resolve_ledger(plan.resolved_ledger_ids)
             if closed:
@@ -1086,6 +1099,17 @@ class App:
 
         day = self.rhythm.local_date(now)
         kind = job.payload.get("kind", "own_life")
+        if kind == "follow_up" and job.created_at:
+            # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
+            # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
+            hold = await self.life.follow_up_hold(now, job.created_at)
+            if hold is not None:
+                log.info(
+                    "[proactive] 这个 follow_up 比他说的时间还早，推到 %s",
+                    hold.strftime("%m-%d %H:%M"),
+                )
+                await self.scheduler.defer(job.id or 0, hold)
+                return
         if not await self.life.can_initiate_today(CONVERSATION_ID, day):
             log.info("[proactive] 今天已经主动过而且他没回，不追了")
             return
@@ -1114,7 +1138,10 @@ class App:
         if job.payload.get("kind") == LEDGER_CHECK:
             ledger_ref = await self.life.due_ledger_entry(now)
             if ledger_ref is None:
+                # 记成作废，不是做完：什么都没问的任务算进体检的"办事型"里，
+                # 那个占比就虚高了。
                 log.info("[proactive] 本来要问一句，但已经没有到期的承诺了")
+                await self.scheduler.cancel(job.id or 0)
                 return
             _entry_id, _kind, entry = ledger_ref
             note = f"{note}\n他当时说的是：{entry.claim}"
@@ -1122,6 +1149,9 @@ class App:
                 note += f"\n他给的理由：{entry.reason}"
             if entry.committed_to:
                 note += f"\n他答应要做的：{entry.committed_to}"
+            if entry.when_there:
+                # 不带上的话，claim 里那句"明天早上"她会当成还没到。
+                note += f"\n他说的时间：他那边 {entry.when_there}（已经过了）"
 
         # 这件事记下之后他说过话没有。说过的话，那条记下的"要问他的事"可能已经过时了——
         # 他也许早就答了。只在 follow_up 和回访这两种"问他事情"的主动上提醒她。
@@ -1142,6 +1172,7 @@ class App:
                 unanswered_initiations=conv.unanswered_initiations,
                 photos=photos,
                 he_spoke_since_noted=he_spoke_since,
+                not_yet=await self.memory.pending_timed(now),
             ),
             day,
         )

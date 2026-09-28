@@ -254,6 +254,9 @@ async def _ledger(args: list[str], ctx: OwnerContext) -> str:
             line += f"\n　　理由：{entry.reason}"
         if entry.committed_to:
             line += f"\n　　你答应：{entry.committed_to}"
+        if entry.when_there:
+            # 她记下的时间对不对，一眼就能核对。写错了往早的方向，就是凌晨被问。
+            line += f"\n　　你说的时间：{entry.when_there}（那之前她不会问）"
         lines.append(line)
     return "\n".join(lines)
 

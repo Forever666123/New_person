@@ -16,19 +16,23 @@ from __future__ import annotations
 
 import logging
 import random
-from datetime import date, datetime, time, timedelta
+import re
+from datetime import UTC, date, datetime, time, timedelta
 
 from .brain import Brain, DayPlanRequest
 from .calendar import AcademicCalendar
 from .clock import Clock
 from .memory import Memory
-from .models import DayPlan, Job, LedgerEntry, PlanEvent
+from .models import DayPlan, Job, LedgerEntry, LedgerTiming, PlanEvent
 from .persona import OpenerConfig, Persona, ProactiveKind, parse_hhmm
 from .rhythm import Rhythm
 from .scheduler import Scheduler
 
 LEDGER_CHECK = "ledger_check"
 """回访台账的那种主动消息的名字。代码里要认它，所以不能只写在 yaml 里。"""
+
+_WHEN_THERE = re.compile(r"\s*(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})\s*")
+"""模型写的"他那边的时间"：MM-DD HH:MM。别的写法一律不认，退回按周期问。"""
 
 OPENER_KEY = "opener"
 """排过开场没有。同时用作任务的去重键，所以它天然只会排上一次。"""
@@ -468,6 +472,87 @@ class LifeEngine:
                 count += 1
         return count
 
+    def resolve_when_there(self, raw: str, said_at: datetime) -> LedgerTiming | None:
+        """把模型写的"他那边 MM-DD HH:MM"换算成真实时刻，再抽一段宽限。
+
+        **分工是模型读钟、代码做算术。** 这次的 bug 就出在让模型心算
+        "还有多少分钟"：它要同时换算她的钟、他的钟和"明天早上"，普遍算短，
+        于是他凌晨一两点说"明早九点做"，她四五点就来问。
+
+        锚点是**他说这句话的时候**，不是她回复的时候：她睡了一夜才回，
+        "09:00"对回复时刻已经过去，对他开口那一刻仍是将来。
+
+        换算不出来（写法不对、没配他的时区、在他开口之前、远得离谱）就返回 None，
+        这条退回按类别周期问——一个坏值卡不住整条台账。
+        """
+        tz = self.persona.owner_tz
+        if not raw or not raw.strip() or tz is None:
+            return None
+        cfg = self.persona.proactive.ledger_timed
+        match = _WHEN_THERE.fullmatch(raw)
+        if match is None:
+            log.warning("[ledger] 他说的时间写法认不出（%s），按周期问", raw[:40])
+            return None
+        month, day, hour, minute = (int(g) for g in match.groups())
+        said = said_at.astimezone(UTC)
+        said_there = said_at.astimezone(tz)
+        best: datetime | None = None
+        # 跨年："12-31 说 01-01"是明年的一月一号。取离他开口最近的那一年。
+        for year in (said_there.year - 1, said_there.year, said_there.year + 1):
+            try:
+                wall = datetime(year, month, day, hour, minute, tzinfo=tz)
+            except ValueError:
+                continue
+            # 夏令时跳过或重复的那一小时，两种理解取**更晚**的：写晚了只是问得晚。
+            # 比较一律换到 UTC——同一个 tzinfo 的两个时刻相减时 Python 按墙钟算，
+            # 会把重复的那一小时算丢。
+            moment = max(
+                wall.replace(fold=0).astimezone(UTC), wall.replace(fold=1).astimezone(UTC)
+            )
+            if best is None or abs(moment - said) < abs(best - said):
+                best = moment
+        if best is None:
+            log.warning("[ledger] 他说的时间不存在（%s），按周期问", raw[:40])
+            return None
+        if best <= said:
+            # 在他开口之前——多半是进展（"我九点就在跑了"），不是计划。
+            return None
+        if best - said > timedelta(days=cfg.max_days_ahead):
+            log.warning("[ledger] 他说的时间远得离谱（%s），按周期问", raw[:40])
+            return None
+        lo, hi = cfg.grace_hours
+        grace = timedelta(hours=self.rng.uniform(lo, max(lo, hi)))
+        return LedgerTiming(
+            when_there=best.astimezone(tz).strftime("%m-%d %H:%M"),
+            due_at=best,
+            ask_after=best + grace,
+        )
+
+    def _awake_at_or_after(self, moment: datetime) -> datetime:
+        """这一刻她要是在睡，就挪到她醒来之后第一次看手机。"""
+        if self.rhythm.is_sleeping(moment):
+            return self.rhythm.first_glance_after_waking(
+                self.rhythm.next_wake_after(moment), self.rng
+            )
+        return moment
+
+    async def follow_up_hold(self, now: datetime, noted_at: datetime) -> datetime | None:
+        """这个 follow_up 最早能在什么时候发。不用等就返回 None。
+
+        ``noted_at`` 前后 ``follow_up_guard_hours`` 里记下的、他说了时间的计划，
+        过了宽限之前她都不发 follow_up——分不清它是不是就在问那件事。
+        窗口两头都要有边：只有下限的话，被推迟过的 follow_up 会被几天后
+        一件不相干的新计划再拖住。
+        """
+        guard = timedelta(hours=self.persona.proactive.ledger_timed.follow_up_guard_hours)
+        hold = await self.memory.latest_timed_ask_after(
+            now, since=noted_at - guard, until=noted_at + guard
+        )
+        if hold is None or hold <= now:
+            return None
+        # 库里存的是 UTC。排任务之前换回她的钟，跟队列里别的任务写法一致。
+        return self._awake_at_or_after(hold.astimezone(now.tzinfo))
+
     async def schedule_follow_up(self, conversation_id: str, delay_minutes: int, note: str) -> int:
         """她说了"我查完告诉你"，就真的要记得回来说。
 
@@ -479,11 +564,17 @@ class LifeEngine:
         if await self.memory.pending_jobs("follow_up", conversation_id):
             log.info("[life] 已经有一个 follow_up 排着了，这个不排")
             return 0
-        run_at = self.clock.now() + timedelta(minutes=delay_minutes * self.scheduler.delay_scale)
-        if self.rhythm.is_sleeping(run_at):
-            run_at = self.rhythm.first_glance_after_waking(
-                self.rhythm.next_wake_after(run_at), self.rng
+        now = self.clock.now()
+        run_at = now + timedelta(minutes=delay_minutes * self.scheduler.delay_scale)
+        # 他刚说了带时间的计划的话，这个 follow_up 不能比那件事该问的时候还早。
+        # 靠提示词让模型别把他的计划塞进来是请求，不是约束。
+        hold = await self.follow_up_hold(now, now)
+        if hold is not None and hold > run_at:
+            log.info(
+                "[life] 这个 follow_up 比他说的时间还早，推到 %s", hold.strftime("%m-%d %H:%M")
             )
+            run_at = hold
+        run_at = self._awake_at_or_after(run_at)
         return await self.scheduler.schedule(
             "follow_up",
             run_at,

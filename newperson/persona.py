@@ -371,6 +371,29 @@ class OpenerConfig(BaseModel):
     """给模型的指示。重点是把"打招呼"那条路堵死。"""
 
 
+class LedgerTimedConfig(BaseModel):
+    """他说了时间的事（"明早 9 点起来做完"），什么时候才能问。
+
+    管的是"**不在他说的时间之前问**"，不是"避开他睡觉"——
+    人设里写着她不迁就他的作息。
+    """
+
+    grace_hours: tuple[float, float] = (3.0, 10.0)
+    """过了他说的时间，再等多久才算"该问了"。每条抽一次。
+
+    一过九点就来问"跑完没"，那是闹钟不是人。
+    """
+    max_days_ahead: float = 30.0
+    """他说的时间比这还远，就当没说，按类别周期走。多半是读错了钟。"""
+    follow_up_guard_hours: float = 12.0
+    """记下带时间的计划前后这么久里排的 follow_up，最早也要等到那件事该问的时候。
+
+    模型不听话时会把他的计划塞进 follow_up，分钟数又是它心算的，
+    普遍偏早——他凌晨一两点说"明早九点做"，她四五点就来问。
+    分不清那个 follow_up 是不是在问这件事，所以宁可让她自己答应的事晚一点。
+    """
+
+
 class ProactiveConfig(BaseModel):
     day_probability: float = 0.4
     """今天她到底会不会主动开口。
@@ -393,6 +416,8 @@ class ProactiveConfig(BaseModel):
     """同一条承诺最多追问几次。问过就得放下，不然她成了催办机器人。"""
     ledger_max_age_days: float = 45.0
     """多久以前的承诺就不再提了。三个月前那句话，正常人早就翻篇了。"""
+    ledger_timed: LedgerTimedConfig = Field(default_factory=lambda: LedgerTimedConfig())
+    """他说了时间的事，那之前不问。"""
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +594,22 @@ def validate_persona(persona: Persona) -> list[tuple[Severity, str]]:
             issues.append(
                 ("warning", f"模式 {mode.name} 有 ledger_kind 但没打开 include_ledger：聊到时看不见旧账")
             )
+    timed = persona.proactive.ledger_timed
+    lo, hi = timed.grace_hours
+    if lo < 1:
+        issues.append(
+            ("warning", "ledger_timed.grace_hours 下限不到 1 小时：一过他说的点就来问，那是闹钟不是人")
+        )
+    if hi < lo:
+        issues.append(("error", "ledger_timed.grace_hours 要写成 [下限, 上限]"))
+    if timed.max_days_ahead + hi / 24 >= persona.proactive.ledger_max_age_days:
+        issues.append(
+            (
+                "warning",
+                "ledger_timed.max_days_ahead 加上宽限超过了 ledger_max_age_days："
+                "远一点的事还没到时间，就先被当成太老丢掉了",
+            )
+        )
     seen: dict[str, str] = {}
     for mode in persona.modes:
         for trigger in mode.triggers:

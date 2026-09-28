@@ -121,6 +121,12 @@ _OUTPUT_RULES = """
   `kind` 从这几个里挑一个：trading（仓位、止损、回测）、study（课业、考试、deadline）、
   shift（便利店排班）、project（他在写的东西）、english（英语练习）、sleep（作息）。
   都不沾边就不用记。
+
+  `when_there` 是他说要做（或做完）这件事的时间，**按他那边的钟**写成 `MM-DD HH:MM`。
+  上下文里"他那边是 …"和他每条消息旁边标的"他那边"，就是那个钟。
+  他凌晨说"明天早上"，一般是指睡醒之后的这个早上。只说了哪天就写那天 23:59。
+  没说时间就留空。拿不准的时候宁可写晚，别写早。
+  到了那个时间之前，不会让你去问他这件事，你不用自己算还有多久。
 - `resolved_ledger_ids` 放那些他这次给了下文的条目编号（上下文里的 `#12` 那个数）。
   做了、没做、改主意了、不打算做了——**都算有下文**，都要放进去。
   放进去之后你就不会再问它了。他没提到的条目别放。
@@ -153,13 +159,22 @@ def format_messages(messages: list[StoredMessage], persona: Persona) -> str:
 
 
 def format_unread(messages: list[StoredMessage], persona: Persona) -> str:
-    """未读消息带序号，方便她用 ``reply_to_index`` 引用某一条。"""
+    """未读消息带序号，方便她用 ``reply_to_index`` 引用某一条。
+
+    每条再标上**他那边**是几点。他说"明天早上"是相对他那一天说的，
+    而她常常睡了一夜才回——只有她的钟的话，"明天"指哪天最容易算错。
+    """
+    owner_tz = persona.owner_tz
     lines = []
     for i, msg in enumerate(messages):
         text = msg.content.strip()
         if msg.attachments:
             text = f"{text} [图片]".strip()
-        lines.append(f"{i}. [{msg.created_at.strftime('%m-%d %H:%M')}] {text}")
+        stamp = msg.created_at.strftime("%m-%d %H:%M")
+        if owner_tz is not None:
+            there = msg.created_at.astimezone(ZoneInfo(str(owner_tz)))
+            stamp += f"｜他那边 {there.strftime('%m-%d %H:%M')}"
+        lines.append(f"{i}. [{stamp}] {text}")
     return "\n".join(lines)
 
 
@@ -184,7 +199,25 @@ def format_ledger(entries: list[tuple[int, datetime, LedgerEntry]]) -> str:
             line += f"（理由：{entry.reason}）"
         if entry.committed_to:
             line += f"（他答应：{entry.committed_to}）"
+        if entry.when_there:
+            line += f"（他说的时间：他那边 {entry.when_there}）"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def format_not_yet(entries: list[tuple[int, datetime, LedgerEntry]] | None) -> str:
+    """他说了时间、还没到该问的时候的那几条。
+
+    代码只拦得住"回访"那一条路。她说自己的事、回他消息的时候，
+    上下文里有他的原话，模型顺口就会问一句"跑完没"。能挡住的只有这一段。
+    """
+    if not entries:
+        return ""
+    lines = [
+        f"- [#{entry_id}] {entry.claim}（他那边 {entry.when_there}）"
+        for entry_id, _due, entry in entries
+    ]
+    lines.append("这些还没到时间，别问他做了没有。他自己提起来的话照常接。")
     return "\n".join(lines)
 
 
@@ -258,6 +291,7 @@ def build_reply_user(
     ledger: list[tuple[datetime, LedgerEntry]],
     ledger_topic: str = "",
     open_questions: list[tuple[int, datetime, LedgerEntry]] | None = None,
+    not_yet: list[tuple[int, datetime, LedgerEntry]] | None = None,
     mode_instruction: str,
     recent: list[StoredMessage],
     unread: list[StoredMessage],
@@ -293,6 +327,9 @@ def build_reply_user(
         blocks.append(
             _section(f"他之前{ledger_topic or '说过的话'}", f"{ledger_text}\n对不上的时候，直接翻出来问他。")
         )
+    not_yet_text = format_not_yet(not_yet)
+    if not_yet_text:
+        blocks.append(_section("他说了时间、还没到的", not_yet_text))
     if mode_instruction:
         blocks.append(_section("这次的话题", mode_instruction))
     if recent:
@@ -323,6 +360,7 @@ def build_proactive_user(
     unanswered_initiations: int,
     photos: list[Photo],
     he_spoke_since_noted: bool = False,
+    not_yet: list[tuple[int, datetime, LedgerEntry]] | None = None,
 ) -> str:
     """她主动开口。"""
     blocks = [_section("此刻", situation)]
@@ -335,6 +373,9 @@ def build_proactive_user(
         blocks.append(_section("你自己说过的", "\n".join(f"- {f}" for f in self_facts)))
     if recent:
         blocks.append(_section("最近的对话", format_messages(recent, persona)))
+    not_yet_text = format_not_yet(not_yet)
+    if not_yet_text:
+        blocks.append(_section("他说了时间、还没到的", not_yet_text))
 
     context = [trigger_note]
     if he_spoke_since_noted:

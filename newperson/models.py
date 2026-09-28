@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field
 
@@ -218,6 +218,24 @@ class LedgerEntry(BaseModel):
     claim: str = Field(description="他说了什么。用他自己的话。")
     reason: str = Field(default="", description="他给的理由，如果有。")
     committed_to: str = Field(default="", description="他答应要做的事，如果有。")
+    when_there: str = Field(
+        default="",
+        description=(
+            "他说要在什么时候做（或做完），按他那边的钟写成 MM-DD HH:MM。"
+            "只说了哪天就写那天 23:59。没说时间就留空，别猜。"
+        ),
+    )
+
+
+class LedgerTiming(NamedTuple):
+    """他说的那个时间，换算好的。代码算，不让模型算。"""
+
+    when_there: str
+    """他那边的 MM-DD HH:MM，给人和模型看。"""
+    due_at: datetime
+    """他说的那一刻。"""
+    ask_after: datetime
+    """过了宽限、可以问的那一刻。"""
 
 
 class ReplyPart(BaseModel):
@@ -238,10 +256,10 @@ class PhotoRequest(BaseModel):
 
 
 class FollowUp(BaseModel):
-    """稍后要主动跟进的事。"""
+    """你自己答应过、稍后要回来说的事。他的计划不放这里，记进 ledger_entries。"""
 
     delay_minutes: int = Field(ge=1, le=60 * 24 * 7)
-    note: str = Field(description="到时候要说什么。")
+    note: str = Field(description="到时候要说什么。只写你自己答应过的事。")
 
 
 class ReplyPlan(BaseModel):

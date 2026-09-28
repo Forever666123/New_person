@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,7 +20,7 @@ from newperson.calendar import AcademicCalendar
 from newperson.clock import FakeClock
 from newperson.life import LEDGER_CHECK, LifeEngine
 from newperson.memory import Memory
-from newperson.models import LedgerEntry
+from newperson.models import Job, LedgerEntry
 from newperson.persona import Persona
 from newperson.rhythm import Rhythm
 from newperson.scheduler import Scheduler
@@ -476,3 +477,275 @@ def test_the_low_mood_mode_does_not_steer_back_to_his_tasks(persona: Persona) ->
     # 但也不能变成心理咨询：那几条"不要"还得在
     for still_banned in ("不讲道理", "不给建议清单", "不问"):
         assert still_banned in mode.instruction
+
+
+# -- 他说了时间的事，那之前不问 ------------------------------------------------
+#
+# 线上真出过：他凌晨一两点说"明早九点起来把它做完"，她清晨四五点就来问做了没有。
+# 分钟数是模型心算的，要同时换算她的钟、他的钟和"明天早上"，普遍算短。
+# 现在的分工是模型只读钟（写下他那边的 MM-DD HH:MM），代码做换算、设闸门。
+
+SYDNEY = ZoneInfo("Australia/Sydney")
+
+
+def _his(month: int, day: int, hour: int, minute: int = 0, year: int = 2026) -> datetime:
+    return datetime(year, month, day, hour, minute, tzinfo=SYDNEY)
+
+
+async def test_she_never_asks_before_the_time_he_named(tmp_path: Path, persona: Persona) -> None:
+    """他睡前说明早九点做，那之前（加上宽限）这条绝不入选回访。
+
+    周期故意设成 0，只看闸门：他那边 04:30、08:59、09:00、宽限结束前一分钟都不行，
+    到了宽限结束才行。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 29, 1, 30).astimezone(persona.tz)
+        timing = life.resolve_when_there("09-29 09:00", said)
+        assert timing is not None
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="trading", claim="明天早上9点起来把回测跑完", when_there="09-29 09:00")],
+            said,
+            [timing],
+        )
+        for too_early in (
+            _his(9, 29, 4, 30),
+            _his(9, 29, 8, 59),
+            _his(9, 29, 9, 0),
+            timing.ask_after - timedelta(minutes=1),
+        ):
+            assert await memory.due_ledger_entry("trading", too_early, 0) is None, (
+                f"他那边 {too_early.astimezone(SYDNEY):%H:%M} 就入选了"
+            )
+        found = await memory.due_ledger_entry("trading", timing.ask_after, 0)
+        assert found is not None and found[2].claim == "明天早上9点起来把回测跑完"
+    finally:
+        await memory.close()
+
+
+async def test_a_named_time_is_read_on_his_clock_not_hers(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """"09-29 09:00"是他那边的九点，不是她那边的。按她的钟理解会差十四个小时。"""
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        timing = life.resolve_when_there("09-29 09:00", _his(9, 29, 1, 30))
+        assert timing is not None
+        assert timing.due_at == datetime(2026, 9, 28, 23, 0, tzinfo=UTC)
+        assert timing.when_there == "09-29 09:00"
+    finally:
+        await memory.close()
+
+
+async def test_his_daylight_saving_switch_is_respected(tmp_path: Path, persona: Persona) -> None:
+    """悉尼 10-04 凌晨拨快一小时。换算要按那一天的偏移，不能拿"现在的偏移"去算。
+
+    跳过的那一小时（02:30 不存在）不能抛异常，两种理解取更晚的那个。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(10, 3, 20, 0)
+        timing = life.resolve_when_there("10-04 09:00", said)
+        assert timing is not None
+        assert timing.due_at == datetime(2026, 10, 3, 22, 0, tzinfo=UTC)
+        gap = life.resolve_when_there("10-04 02:30", said)
+        assert gap is not None
+        assert gap.due_at == datetime(2026, 10, 3, 16, 30, tzinfo=UTC)
+    finally:
+        await memory.close()
+
+
+async def test_a_named_time_rolls_over_the_new_year(tmp_path: Path, persona: Persona) -> None:
+    """除夕晚上说"01-01 09:00"，是明年的一月一号。"""
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        timing = life.resolve_when_there("01-01 09:00", _his(12, 31, 22, 0))
+        assert timing is not None
+        assert timing.due_at == datetime(2026, 12, 31, 22, 0, tzinfo=UTC)
+    finally:
+        await memory.close()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["明天早上", "13-40 25:00", "02-30 09:00", "09-28 09:00", "12-25 09:00", "9点", ""],
+)
+async def test_a_bad_time_falls_back_to_the_category_cycle(
+    tmp_path: Path, persona: Persona, raw: str
+) -> None:
+    """写法不对、日子不存在、在他开口之前、远得离谱——统统当没说，按类别周期问。
+
+    一个坏值卡不住整条台账：这条照样在周期之后到期，不早也不卡死。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 29, 1, 30)
+        assert life.resolve_when_there(raw, said) is None
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="trading", claim="回测", when_there=raw)], said, [None]
+        )
+        assert await memory.due_ledger_entry("trading", said + timedelta(days=1), 2) is None
+        assert await memory.due_ledger_entry("trading", said + timedelta(days=2, minutes=1), 2)
+    finally:
+        await memory.close()
+
+
+async def test_a_timed_entry_does_not_shadow_the_rest_of_its_kind(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """同一类里一条还没到时间的，不能把早就到期的另一条挡住。"""
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 29, 1, 30)
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="trading", claim="老的那件")], said - timedelta(days=5)
+        )
+        far = life.resolve_when_there("10-10 09:00", said)
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="trading", claim="还没到的", when_there="10-10 09:00")],
+            said - timedelta(days=6),
+            [far],
+        )
+        found = await memory.due_ledger_entry("trading", said, 2)
+        assert found is not None and found[2].claim == "老的那件"
+    finally:
+        await memory.close()
+
+
+async def test_a_far_off_deadline_is_not_asked_about_before_it_arrives(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """周一说"下周五交"。课业四天一个周期，周期先到了，截止还没到——不问。"""
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 28, 20, 0)
+        timing = life.resolve_when_there("10-09 23:59", said)
+        assert timing is not None
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="study", claim="下周五交作业", when_there="10-09 23:59")],
+            said,
+            [timing],
+        )
+        assert await life.due_ledger_entry(said + timedelta(days=5)) is None
+        assert await life.due_ledger_entry(_his(10, 9, 15, 0)) is None
+        found = await life.due_ledger_entry(timing.ask_after + timedelta(minutes=1))
+        assert found is not None and found[2].claim == "下周五交作业"
+    finally:
+        await memory.close()
+
+
+async def test_she_does_not_ask_the_moment_the_clock_strikes(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """过了他说的时间也不是一到点就问：宽限至少三小时，而且每条不一样。
+
+    跟"起床时间要分散"是一回事——准点就是闹钟。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        graces = []
+        for seed in range(50):
+            life.rng = random.Random(seed)
+            timing = life.resolve_when_there("09-29 09:00", _his(9, 29, 1, 30))
+            assert timing is not None
+            graces.append((timing.ask_after - timing.due_at).total_seconds() / 3600)
+        lo, hi = persona.proactive.ledger_timed.grace_hours
+        assert min(graces) >= lo >= 1
+        assert max(graces) <= hi
+        assert len({round(g, 2) for g in graces}) > 40, "宽限几乎都一样，那还是闹钟"
+    finally:
+        await memory.close()
+
+
+async def test_saying_it_again_keeps_the_later_time(tmp_path: Path, persona: Persona) -> None:
+    """同一件事再说一遍又带了时间，取更晚的那个。
+
+    写晚了只是问得晚，写早了就是凌晨被问——模型第二次读错钟，不能把时间往前挪。
+    问过一次的条目，时间就不动了。尾随空格不算另一件事。
+    """
+    life, memory, _clock, _now = await build(tmp_path, persona)
+    try:
+        said = _his(9, 29, 1, 30)
+        nine = life.resolve_when_there("09-29 09:00", said)
+        seven = life.resolve_when_there("09-29 07:00", said)
+        noon = life.resolve_when_there("09-29 12:00", said)
+        claim = "明早把回测跑完"
+        await memory.add_ledger_entries([LedgerEntry(kind="trading", claim=claim)], said, [nine])
+        await memory.add_ledger_entries(
+            [LedgerEntry(kind="trading", claim=claim + " ")], said, [seven]
+        )
+        rows = await memory.ledger("trading")
+        assert len(rows) == 1, "带个尾随空格就又进了一行"
+        assert rows[0][2].when_there == "09-29 09:00", "第二次写得更早，时间被往前挪了"
+        await memory.add_ledger_entries([LedgerEntry(kind="trading", claim=claim)], said, [noon])
+        assert (await memory.ledger("trading"))[0][2].when_there == "09-29 12:00"
+    finally:
+        await memory.close()
+
+
+async def test_an_old_ledger_table_gets_the_time_columns(tmp_path: Path) -> None:
+    """已经在用的库补上三列，旧行照旧按周期问；旧版排下的 follow_up 一次性作废。
+
+    那些 follow_up 多半就是"凌晨来问做了没"的那种，重启清不掉它们。
+    别的任务一个都不能碰。
+    """
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    memory = Memory(path)
+    await memory.open()
+    at = datetime(2026, 9, 20, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+    await memory.add_ledger_entries([LedgerEntry(kind="trading", claim="旧账")], at)
+    follow = await memory.add_job(Job(kind="follow_up", run_at=at + timedelta(hours=3)), at)
+    reply = await memory.add_job(Job(kind="reply", run_at=at + timedelta(hours=3)), at)
+    await memory.close()
+
+    conn = sqlite3.connect(path)
+    for col in ("when_there", "due_at", "ask_after"):
+        conn.execute(f"ALTER TABLE ledger DROP COLUMN {col}")
+    conn.commit()
+    conn.close()
+
+    memory = Memory(path)
+    await memory.open()
+    try:
+        cur = await memory.db.execute("PRAGMA table_info(ledger)")
+        names = {row[1] for row in await cur.fetchall()}
+        assert {"when_there", "due_at", "ask_after"} <= names
+        kept = await memory.ledger("trading")
+        assert len(kept) == 1 and kept[0][2].when_there == ""
+        assert await memory.due_ledger_entry("trading", at + timedelta(days=3), 2)
+        assert (await memory.get_job(follow)).status == "cancelled"
+        assert (await memory.get_job(reply)).status == "pending"
+    finally:
+        await memory.close()
+
+
+def test_the_output_rules_explain_when_there(persona: Persona) -> None:
+    """字段加了但没人讲怎么用，等于没加。按他的钟写、宁可写晚——两样都要讲到。"""
+    from newperson.models import ReplyPlan
+    from newperson.prompts import build_system
+
+    text = build_system(persona)
+    assert "when_there" in text
+    assert "他那边" in text
+    assert "宁可写晚" in text
+    schema = ReplyPlan.model_json_schema()
+    assert schema["$defs"]["LedgerEntry"]["properties"]["when_there"]["description"]
+
+
+def test_check_warns_when_the_grace_is_zero_or_the_window_outlives_the_ledger(
+    persona: Persona,
+) -> None:
+    """一过点就问，或者远一点的事还没到时间就先被当成太老丢掉——都要当场喊出来。"""
+    from newperson.persona import validate_persona
+
+    zero = persona.model_copy(deep=True)
+    zero.proactive.ledger_timed.grace_hours = (0.0, 1.0)
+    assert any("闹钟" in msg for _lvl, msg in validate_persona(zero))
+
+    long = persona.model_copy(deep=True)
+    long.proactive.ledger_timed.max_days_ahead = 60
+    assert any("太老" in msg for _lvl, msg in validate_persona(long))
+
+    assert not any("ledger_timed" in msg for _lvl, msg in validate_persona(persona))
