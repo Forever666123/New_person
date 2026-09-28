@@ -2576,6 +2576,8 @@ async def test_his_message_does_not_turn_her_green(tmp_path: Path, persona: Pers
     assert channel.texts == ["嗯"]
     assert client.presence._online_until is not None, "她回消息的时候也没亮"
     assert client.presence._online_until > job.run_at
+    # 而且是**马上**亮的，不是等下一轮一分钟的循环：不然气泡总比绿灯先到
+    assert client.presence._current is not None and client.presence._current[0] == "online"
 
 
 async def test_her_promise_is_not_dropped_when_they_are_mid_chat(
@@ -2624,10 +2626,56 @@ async def test_her_promise_rides_along_with_the_reply_she_is_about_to_send(
 
     clock.set(follow.run_at + timedelta(seconds=1))
     await app.scheduler.run_due_once()
-    assert (await memory.get_job(follow.id or 0)).status == "cancelled"
-    await drain(app, clock)
+    # 并进去了，但回复还没说出口之前不作废
+    assert (await memory.get_job(follow.id or 0)).status == "pending"
+    reply_job = await memory.get_job(reply.id or 0)
+    clock.set(reply_job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
     prompt = llm.calls[-1]["messages"][0]["content"]
     assert "你之前答应过他的事，这次顺便说：告诉他查到的那个参数是0.3" in prompt
+    assert (await memory.get_job(follow.id or 0)).status == "cancelled", "说出口了还留着，会再说一遍"
+
+
+async def test_a_merged_promise_survives_a_reply_that_says_nothing(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """并进回复之后，回复却什么都没发（他那句是"好"，她不打算接）：承诺还在，到点照说。"""
+    app, _channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[])]
+    )
+    clock.set(EVENING)
+    await app.life.schedule_follow_up(CONVERSATION_ID, 30, "告诉他查到的参数")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    at = follow.run_at - timedelta(seconds=5)
+    clock.set(at)
+    await send(app, "好", at=at, msg_id=654)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, follow.run_at + timedelta(minutes=5))
+    clock.set(follow.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    reply_job = await memory.get_job(reply.id or 0)
+    clock.set(reply_job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(follow.id or 0)).status == "pending", "回复没说出口，承诺却没了"
+
+
+async def test_a_deferred_promise_survives_a_restart(tmp_path: Path, persona: Persona) -> None:
+    """她答应的事睡着时被挪到早上，中间重启一次：不能按最初那个时刻判成"停机太久"作废。"""
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    night = EVENING
+    while not app.rhythm.is_sleeping(night):
+        night += timedelta(minutes=30)
+    clock.set(night - timedelta(minutes=40))
+    await app.life.schedule_follow_up(CONVERSATION_ID, 1, "告诉他查到的参数")
+    follow = (await memory.pending_jobs("follow_up", CONVERSATION_ID))[0]
+    await memory.reschedule_job(follow.id or 0, night + timedelta(minutes=5))
+    clock.set(night + timedelta(minutes=6))
+    await app.handle_proactive_job(await memory.get_job(follow.id or 0))
+    moved = await memory.get_job(follow.id or 0)
+    assert moved.status == "pending" and moved.run_at > clock.now()
+    clock.set(moved.run_at - timedelta(minutes=1))
+    await app.scheduler.recover()
+    assert (await memory.get_job(follow.id or 0)).status == "pending", "一重启就当成停机太久作废了"
 
 
 async def test_a_proactive_that_says_nothing_is_not_counted_as_done(

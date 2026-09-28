@@ -420,13 +420,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 print("\n心里挂着：" + "；".join(plan.thoughts))
             print("\n（◆ 是她可能会主动跟你提的）")
             if args.save:
+                had_plan = await memory.get_day_plan(day) is not None
                 await memory.save_day_plan(day, plan)
                 # 当天的主动时刻只在"新生成日程"那条路上排。这里存进去之后，
                 # 她起床时看到已经有日程就直接返回——那一天就一次都不会主动开口。
                 # 留个记号，让她起床时补排。
-                from .life import PROACTIVE_PENDING
+                # 当天已经有日程的话主动时刻已经排过了，再补排就是重新掷一次骰子。
+                if not had_plan:
+                    from .life import PROACTIVE_PENDING
 
-                await memory.kv_set(f"{PROACTIVE_PENDING}{day}", "1")
+                    await memory.kv_set(f"{PROACTIVE_PENDING}{day}", "1")
                 print("已存进日记")
             return 0
         finally:

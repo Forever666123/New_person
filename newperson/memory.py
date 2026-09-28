@@ -1190,8 +1190,18 @@ class Memory:
         await self.db.commit()
 
     async def reschedule_job(
-        self, job_id: int, run_at: datetime, payload: dict[str, Any] | None = None
+        self,
+        job_id: int,
+        run_at: datetime,
+        payload: dict[str, Any] | None = None,
+        *,
+        reset_original: bool = False,
     ) -> None:
+        """改排期。``reset_original`` 用于**故意**往后推：那之后"过期多久"从新时刻算。"""
+        if reset_original:
+            await self.db.execute(
+                "UPDATE jobs SET original_run_at = ? WHERE id = ?", (run_at.isoformat(), job_id)
+            )
         if payload is None:
             await self.db.execute(
                 "UPDATE jobs SET run_at = ?, status = 'pending', lease_until = NULL WHERE id = ?",

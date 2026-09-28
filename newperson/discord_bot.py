@@ -20,7 +20,7 @@ import json
 import logging
 import random
 import signal
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -132,8 +132,8 @@ class App:
         # 照片库空着的时候，要照片的那几种主动不进当天的候选。
         # 原来它照样抽签、占掉名额，到点再发现没照片跳过——那天就什么都不说了。
         self.life.has_photos = lambda: bool(self.media.library.available(set(), None))
-        self.on_phone: Callable[[], None] | None = None
-        """她拿起手机了（在线状态亮几分钟）。连上 Discord 之后由 client 接上。"""
+        self.on_phone: Callable[[], Awaitable[None]] | None = None
+        """她拿起手机了（在线状态马上亮，亮几分钟）。连上 Discord 之后由 client 接上。"""
 
     # -- 启动 ---------------------------------------------------------------
 
@@ -874,11 +874,11 @@ class App:
             diary_notes=notes,
         )
 
-    def _on_phone(self) -> None:
-        """她真的在用手机：要打字发出去了。在线状态只跟着这个亮。"""
+    async def _on_phone(self) -> None:
+        """她真的在用手机：要打字发出去了。在线状态只跟着这个亮，**而且要先亮再打字**。"""
         if self.on_phone is not None:
             with contextlib.suppress(Exception):
-                self.on_phone()
+                await self.on_phone()
 
     def _local_stamps(self, messages: list, now: datetime) -> list:
         """聊天记录的时间戳换成她此刻所在的时区，跟"现在是几点"对得上。"""
@@ -1056,7 +1056,7 @@ class App:
         async def interrupted() -> bool:
             return await self.memory.has_newer_user_message(CONVERSATION_ID, covers)
 
-        self._on_phone()
+        await self._on_phone()
 
         async def on_progress(index: int) -> None:
             await self.memory.save_job_progress(
@@ -1089,6 +1089,11 @@ class App:
             raise
 
         await self._record_sent(result, now, batch)
+        if result.sent_texts and (riding := job.payload.get("riding_follow_up")):
+            # 答应他的那件事跟着这次回复说出口了
+            rider = await self.memory.get_job(int(riding))
+            if rider is not None and rider.status == "pending":
+                await self.scheduler.cancel(int(riding))
         if result.sent_texts or result.photo_sent:
             # 发得出去就把"发不出去"这个判断收回来。
             # 不收的话，一次 403（你临时退了共同服务器、关了私信）之后
@@ -1267,15 +1272,18 @@ class App:
                 reply = pending[0]
                 payload = None
                 if promised and not reply.progress.get("plan"):
-                    # 并进这次回复：她正要回他，顺便把答应的事说了
+                    # 并进这次回复：她正要回他，顺便把答应的事说了。
+                    # 这个 follow_up 先不作废，挪后一阵留着：回复真的说出口了
+                    # （_deliver_reply 发出了文字）才作废它。回复没发出来——
+                    # 他撤回了、模型觉得这句不用回——它到点照样说。
                     hints = [*reply.payload.get("hints", []),
                              f"你之前答应过他的事，这次顺便说：{job.payload.get('note', '')}"]
-                    payload = {**reply.payload, "hints": hints}
+                    payload = {**reply.payload, "hints": hints, "riding_follow_up": job.id}
                 await self.scheduler.reschedule(
                     reply.id or 0, later(now, timedelta(seconds=self.rng.uniform(20, 90))), payload
                 )
                 if payload is not None:
-                    await self._skip(job, "有未读，答应他的事并进这次回复里说")
+                    await self._later(job, now, (60, 120), "有未读，答应他的事并进这次回复里说")
                     return
             if promised:
                 await self._later(job, now, (15, 40), "有未读，答应他的事等这轮回完")
@@ -1382,7 +1390,7 @@ class App:
             await self._skip(job, "要的那张照片没取到")
             return
 
-        self._on_phone()
+        await self._on_phone()
         try:
             result = await self.deliverer.deliver_proactive(
                 await self.resolve_channel(), plan, photo
@@ -1496,6 +1504,15 @@ class PresenceManager:
         self.rng = rng
         self._current: tuple[str, str | None] | None = None
         self._online_until: datetime | None = None
+
+    async def go_online(self) -> None:
+        """她拿起手机要发消息了：马上亮，别等下一轮循环。
+
+        循环一分钟才跑一次，只改标志的话，她的气泡几乎总是先到、
+        绿灯零到六十秒后才亮——又是一条反着来的固定规律。
+        """
+        self.note_activity()
+        await self.apply_once()
 
     def note_activity(self, minutes: float | None = None) -> None:
         """她刚看了手机。接下来几分钟显示在线。"""
@@ -1617,7 +1634,7 @@ class NewPersonClient(discord.Client):
         self.presence = PresenceManager(
             self, self.app.persona, self.app.rhythm, self.app.memory, self.app.clock, self.app.rng
         )
-        self.app.on_phone = self.presence.note_activity
+        self.app.on_phone = self.presence.go_online
         self.app.spawn(self.presence.run_forever(), "presence")
         # 放在最后：补抓要用到已经建好的频道和数据库。
         # 每次重连都跑一遍，绝大多数时候什么都找不到，代价就是一次 history 调用。

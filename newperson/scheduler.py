@@ -117,7 +117,9 @@ class Scheduler:
         （这个项目里最常见、设计上"当作这会儿没看手机"的那种失败），
         那条任务直接判死，他那句话永远没人回。
         """
-        await self.memory.reschedule_job(job_id, run_at)
+        # "过期多久"也从新时刻算。不然她答应的 follow_up 睡着时被挪到早上，
+        # 中间一次重启就按最初那个时刻判成"停机太久"作废，承诺照样丢。
+        await self.memory.reschedule_job(job_id, run_at, reset_original=True)
         await self.memory.uncount_attempt(job_id)
         self._wake.set()
 
