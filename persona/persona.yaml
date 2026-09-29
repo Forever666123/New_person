@@ -261,6 +261,7 @@ style:
   # 偶尔手滑：一次回复里打错一个字（拼音选错同音字这种），发出去几秒后改回来。
   # 打错的样子让模型写，随机换字读起来像乱码不像手滑；多久一次由这里定。
   typo_probability: 0.05
+  typo_left_probability: 0.3  # 打错了有三成懒得改，就那么放着
   status_text_probability: 0  # 多少日子挂 Discord 自定义状态。挂的是日程里那句心情原文，先关着
 
   # 下面这几个只有名字，代码里没人读它们，写了也不会发生任何事。
@@ -474,6 +475,32 @@ proactive:
 
   # 睡前说一声再走。他在她快睡的时候跟她聊，到点她会说一句"困了 我睡了"；
   # 他那句还没回的话，回完顺便说。聊天早就停了的晚上她直接睡，不专门道晚安。
+  # 节日那天多半会主动说一声节日快乐，顺口说说自己打算干嘛。
+  # 不是每个节日都说（probability），说法每次不一样。农历节日每年日子不一样，一年一年往下续
+  holiday:
+    probability: 0.8
+    note: |
+      今天{name}。跟他说声{greeting}，再顺口说说你今天打算干嘛——照你今天的安排说，
+      没什么安排就说没什么安排。说法每次不一样，一两句就够。别客套，别抒情，
+      也不用问他怎么过。
+    days:
+      - {date: 2026-10-01, name: 国庆, greeting: 国庆快乐}
+      - {date: 2026-12-25, name: 圣诞, greeting: 圣诞快乐}
+      - {date: 2027-01-01, name: 元旦, greeting: 新年快乐}
+      - {date: 2027-02-05, name: 除夕, greeting: 新年快乐}
+      - {date: 2027-02-20, name: 元宵, greeting: 元宵快乐}
+      - {date: 2027-06-09, name: 端午, greeting: 端午安康}
+      - {date: 2027-09-15, name: 中秋, greeting: 中秋快乐}
+      - {date: 2027-10-01, name: 国庆, greeting: 国庆快乐}
+      - {date: 2027-12-25, name: 圣诞, greeting: 圣诞快乐}
+      - {date: 2028-01-01, name: 元旦, greeting: 新年快乐}
+      - {date: 2028-01-25, name: 除夕, greeting: 新年快乐}
+      - {date: 2028-02-09, name: 元宵, greeting: 元宵快乐}
+      - {date: 2028-05-28, name: 端午, greeting: 端午安康}
+      - {date: 2028-10-01, name: 国庆, greeting: 国庆快乐}
+      - {date: 2028-10-03, name: 中秋, greeting: 中秋快乐}
+      - {date: 2028-12-25, name: 圣诞, greeting: 圣诞快乐}
+
   sign_off:
     enabled: true
     watch_minutes: 90          # 他在她入睡前一个半小时内说过话，才准备这一句

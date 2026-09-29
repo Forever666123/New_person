@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -280,6 +281,8 @@ class StyleConfig(BaseModel):
     typing_chars_per_second: float = 2.6
     """打字速度，手机打字比键盘慢。"""
     typo_probability: float = 0.05
+    typo_left_probability: float = 0.0
+    """手滑之后有多大概率懒得改。每次都在几秒内改回来，本身也是一条规律。"""
     """一次回复里手滑打错一个字、发出去几秒后改回来的概率。
 
     打错的样子让模型写（拼音选错同音字最像手滑），多久一次由这里定。
@@ -469,6 +472,27 @@ class SignOffConfig(BaseModel):
     """已经说过、他又说话了时的提示。"""
 
 
+class Holiday(BaseModel):
+    date: date
+    name: str
+    greeting: str = ""
+    """那天怎么说，比如"新年快乐"。不写就是"{name}快乐"。"""
+
+
+class HolidayConfig(BaseModel):
+    """节日那天她多半会主动说一声，顺口说说自己打算干嘛。
+
+    不走每天"今天开不开口"那一关：节日本来就是会开口的日子。但也不是每个节日都说，
+    说法每次不一样——死板的话就成了定时群发。
+    """
+
+    probability: float = 0.8
+    note: str = "今天{name}。跟他说声{greeting}，再顺口说说你今天打算干嘛。"
+    """给模型的指示。{name} 和 {greeting} 会换成那天的。"""
+    days: list[Holiday] = Field(default_factory=list)
+    """农历节日每年日子不一样，一年一年写上。"""
+
+
 class ProactiveConfig(BaseModel):
     day_probability: float = 0.4
     """今天她到底会不会主动开口。
@@ -494,6 +518,7 @@ class ProactiveConfig(BaseModel):
     ledger_timed: LedgerTimedConfig = Field(default_factory=lambda: LedgerTimedConfig())
     """他说了时间的事，那之前不问。"""
     sign_off: SignOffConfig = Field(default_factory=lambda: SignOffConfig())
+    holiday: HolidayConfig = Field(default_factory=lambda: HolidayConfig())
     """睡前说一声再走。"""
 
 
@@ -608,6 +633,9 @@ class Persona(BaseModel):
     @property
     def owner_tz(self) -> ZoneInfo | None:
         return ZoneInfo(self.owner.timezone) if self.owner.timezone else None
+
+    def holiday_on(self, day: date) -> Holiday | None:
+        return next((h for h in self.proactive.holiday.days if h.date == day), None)
 
     def mode_for(self, text: str) -> TopicMode | None:
         """文本命中哪个话题模式。

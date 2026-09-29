@@ -632,6 +632,7 @@ async def test_a_typo_is_sent_then_fixed_a_few_seconds_later(
     deliverer: Deliverer, channel: FakeChannel
 ) -> None:
     """手滑打错一个字：先发出去错的，过几秒改回来。记下来的是改好的那句。"""
+    deliverer.typo_left_probability = 0.0
     slip = [ReplyPart(text="我在图书馆", typo_text="我再图书馆")]
     result = await deliverer.deliver(channel, slip, None)
     assert channel.texts == ["我再图书馆"]
@@ -661,6 +662,7 @@ async def test_progress_is_saved_before_the_typo_is_fixed(
     改错字要等 4–20 秒。进度原来记在改完之后：停机取消落在这段里，
     重启后整条重发，他看到两条，第一条的错字永远没改。
     """
+    deliverer.typo_left_probability = 0.0
     seen: list[list[str]] = []
 
     async def on_progress(_index: int) -> None:
@@ -683,6 +685,7 @@ async def test_a_shutdown_while_fixing_a_typo_still_reports_what_was_sent(
     """
     import asyncio
 
+    deliverer.typo_left_probability = 0.0
     real_sleep = deliverer.clock.sleep
 
     async def sleep(seconds: float) -> None:
@@ -775,3 +778,16 @@ async def test_after_a_few_tries_an_unknown_picture_error_stops_blocking_the_wor
     result = await deliverer.deliver(channel, parts("你看{photo}"), PHOTO, drop_photo_on_error=True)
     assert channel.texts == ["你看"]
     assert result.photo_failed == PHOTO
+
+
+async def test_sometimes_she_does_not_bother_fixing_a_typo(
+    deliverer: Deliverer, channel: FakeChannel
+) -> None:
+    """打错了有时懒得改：不编辑，记下来的也是打错的那版，跟他看到的一样。"""
+    deliverer.typo_left_probability = 1.0
+    result = await deliverer.deliver(
+        channel, [ReplyPart(text="我在图书馆", typo_text="我再图书馆")], None
+    )
+    assert channel.texts == ["我再图书馆"]
+    assert not [e for e in channel.events if e.kind == "edit"]
+    assert result.sent_texts == ["我再图书馆"]

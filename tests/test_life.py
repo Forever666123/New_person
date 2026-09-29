@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -373,3 +373,25 @@ def test_she_rarely_starts_a_chat_in_the_middle_of_class(persona: Persona) -> No
     assert in_class / total <= glance_in_class / glance_total + 0.02, (
         f"课上主动 {in_class / total:.1%}，课上看手机 {glance_in_class / glance_total:.1%}"
     )
+
+
+async def test_on_a_holiday_she_usually_says_happy_holiday(harness: Harness) -> None:
+    """节日那天排上一句节日快乐，顺口说说自己的安排；不过"今天开不开口"那一关。平常日子没有。"""
+    from newperson.life import HOLIDAY
+
+    life = harness.life
+    persona = life.persona
+    quiet = persona.proactive.model_copy(update={
+        "day_probability": 0.0,
+        "holiday": persona.proactive.holiday.model_copy(update={"probability": 1.0}),
+    })
+    life.persona = persona.model_copy(update={"proactive": quiet})
+    eve = date(2027, 2, 5)
+    harness.clock.set(datetime.combine(eve, datetime.min.time(), TZ).replace(hour=5))
+    got = await life.candidate_moments(PLAN, eve, "owner")
+    assert [k.name for _, k, _ in got] == [HOLIDAY]
+    assert "新年快乐" in got[0][2] and "打算干嘛" in got[0][2]
+
+    ordinary = date(2027, 2, 9)
+    harness.clock.set(datetime.combine(ordinary, datetime.min.time(), TZ).replace(hour=5))
+    assert await life.candidate_moments(PLAN, ordinary, "owner") == []

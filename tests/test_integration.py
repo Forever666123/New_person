@@ -4718,6 +4718,26 @@ async def test_being_rate_limited_at_login_is_waited_out() -> None:
     assert tries["n"] == 3 and len(waits) == 2
 
 
+async def test_she_does_not_say_happy_holiday_twice(tmp_path: Path, persona: Persona) -> None:
+    """他先来说了新年快乐、她也回了：排着的那句节日快乐就不再说。回复时她也知道今天是什么日子。"""
+    eve = datetime(2027, 2, 5, 14, 0, tzinfo=TZ)
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="新年快乐 你也是")])], now=eve
+    )
+    await send(app, "新年快乐！", at=eve, msg_id=4500)
+    await _deliver_one_reply(app, clock, memory)
+    assert "今天是除夕" in llm.calls[-1]["messages"][0]["content"]
+    at = clock.now() + timedelta(hours=3)
+    job_id = await app.scheduler.schedule(
+        "proactive", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "holiday", "note": "今天除夕。跟他说声新年快乐"},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert len(llm.calls) == 1 and channel.texts == ["新年快乐 你也是"]
+    assert (await memory.get_job(job_id)).status == "cancelled"
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

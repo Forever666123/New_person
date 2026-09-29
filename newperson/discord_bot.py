@@ -40,7 +40,7 @@ from .calendar import AcademicCalendar
 from .clock import Clock, RealClock, later
 from .config import Settings
 from .delivery import Deliverer, DeliveryBlocked
-from .life import LEDGER_CHECK, LifeEngine
+from .life import HOLIDAY, LEDGER_CHECK, LifeEngine
 from .media import CommandImageGenerator, MediaService, NullImageGenerator, PhotoLibrary
 from .memory import Memory
 from .models import (
@@ -1082,6 +1082,9 @@ class App:
             mood.append("你这几天没什么心思聊天。")
         if heads_up := self.life.trip_heads_up(day):
             mood.append(heads_up)
+        if holiday := self.persona.holiday_on(day):
+            # 放在易变层。他先来说话的话，她在回复里也知道今天是什么日子
+            mood.append(f"今天是{holiday.name}。")
 
         # 作息只知道有没有课，日程才知道她此刻具体在干什么。
         # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。
@@ -1703,6 +1706,9 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         day = self.rhythm.local_date(now)
+        if kind == HOLIDAY and await self._said_happy_today(now):
+            await self._skip(job, "今天已经说过节日快乐了")
+            return
         # 答应他的事不算新开话头，本来就是在回他的话：今天主动过、他没回，照样说
         if not promised and not await self.life.can_initiate_today(CONVERSATION_ID, day):
             await self._skip(job, "今天已经主动过而且他没回，不追了")
@@ -1791,6 +1797,22 @@ class App:
         await self._deliver_proactive_plan(
             job, plan, photo, now, kind, ledger_ref[0] if ledger_ref else None
         )
+
+    async def _said_happy_today(self, now: datetime) -> bool:
+        """她今天已经说过节日的那句了（多半是他先来、她回的时候说的）。"""
+        day = self.rhythm.local_date(now)
+        holiday = self.persona.holiday_on(day)
+        words = {"快乐"}
+        if holiday is not None:
+            words |= {w for w in (holiday.name, holiday.greeting) if w}
+        for message in await self.memory.recent_messages(CONVERSATION_ID, 40):
+            if (
+                message.author_kind == "bot"
+                and self.rhythm.local_date(message.created_at) == day
+                and any(w in message.content for w in words)
+            ):
+                return True
+        return False
 
     async def _resume_proactive(self, job: Job, now: datetime, kind: str) -> None:
         """主动消息上次发到一半断了，从断点接着发。

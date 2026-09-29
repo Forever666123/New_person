@@ -31,6 +31,8 @@ from .scheduler import Scheduler
 
 LEDGER_CHECK = "ledger_check"
 """回访台账的那种主动消息的名字。代码里要认它，所以不能只写在 yaml 里。"""
+HOLIDAY = "holiday"
+"""节日那一句。不在 yaml 的 kinds 里：日子由 proactive.holiday.days 定。"""
 
 _WHEN_THERE = re.compile(r"\s*(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})\s*")
 """模型写的"他那边的时间"：MM-DD HH:MM。别的写法一律不认，退回按周期问。"""
@@ -332,7 +334,32 @@ class LifeEngine:
     async def candidate_moments(
         self, plan: DayPlan, day: date, conversation_id: str
     ) -> list[tuple[datetime, ProactiveKind, str]]:
-        """今天她可能主动开口的时刻。
+        """今天她可能主动开口的时刻：节日那一句，加上平常的。"""
+        found = await self._holiday_candidate(plan, day)
+        found += await self._regular_candidates(plan, day, conversation_id)
+        return sorted(found, key=lambda c: c[0])
+
+    async def _holiday_candidate(
+        self, plan: DayPlan, day: date
+    ) -> list[tuple[datetime, ProactiveKind, str]]:
+        """节日那天多半说一声。不过"今天开不开口"那一关，但也不是每次都说。"""
+        cfg = self.persona.proactive.holiday
+        holiday = self.persona.holiday_on(day)
+        if holiday is None or self.rng.random() >= cfg.probability:
+            return []
+        wake, sleep = self._awake_window(day)
+        kind = ProactiveKind(name=HOLIDAY, weight=0.0)
+        moment = self._sample_moment(kind, wake, sleep, day)
+        if moment is None or moment <= self.clock.now() or self.rhythm.is_sleeping(moment):
+            return []
+        note = cfg.note.format(name=holiday.name, greeting=holiday.greeting or f"{holiday.name}快乐")
+        shareable = [e for e in plan.events if e.shareable]
+        return [(moment, kind, self._with_plan_hint(note, HOLIDAY, shareable))]
+
+    async def _regular_candidates(
+        self, plan: DayPlan, day: date, conversation_id: str
+    ) -> list[tuple[datetime, ProactiveKind, str]]:
+        """平常的主动。
 
         概率会因为"上次主动他没回"而衰减。追着说话是这类东西最容易崩掉的地方。
         """
@@ -438,7 +465,7 @@ class LifeEngine:
 
         少了这一步她只能泛泛地说，而泛泛正是最像机器人的地方。
         """
-        if not shareable or kind_name not in ("own_life", "travel_note"):
+        if not shareable or kind_name not in ("own_life", "travel_note", HOLIDAY):
             return note
         event = self.rng.choice(shareable)
         note = f"{note}\n今天可以提的是：{event.title}。{event.detail}"

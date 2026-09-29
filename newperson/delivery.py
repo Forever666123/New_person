@@ -194,6 +194,8 @@ class Deliverer:
         self.attention = attention
         self.rng = rng
         self.make_file = make_file
+        self.typo_left_probability = attention.persona.style.typo_left_probability
+        """打错了懒得改的概率。"""
 
     # -- 组稿 ---------------------------------------------------------------
 
@@ -335,8 +337,9 @@ class Deliverer:
                 if on_progress is not None:
                     await on_progress(index)
 
-                if typo:
-                    # 发出去了才看见打错了，过几秒改回来
+                if typo and self.rng.random() >= self.typo_left_probability:
+                    # 发出去了才看见打错了，过几秒改回来。有时候懒得改，就那么放着——
+                    # 那样记下来的也是打错的那版，跟他看到的一样
                     await self.clock.sleep(self.rng.uniform(4, 20) * self.attention.delay_scale)
                     if await self._edit(message, part.text):
                         result.sent_texts[-1] = part.text
