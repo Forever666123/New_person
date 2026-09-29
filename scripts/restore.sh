@@ -42,7 +42,12 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-die() { echo "✗ $*" >&2; exit 1; }
+die() {
+    echo "✗ $*" >&2
+    # 演练失败说明手里那份备份可能恢复不了：喊出来（没配 webhook 就只写日志）
+    "$SCRIPT_DIR/alert.sh" "恢复演练失败：$*" >/dev/null 2>&1 || true
+    exit 1
+}
 say() { echo "[$(date -u +%FT%TZ)] $*"; }
 
 [ -n "$RCLONE_REMOTE" ] || die "没配 RCLONE_REMOTE。看 scripts/backup.env.example"

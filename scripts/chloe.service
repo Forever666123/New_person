@@ -20,6 +20,8 @@ Wants=network-online.target
 # 于是熔断形同虚设。验一下：systemd-analyze verify chloe.service
 StartLimitIntervalSec=3600
 StartLimitBurst=20
+# 熔断之后她就再也不会被拉起来了：发一声报警（scripts/chloe-alert.service，没配 webhook 就什么都不做）
+OnFailure=chloe-alert.service
 
 [Service]
 Type=simple

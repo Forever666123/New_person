@@ -1,0 +1,8 @@
+# chloe.service 停了（多半是一小时内重启了二十次、被熔断）的时候发一声报警。
+# 装：cp scripts/chloe-alert.service /etc/systemd/system/ && systemctl daemon-reload
+[Unit]
+Description=Tell the owner that Chloe stopped
+
+[Service]
+Type=oneshot
+ExecStart=/opt/New_person/scripts/alert.sh "她停了：systemd 不再拉起她（多半是连续重启太多次被熔断）。看 journalctl -u chloe -n 50，修好之后 systemctl reset-failed chloe && systemctl start chloe"

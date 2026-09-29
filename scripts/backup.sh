@@ -33,7 +33,12 @@ KEEP_LOCAL="${KEEP_LOCAL:-3}"
 PYTHON_BIN="${PYTHON_BIN:-$NP_DIR/.venv/bin/python}"
 DB_PATH="${DB_PATH:-$NP_DIR/data/newperson.db}"
 
-die() { echo "✗ $*" >&2; exit 1; }
+die() {
+    echo "✗ $*" >&2
+    # 备份停了没有任何症状，所以失败要喊出来（没配 webhook 就只写日志）
+    "$SCRIPT_DIR/alert.sh" "备份失败：$*" >/dev/null 2>&1 || true
+    exit 1
+}
 say() { echo "[$(date -u +%FT%TZ)] $*"; }
 
 [ -n "$RCLONE_REMOTE" ] || die "没配 RCLONE_REMOTE。看 scripts/backup.env.example"

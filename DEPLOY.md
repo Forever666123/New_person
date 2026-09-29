@@ -409,7 +409,7 @@ cd /opt/New_person && .venv/bin/python -m newperson doctor
 想让它每周自己跑一次，就这行（`crontab -e`）：
 
 ```
-0 6 * * 1 cd /opt/New_person && .venv/bin/python -m newperson doctor > /var/log/chloe-doctor.log 2>&1 || cp /var/log/chloe-doctor.log "/var/log/chloe-doctor.BAD-$(date +\%F).log"
+0 6 * * 1 cd /opt/New_person && .venv/bin/python -m newperson doctor > /var/log/chloe-doctor.log 2>&1 || { cp /var/log/chloe-doctor.log "/var/log/chloe-doctor.BAD-$(date +\%F).log"; scripts/alert.sh "每周体检发现问题：$(grep '✗' /var/log/chloe-doctor.log | head -5)"; }
 ```
 
 三个地方是故意这么写的：
@@ -423,7 +423,8 @@ cd /opt/New_person && .venv/bin/python -m newperson doctor
 - `%F` 里的 `%` 要写成 `\%`。crontab 会把没转义的 `%` 当成换行，
   命令会从那里断掉。
 
-于是你平时什么都不用看。想确认的时候只要：
+配了下面"出事时通知你"的话，发现 BAD 会直接发到你的私密频道。
+没配也没关系，平时什么都不用看。想确认的时候只要：
 
 ```bash
 ls /var/log/chloe-doctor.BAD-* 2>/dev/null || echo 这几周都正常
@@ -463,3 +464,33 @@ ls /var/log/chloe-doctor.BAD-* 2>/dev/null || echo 这几周都正常
 
 **换服务器。** 把 `data/` 目录整个拷过去就行，她的记忆全在里面。
 或者直接在新机器上 `scripts/restore.sh --install`。
+
+
+## 出事时通知你（可选）
+
+她的正常状态就包含长时间不说话，所以"坏了"和"她这会儿不想聊"从外面看一模一样。
+配上这个，下面几种情况会往你 Discord 里一个**只有你能看的频道**发一句话：
+
+- 服务连续重启太多次、被 systemd 熔断停掉了（之后不会再自己起来）
+- 每天的备份失败、每周的恢复演练失败
+- 每周体检发现 BAD（上面那条 cron 已经接好了）
+
+**不走她的私聊，也不走她的 bot 账号**，她的对话里看不到它。只发计数、时刻、错误类别，
+不带聊天内容。
+
+1. Discord 里建一个频道，只给你自己看。频道设置 → 整合 → Webhooks → 新建 → 复制 URL。
+   **这个 URL 谁拿到都能往那个频道发消息，别发给任何人。**
+2. 在服务器上：
+
+   ```bash
+   cd /opt/New_person
+   echo 'ALERT_WEBHOOK_URL=粘贴那个URL' > scripts/alert.env
+   chmod 600 scripts/alert.env
+   cp scripts/chloe.service scripts/chloe-alert.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl restart chloe
+   scripts/alert.sh 测试一下
+   ```
+
+   频道里收到"[chloe] 测试一下"就好了。
+
+没配 `alert.env` 的话 `alert.sh` 什么都不发，只在日志里写一行，不影响任何东西。
