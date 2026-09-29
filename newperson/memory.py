@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
@@ -185,7 +186,14 @@ class Memory:
         return self._db
 
     async def open(self) -> None:
-        """打开连接、建表。幂等。"""
+        """打开连接、建表。幂等：再调一次会先关掉旧的连接。
+
+        启动半途失败（盘满、迁移出错）之后要重试，不关旧的就会攒一堆没人关的连接。
+        """
+        if self._db is not None:
+            with contextlib.suppress(Exception):
+                await self._db.close()
+            self._db = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
@@ -500,6 +508,12 @@ class Memory:
         found = [self._row_to_message(r) for r in rows]
         found.sort(key=lambda m: (m.created_at, m.id))
         return found
+
+    async def has_discord_message(self, discord_message_id: int) -> bool:
+        row = await self._fetch_one(
+            "SELECT 1 FROM messages WHERE discord_message_id = ?", (discord_message_id,)
+        )
+        return row is not None
 
     async def restore_unread(self, conversation_id: str, upto_id: int) -> int:
         """把**那一批**消息放回未读。

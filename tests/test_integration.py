@@ -3669,6 +3669,218 @@ async def test_her_custom_status_shows_up_on_some_days_and_not_at_midnight_sharp
     assert 4 <= shown <= 24, f"40 天里有状态的只有 {shown} 天"
 
 
+async def test_his_message_still_gets_answered_after_a_long_api_outage(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """接口连着挂了好一阵：那批话照样有人回，不是三次失败就永远躺在未读里。"""
+    outage = [RuntimeError("连不上接口")] * 8
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [*outage, ReplyPlan(parts=[ReplyPart(text="在")])]
+    )
+    await send(app, "在吗", at=EVENING, msg_id=2400)
+    await drain(app, clock, hops=40)
+    assert channel.texts == ["在"]
+    assert not await memory.unread_messages(CONVERSATION_ID)
+
+
+async def test_a_reply_that_slips_into_her_sleep_waits_until_she_wakes(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前一两分钟排的回复，被重试或重启挪进了睡眠：醒来再回。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="早")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=3)
+    clock.set(at)
+    await send(app, "睡了没", at=at, msg_id=2500)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    asleep = bedtime + timedelta(minutes=4)
+    await memory.reschedule_job(reply.id or 0, asleep)  # 重试退避、开机打散都会这样
+    clock.set(asleep + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [] and llm.calls == []
+    moved = await memory.get_job(reply.id or 0)
+    assert moved.status == "pending" and not app.rhythm.is_sleeping(moved.run_at)
+
+
+async def test_a_reply_planned_long_ago_is_not_sent_as_is(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """想好的回复一条都没发出去（Discord 断了），过了很久才恢复：放回未读、按人的节奏重排。
+
+    原来照原样发：几个小时前的回复，而且 !np retry 放回来的几条会在一两秒内连着冒出来。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="旧的")]), ReplyPlan(parts=[ReplyPart(text="新的")])],
+    )
+    await send(app, "在吗", at=EVENING, msg_id=2600)
+    real_send = channel.send
+
+    async def discord_down(*_a, **_kw):
+        raise RuntimeError("503 Service Unavailable")
+
+    channel.send = discord_down
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert not await memory.unread_messages(CONVERSATION_ID), "前提：这批已经标成已读"
+
+    channel.send = real_send
+    back = clock.now() + timedelta(minutes=50)
+    await memory.reschedule_job(job.id or 0, back)
+    clock.set(back + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [], "放了五十分钟的旧回复被照原样发了出去"
+    assert await memory.unread_messages(CONVERSATION_ID)
+    await drain(app, clock, hops=10)
+    assert channel.texts == ["新的"] and len(llm.calls) == 2
+
+
+async def test_a_dropped_reply_is_picked_up_again_by_her_next_proactive_moment(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """回复重试到放弃了，他的话还挂在未读：她下一次想主动开口时，先把回复补排上。"""
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    await send(app, "在吗", at=EVENING, msg_id=2700)
+    dead = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.set_job_status(dead.id or 0, "failed", "试了三次", at=EVENING)
+    later_on = EVENING + timedelta(hours=1)
+    await app.scheduler.schedule(
+        "proactive", later_on, conversation_id=CONVERSATION_ID, payload={"kind": "own_life"}
+    )
+    clock.set(later_on + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert await memory.pending_jobs("reply", CONVERSATION_ID), "没人再去回他那句"
+
+
+async def test_how_long_he_waited_is_counted_when_she_actually_replies(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """"他这条是多久前发的"按生成那一刻算，不按排期时写下的那个数。"""
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    await send(app, "在吗", at=EVENING - timedelta(hours=2), msg_id=2800)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    stale = {**job.payload, "hints": ["他这条消息是 20 分钟 前发的。**别解释这段时间你在干嘛**"]}
+    await app.scheduler.reschedule(job.id or 0, EVENING + timedelta(hours=1), stale)
+    clock.set(EVENING + timedelta(hours=1, seconds=1))
+    await app.scheduler.run_due_once()
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert "20 分钟 前发的" not in prompt
+    assert "3.0 小时 前发的" in prompt
+
+
+async def test_a_failed_start_is_retried_without_waiting_for_a_reconnect(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """启动半途失败（比如盘满）：过一会儿自己再试，不等下一次重新 IDENTIFY。
+
+    原来异常被 discord.py 吞成一行日志：进程活着、网关连着，调度循环却没起来，
+    要等 Discord 让会话失效、重新 IDENTIFY 才会再试——可能是好几天以后。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    real_open = memory.open
+    failures = {"left": 1}
+
+    async def open_once_broken() -> None:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError("database or disk is full")
+        await real_open()
+
+    memory.open = open_once_broken
+    client = NewPersonClient(app)
+    await client.on_ready()
+    assert not app._started
+    retry = client._start_retry
+    assert retry is not None
+    await asyncio.wait_for(retry, timeout=5)
+    assert app._started, "失败之后没有自己再试"
+    assert [t for t in app._tasks if t.get_name() == "scheduler"]
+    for task in list(app._tasks):
+        task.cancel()
+
+
+async def test_she_keeps_trying_to_log_in_while_discord_is_unreachable() -> None:
+    """开机时连不上 Discord：进程里退避重试，不是一秒就退出、让 systemd 熔断。"""
+    import aiohttp
+
+    from newperson.discord_bot import login_with_retry
+
+    waits: list[float] = []
+    tries = {"n": 0}
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    class Unreachable:
+        async def login(self, _token: str) -> None:
+            tries["n"] += 1
+            if tries["n"] <= 6:
+                raise aiohttp.ClientConnectionError("Cannot connect to host discord.com:443")
+
+    await login_with_retry(Unreachable(), "x", sleep=fake_sleep)
+    assert tries["n"] == 7
+    assert waits[0] == 30 and waits == sorted(waits) and max(waits) <= 600
+
+
+async def test_a_wrong_token_is_not_retried_forever() -> None:
+    """token 错了等多久都不会好，照旧直接退出。"""
+    import discord
+
+    from newperson.discord_bot import login_with_retry
+
+    class WrongToken:
+        async def login(self, _token: str) -> None:
+            raise discord.LoginFailure("Improper token has been passed.")
+
+    async def no_sleep(_s: float) -> None:
+        raise AssertionError("不该重试")
+
+    with pytest.raises(discord.LoginFailure):
+        await login_with_retry(WrongToken(), "x", sleep=no_sleep)
+
+
+async def test_catching_up_does_not_download_his_pictures_again(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """补抓重翻到库里已经有的消息：不再把它的图下载一遍。
+
+    游标只在补抓时前进，每次重连都会重翻上次重连以来的整段；
+    原来每张图都重下一次（最多 5MB、等 20 秒），新文件还逃过了两周清理。
+    """
+    from newperson.discord_bot import CATCHUP_CURSOR, CATCHUP_SEEN
+
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await send(app, "停机前", at=EVENING, msg_id=100)
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID, discord_message_id=101, author_id=42,
+            author_name="Leo", content="看这个", created_at=EVENING + timedelta(minutes=1),
+        )
+    )
+    with_picture = fake_incoming(101, "看这个", EVENING + timedelta(minutes=1))
+    with_picture.attachments = [SimpleNamespace(
+        url="https://cdn/x.png", filename="x.png", content_type="image/png", size=10,
+    )]
+    wire_inbound(app, FakeHistoryChannel([with_picture]))
+    await memory.kv_set(CATCHUP_SEEN, "999")
+    await memory.kv_set(f"{CATCHUP_CURSOR}999", "100")
+    downloads: list[int] = []
+
+    async def counting(message):
+        downloads.append(message.id)
+        return []
+
+    app._download_images = counting
+    await app.catch_up()
+    assert downloads == [], "库里已经有的那条，图又下了一遍"
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

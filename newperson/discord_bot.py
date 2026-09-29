@@ -28,7 +28,13 @@ from typing import Any
 import discord
 
 from . import owner as owner_cmds
-from .attention import SLEEP_SOON_HINT, AttentionPolicy, extract_features, heat_of
+from .attention import (
+    SLEEP_SOON_HINT,
+    WAITED_PREFIX,
+    AttentionPolicy,
+    extract_features,
+    heat_of,
+)
 from .brain import Brain, MemoryUpdateRequest, ProactiveRequest, ReplyRequest, build_client
 from .calendar import AcademicCalendar
 from .clock import Clock, RealClock, later
@@ -61,6 +67,9 @@ PHOTO_SHORTLIST = 20
 
 CATCHUP_CURSOR = "catchup_cursor:"
 """补抓的游标前缀，后面接频道 id。**一个频道一个**，见 _catch_up_channels。"""
+
+STALE_PLAN = timedelta(minutes=30)
+"""想好的回复一条都没发出去、又放了这么久，就不照原样发了，放回未读重新排。"""
 
 MEMORY_RETRY_BACKOFF = timedelta(hours=6)
 """记忆整理失败之后隔这么久才再试。见 _maybe_summarize 为什么不能不退避。"""
@@ -167,7 +176,7 @@ class App:
         self.scheduler.register("proactive", self.handle_proactive_job)
         self.scheduler.register("follow_up", self.handle_proactive_job)
         self.scheduler.register("sign_off", self.handle_sign_off_job)
-        self.scheduler.register("day_plan", self.life.handle_day_plan_job)
+        self.scheduler.register("day_plan", self.handle_day_plan_job)
         self.scheduler.register("memory_update", self.handle_memory_update_job)
 
         await self.scheduler.recover()
@@ -536,7 +545,7 @@ class App:
                                 author_id=message.author.id,
                                 author_name=message.author.display_name,
                                 content=message.content,
-                                attachments=await self._download_images(message),
+                                attachments=await self._fresh_images(message),
                                 created_at=at,
                             )
                         )
@@ -740,7 +749,7 @@ class App:
             return
 
         now = self.clock.now()
-        attachments = await self._download_images(message)
+        attachments = await self._fresh_images(message)
         stored_id = await self.memory.add_user_message(
             IncomingMessage(
                 conversation_id=CONVERSATION_ID,
@@ -946,13 +955,21 @@ class App:
         for job in await self.memory.pending_jobs("sign_off", CONVERSATION_ID):
             await self.scheduler.cancel(job.id or 0)
 
-    async def _reply_hints(self, job: Job, now: datetime) -> tuple[list[str], datetime | None]:
+    async def _reply_hints(
+        self, job: Job, now: datetime, said_at: datetime
+    ) -> tuple[list[str], datetime | None]:
         """这次回复的处境提示，以及要不要顺便说睡了（要的话是那晚的入睡时刻）。
 
         睡前那句在**生成的那一刻**决定，不写死在任务里：回复被推迟过了睡点
         （额度用完、暂停、重试退避），醒来那条回复不该还带着"你准备睡了"。
+        "他等了多久"也在这一刻重算：排期时写的是原定时刻，接口挂了几个小时、
+        额度用完顺延到明天之后，提示里还写着"20 分钟前"。
         """
-        hints = list(job.payload.get("hints", []))
+        hints = [
+            h for h in job.payload.get("hints", []) if not h.startswith(WAITED_PREFIX)
+        ]
+        if waited := self.attention.waited_hint(now, said_at):
+            hints.insert(0, waited)
         cfg = self.persona.proactive.sign_off
         goodnight: datetime | None = None
         if cfg.enabled and not self.rhythm.is_sleeping(now):
@@ -975,6 +992,17 @@ class App:
             if rider is not None and rider.status == "pending":
                 hints.append(f"你之前答应过他的事，这次顺便说：{rider.payload.get('note', '')}")
         return hints, goodnight
+
+    async def _fresh_images(self, message: discord.Message) -> list:
+        """库里已经有这条消息就不再下载它的图。
+
+        补抓的游标只在补抓时前进，每次重连都会把上次重连以来的消息整段重翻一遍：
+        他发过的每张图（最多 5MB、等 20 秒）都要重下一次，新文件还逃过了两周清理。
+        入库那一步本来就会去重，图是白下的。
+        """
+        if await self.memory.has_discord_message(message.id):
+            return []
+        return await self._download_images(message)
 
     async def _download_images(self, message: discord.Message) -> list:
         """把他发的图片存下来，之后要真的给她看。"""
@@ -1099,9 +1127,15 @@ class App:
         now = self.clock.now()
         from .models import ReplyPlan
 
-        if job.payload.get("sign_off_before") and self.rhythm.is_sleeping(now):
-            # 睡前那句把它拉到离睡点只剩几分钟，之后任何顺延（重试退避、重启打散）
-            # 都会让它在她睡着的时候发出去。她已经睡了，那就醒来再回。
+        if (
+            self.rhythm.is_sleeping(now)
+            and not job.payload.get("owner_now")
+            and not int(job.progress.get("sent_parts", 0))
+        ):
+            # **睡着的时候绝不回。** 排期时已经把回复推出了睡眠，可之后改时刻的几条路
+            # 都不看作息：重试退避、重启后打散、他接着说话的防抖、睡前那句往前拉。
+            # 睡前一两分钟排的回复，接口抖一下就会在她睡着之后发出去。
+            # 已经发了一半的照发，停在半截更怪；你亲手 !np now 的也照发。
             wake = self.rhythm.next_wake_after(now)
             await self._later_reply(job, self.rhythm.first_glance_after_waking(wake, self.rng))
             return
@@ -1123,6 +1157,21 @@ class App:
                     log.info("[job] 把 %d 条消息放回未读", restored)
                 saved = None
             else:
+                planned = job.progress.get("planned_at")
+                if (
+                    start_index == 0
+                    and planned
+                    and now - datetime.fromisoformat(planned) > STALE_PLAN
+                    and job.covers_upto_message_id
+                ):
+                    # 想好的话一条都没发出去，而且已经放了很久（Discord 断了几个小时、
+                    # 重试到放弃后 !np retry）。照原样发出去就是几小时前的回复，
+                    # 几条还会在一两秒内连着冒出来。把那批话放回未读，按人的节奏重新排。
+                    await self.memory.save_job_progress(job.id or 0, {}, covers)
+                    await self.memory.restore_unread(CONVERSATION_ID, covers)
+                    log.info("[job] 想好的回复放太久了，重新排一次")
+                    await self._schedule_reply(now, channel_id=job.payload.get("channel_id"))
+                    return
                 log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
                 # 只取**那一批**。reply_to_index 是按那一批的下标算的；原来取的是
                 # "最近四十行里 id 不超过 covers 的全部"，早就回过的旧话也在里面，
@@ -1140,7 +1189,7 @@ class App:
             return
         covers = max(m.id for m in unread)
 
-        hints, goodnight = await self._reply_hints(job, now)
+        hints, goodnight = await self._reply_hints(job, now, unread[-1].created_at)
         reply_plan = await self._generate_reply(job, unread, now, hints)
         if reply_plan is None:
             # 模型没给出结果。**这里绝不能提前把消息标成已读**，
@@ -1155,7 +1204,11 @@ class App:
         # 生成成功了才算她真的处理过这批消息
         await self.memory.mark_read([m.id for m in unread], now)
         start_index = 0
-        progress: dict[str, Any] = {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}
+        progress: dict[str, Any] = {
+            "plan": reply_plan.model_dump(mode="json"),
+            "sent_parts": 0,
+            "planned_at": now.isoformat(),
+        }
         if goodnight is not None:
             progress["goodnight"] = goodnight.isoformat()
         await self.memory.save_job_progress(job.id or 0, progress, covers)
@@ -1267,7 +1320,11 @@ class App:
         await self._on_phone()
 
         async def on_progress(index: int) -> None:
-            progress: dict[str, Any] = {"plan": plan.model_dump(mode="json"), "sent_parts": index + 1}
+            progress: dict[str, Any] = {
+                "plan": plan.model_dump(mode="json"),
+                "sent_parts": index + 1,
+                "planned_at": job.progress.get("planned_at") or now.isoformat(),
+            }
             if goodnight is not None:
                 progress["goodnight"] = goodnight.isoformat()
             await self.memory.save_job_progress(job.id or 0, progress, covers)
@@ -1500,6 +1557,12 @@ class App:
         # 有未读就不另起话头了，那是回复该做的事
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
+        if unread and not pending:
+            # 有未读、却没有人排着回它：上一条回复重试到放弃了。
+            # 不补排的话，这里只会一次次把想说的话作废、把答应的事往后推，她一直哑着
+            log.warning("[proactive] 有未读却没排回复，补排一条")
+            await self._schedule_reply(now)
+            pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if unread or pending:
             if pending:
                 reply = pending[0]
@@ -1759,6 +1822,12 @@ class App:
 
     # -- 记忆整理 -----------------------------------------------------------
 
+    async def handle_day_plan_job(self, job: Job) -> None:
+        await self.life.handle_day_plan_job(job)
+        # 图片清理原来只在启动时做一次，进程连着跑几周不重启，下载目录就一直涨
+        self._prune_downloads()
+        self._prune_downloads(folder=self.settings.generated_dir)
+
     async def handle_memory_update_job(self, job: Job) -> None:
         now = self.clock.now()
         conv = await self.memory.get_conversation(CONVERSATION_ID)
@@ -1943,6 +2012,7 @@ class NewPersonClient(discord.Client):
         super().__init__(intents=intents)
         self.app = app
         self.presence: PresenceManager | None = None
+        self._start_retry: asyncio.Task | None = None
 
     async def close(self) -> None:
         """收工。
@@ -1966,7 +2036,32 @@ class NewPersonClient(discord.Client):
         而被限流又会导致断线重连，正反馈，越滚越糟。
         """
         log.info("[discord] 以 %s 的身份连上了", self.user)
-        await self.app.start(self)
+        try:
+            await self.app.start(self)
+        except Exception:  # noqa: BLE001 - discord.py 会把它吞成一行日志，进程活着却不干活
+            # 盘满、库打不开、迁移失败：原来要等下一次重新 IDENTIFY 才会再试 start，
+            # 而 RESUME 不算，那可能是好几天以后。这期间进程活着、网关连着，
+            # 调度循环却没起来——她不回，systemd 看着一切正常。自己隔一阵再试。
+            log.exception("[app] 启动没成功，过一会儿自己再试")
+            if self._start_retry is None or self._start_retry.done():
+                self._start_retry = self.app.spawn(self._retry_start(), "start-retry")
+            return
+        await self._after_start()
+
+    async def _retry_start(self, first_delay: float = 60.0) -> None:
+        delay = first_delay
+        while not self.app._started:
+            await self.app.clock.sleep(delay)
+            try:
+                await self.app.start(self)
+            except Exception:  # noqa: BLE001
+                log.exception("[app] 启动还是没成功，%d 秒后再试", min(delay * 2, 600))
+                delay = min(delay * 2, 600)
+                continue
+            log.info("[app] 重试之后启动成功了")
+            await self._after_start()
+
+    async def _after_start(self) -> None:
         if self.presence is not None:
             # **重连之后必须重发一次在线状态。**
             # 重新 IDENTIFY 时 discord.py 只在 ConnectionState 自带 status 的情况下
@@ -2069,4 +2164,44 @@ def run(settings: Settings, persona: Persona) -> None:
     with contextlib.suppress(ValueError):  # 非主线程时装不上，忽略
         signal.signal(signal.SIGTERM, _stop)
 
-    client.run(settings.discord_bot_token, log_handler=None)
+    # 跟 client.run 做的事一样，只是登录那一步连不上时在进程里等着重试
+    async def runner() -> None:
+        async with client:
+            await login_with_retry(client, settings.discord_bot_token)
+            await client.connect(reconnect=True)
+
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(runner())
+
+
+LOGIN_RETRY_SECONDS = (30.0, 600.0)
+"""登录连不上时第一次等多久、最多等多久。"""
+
+
+async def login_with_retry(
+    client: Any,
+    token: str,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """登录 Discord。网络、DNS、Discord 自己 5xx 的时候在进程里退避重试。
+
+    discord.py 连上之后断线会自己重连，**只有登录这一步失败是致命的**：
+    进程一秒就退出，systemd 三十秒后再拉起。开机、更新时赶上 Discord 或 DNS
+    十来分钟不通，二十次启动就用完了，systemd 熔断，之后再也不拉起她——
+    而且没有任何提醒。登录失败不消耗 IDENTIFY，这种重试不需要熔断来保护 token。
+
+    token 错了（LoginFailure）照旧直接退出：那种等多久都不会好。
+    """
+    import aiohttp
+
+    delay, cap = LOGIN_RETRY_SECONDS
+    while True:
+        try:
+            await client.login(token)
+            return
+        except discord.LoginFailure:
+            raise
+        except (aiohttp.ClientError, OSError, TimeoutError, discord.DiscordServerError) as exc:
+            log.warning("[discord] 连不上 Discord（%r），%.0f 秒后再试", exc, delay)
+            await sleep(delay)
+            delay = min(delay * 2, cap)

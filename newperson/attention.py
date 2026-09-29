@@ -28,6 +28,9 @@ _URGENT = re.compile(r"(急|快点|救命|出事|紧急|马上|!!!|？？？)")
 MIN_DELAY_SECONDS = 8.0
 """再急也不会比这更快。"""
 
+WAITED_PREFIX = "他这条消息是 "
+""""等了多久"那条提示的开头。生成时按真实时刻重算，靠它认出旧的那条。"""
+
 SLEEP_SOON_HINT = "你差不多要睡了，可以顺口说一句就下线。"
 """回复落在睡前不久时给的软提示。开着睡前那一句时，生成回复那一刻会换成更明确的那句。"""
 
@@ -314,13 +317,8 @@ class AttentionPolicy:
         于是那句"别解释这段时间你在干嘛"没了，她就真的会解释。
         """
         hints: list[str] = []
-        waited = (reply - min(now, last_user_message_at)).total_seconds() / 60
-        if waited > 10:
-            hints.append(
-                f"他这条消息是 {self._pretty(waited * 60)} 前发的。"
-                "**别解释这段时间你在干嘛**：不说在睡觉、不说刚看到、"
-                "不说抱歉、不交代去哪了。直接接着他的话说。"
-            )
+        if waited := self.waited_hint(reply, min(now, last_user_message_at)):
+            hints.append(waited)
         if defers:
             hints.append("你其实早看到了，只是当时没回。别提这件事。")
         if fatigue > 2:
@@ -334,6 +332,17 @@ class AttentionPolicy:
         if snapshot.trip_place:
             hints.append(f"你人在{snapshot.trip_place}，跟他那边的时差和平时不一样。")
         return hints
+
+    def waited_hint(self, reply_at: datetime, said_at: datetime) -> str | None:
+        """他等了多久。超过十分钟才提，提的时候顺带叮嘱别解释。"""
+        waited = (reply_at.astimezone(UTC) - said_at.astimezone(UTC)).total_seconds() / 60
+        if waited <= 10:
+            return None
+        return (
+            f"{WAITED_PREFIX}{self._pretty(waited * 60)} 前发的。"
+            "**别解释这段时间你在干嘛**：不说在睡觉、不说刚看到、"
+            "不说抱歉、不交代去哪了。直接接着他的话说。"
+        )
 
     def hints_at(
         self, reply_at: datetime, now: datetime, last_user_message_at: datetime

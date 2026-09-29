@@ -85,8 +85,8 @@ async def test_failures_are_retried_then_given_up(parts) -> None:
         attempts.append(job.attempts)
         raise RuntimeError("模型超时")
 
-    sched.register("reply", always_fails)
-    job_id = await sched.schedule("reply", NOW, conversation_id="owner")
+    sched.register("proactive", always_fails)
+    job_id = await sched.schedule("proactive", NOW, conversation_id="owner")
 
     for _ in range(MAX_ATTEMPTS):
         await sched.run_due_once()
@@ -94,6 +94,33 @@ async def test_failures_are_retried_then_given_up(parts) -> None:
 
     assert len(attempts) == MAX_ATTEMPTS
     assert (await memory.get_job(job_id)).status == "failed"
+
+
+async def test_a_reply_outlives_a_long_outage(parts) -> None:
+    """接口挂三个小时，回复任务还在排着，恢复之后照样回。
+
+    原来所有任务都是三次、间隔一分钟和三分钟：从第一次失败算起只撑四分钟。
+    接口挂二十分钟就判死，那批话再也没人回，连主动消息也被未读压住。
+    """
+    memory, clock, sched = parts
+    down_until = NOW + timedelta(hours=3)
+    done: list[int] = []
+
+    async def flaky(job: Job) -> None:
+        if clock.now() < down_until:
+            raise RuntimeError("连不上接口")
+        done.append(job.id or 0)
+
+    sched.register("reply", flaky)
+    job_id = await sched.schedule("reply", NOW, conversation_id="owner")
+    for _ in range(40):
+        if not await sched.run_due_once():
+            nxt = await memory.next_job_run_at()
+            if nxt is None:
+                break
+            clock.set(max(nxt, clock.now()))
+    assert done == [job_id]
+    assert clock.now() - down_until < timedelta(hours=1), "恢复之后等太久才回"
 
 
 async def test_a_retry_is_not_immediate(parts) -> None:

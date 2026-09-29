@@ -5,8 +5,9 @@
 - **租约认领**。任务只能被抢到一次；抢到的一方拿着有期限的租约。
   进程崩在任务中间，租约过期后任务自己回到队列，不会永远卡在 running。
 - **每会话单飞**。同一段对话同时只跑一个任务，免得回复和主动消息在同一个频道里交错发出。
-- **失败重试**。最多三次，间隔一分钟、三分钟、九分钟。对用户表现为"这会儿没看手机"，
-  绝不发任何错误文本出去。
+- **失败重试**。对用户表现为"这会儿没看手机"，绝不发任何错误文本出去。
+  一般任务最多三次，间隔一分钟、三分钟。回复和她答应的事要撑得更久：
+  接口、Discord 挂起来通常是二十分钟到几小时，四分钟就放弃的话，那批话就永远没人回了。
 - **过期策略**。停机很久再启动时，堆积的回复要立刻处理，但过期太久的主动消息就作废了。
   半夜想说的话第二天中午再冒出来会很怪。
 """
@@ -30,7 +31,12 @@ log = logging.getLogger(__name__)
 Handler = Callable[[Job], Awaitable[None]]
 
 MAX_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = (60, 180, 540)
+RETRY_BACKOFF_SECONDS = (60, 180, 540, 1200, 1800, 3600)
+"""第 n 次失败后隔多久再试，超出的按最后一档。"""
+PERSISTENT_KINDS = frozenset({"reply", "follow_up"})
+"""这几种不能轻易放弃：一个是他在等她回，一个是她答应过的事。"""
+PERSISTENT_MAX_ATTEMPTS = 16
+"""按上面的间隔，大约撑十二个小时。再往后多半不是故障，是真坏了，要人看。"""
 LEASE_SECONDS = 300.0
 IDLE_POLL_SECONDS = 60.0
 """没有任何待办时的兜底轮询间隔。正常情况下靠事件唤醒。"""
@@ -250,7 +256,8 @@ class Scheduler:
     async def _handle_failure(self, job: Job, exc: Exception) -> None:
         """失败了就当"这会儿没看手机"，过一阵再试。绝不把错误发给对方。"""
         job_id = job.id or 0
-        if job.attempts >= MAX_ATTEMPTS:
+        limit = PERSISTENT_MAX_ATTEMPTS if job.kind in PERSISTENT_KINDS else MAX_ATTEMPTS
+        if job.attempts >= limit:
             log.error("[job] %s#%s 试了 %d 次都失败：%s", job.kind, job_id, job.attempts, exc)
             await self.memory.set_job_status(job_id, "failed", str(exc)[:200], at=self.clock.now())
             return
