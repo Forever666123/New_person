@@ -404,6 +404,25 @@ class LedgerTimedConfig(BaseModel):
     同一时间只排一个 follow_up，压着的那个还会把她后来答应的全挤掉。"""
 
 
+class SignOffConfig(BaseModel):
+    """睡前说一声再走。
+
+    聊着聊着到了她睡觉的点，一声不吭就下线、第二天才回，那是程序；
+    真人会说一句"困了 我睡了"。但只在你们**还在聊**的时候：
+    聊天早就停了的晚上，她直接睡，不会专门跑来道晚安。
+    """
+
+    enabled: bool = True
+    watch_minutes: float = 90.0
+    """他在她入睡前这么久之内说过话，才准备好睡前那一句。"""
+    lead_minutes: tuple[float, float] = (2.0, 10.0)
+    """在入睡前多久说。每晚抽一次。"""
+    active_within_minutes: float = 30.0
+    """到点时，你们最后一次说话在这么久之内，才算"还在聊"。"""
+    note: str = ""
+    """给模型的指示。"""
+
+
 class ProactiveConfig(BaseModel):
     day_probability: float = 0.4
     """今天她到底会不会主动开口。
@@ -428,6 +447,8 @@ class ProactiveConfig(BaseModel):
     """多久以前的承诺就不再提了。三个月前那句话，正常人早就翻篇了。"""
     ledger_timed: LedgerTimedConfig = Field(default_factory=lambda: LedgerTimedConfig())
     """他说了时间的事，那之前不问。"""
+    sign_off: SignOffConfig = Field(default_factory=lambda: SignOffConfig())
+    """睡前说一声再走。"""
 
 
 # ---------------------------------------------------------------------------

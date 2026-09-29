@@ -155,6 +155,7 @@ class App:
         self.scheduler.register("reply", self.handle_reply_job)
         self.scheduler.register("proactive", self.handle_proactive_job)
         self.scheduler.register("follow_up", self.handle_proactive_job)
+        self.scheduler.register("sign_off", self.handle_sign_off_job)
         self.scheduler.register("day_plan", self.life.handle_day_plan_job)
         self.scheduler.register("memory_update", self.handle_memory_update_job)
 
@@ -757,6 +758,10 @@ class App:
         )
         await self._remember_inbound(getattr(message.channel, "id", None))
         await self._schedule_reply(now, channel_id=message.channel.id)
+        try:
+            await self.life.maybe_schedule_sign_off(CONVERSATION_ID)
+        except Exception:  # noqa: BLE001 - 睡前那一句排不上无所谓，不能连累回复
+            log.warning("[life] 睡前那一句没排上", exc_info=True)
 
     async def _schedule_reply(self, now: datetime, channel_id: int | None = None) -> None:
         if channel_id is None:
@@ -1484,6 +1489,101 @@ class App:
             await self.memory.add_diary_note(
                 day, plan.inner_note or f"主动说了句（{kind}）", now
             )
+
+    async def handle_sign_off_job(self, job: Job) -> None:
+        """睡前说一声再走。
+
+        到点时再看一眼：你们还在聊吗？还在聊，她说一句"我睡了"；
+        他刚说的话还没回，就回完顺便说；聊天早就停了，她直接睡。
+        不算"主动开口"：不占当天的名额，他不回也不会让她以后更少开口。
+        """
+        now = self.clock.now()
+        if await owner_cmds.is_paused(self.memory):
+            await self._skip(job, "暂停中，睡前那句不说了")
+            return
+        bedtime_raw = job.payload.get("bedtime")
+        bedtime = datetime.fromisoformat(bedtime_raw) if bedtime_raw else None
+        if self.rhythm.is_sleeping(now) or (bedtime is not None and now >= bedtime):
+            await self._skip(job, "已经睡了，睡前那句来不及了")
+            return
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        if not conv.deliverable:
+            await self._skip(job, "发不出去")
+            return
+        cfg = self.persona.proactive.sign_off
+        last = max(
+            [t for t in (conv.last_user_message_at, conv.last_bot_message_at) if t],
+            default=None,
+        )
+        if last is None or now - last > timedelta(minutes=cfg.active_within_minutes):
+            await self._skip(job, "你们早就不聊了，她直接睡")
+            return
+
+        pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
+        if pending:
+            reply = pending[0]
+            if not reply.progress.get("plan"):
+                # 他刚说的还没回：睡前回完，顺便说一声。不然他那句要等到明天。
+                hints = [*reply.payload.get("hints", []),
+                         "你准备睡了。回完这条顺便跟他说一声你要睡了，一句就够。"]
+                room = (bedtime - now) if bedtime else timedelta(minutes=2)
+                run_at = later(now, min(timedelta(seconds=self.rng.uniform(20, 60)), room / 2))
+                # 只往前拉，不往后推：本来就排在睡前的，照原来的时刻回
+                run_at = min(run_at, max(reply.run_at, now), key=lambda t: t.astimezone(UTC))
+                await self.scheduler.reschedule(
+                    reply.id or 0, run_at, {**reply.payload, "hints": hints}
+                )
+                log.info("[proactive] 睡前把他那句回了，顺便说一声")
+            return
+        if await self.memory.unread_messages(CONVERSATION_ID):
+            await self._skip(job, "有未读却没排回复，睡前那句先不说")
+            return
+
+        day = self.rhythm.local_date(now)
+        owner_facts, self_facts = await self._recall(now)
+        plan = await self.brain.generate_proactive(
+            ProactiveRequest(
+                situation=await self._build_situation(now),
+                trigger_note=job.payload.get("note", ""),
+                summary=conv.summary,
+                owner_facts=owner_facts,
+                self_facts=self_facts,
+                recent=self._local_stamps(
+                    await self.memory.recent_messages(CONVERSATION_ID, 20), now
+                ),
+                hours_since_last_exchange=(now - last).total_seconds() / 3600,
+                unanswered_initiations=0,
+                photos=[],
+            ),
+            day,
+        )
+        if plan is None:
+            if await self.brain.over_budget(day):
+                await self._skip(job, "今天的模型额度用完了，睡前那句不说了")
+                return
+            raise RuntimeError("睡前那句没生成出来")
+        if not plan.send or not plan.parts:
+            await self._skip(job, "她刚才已经说过要睡了")
+            return
+        plan.photo_request = None
+        await self._on_phone()
+        try:
+            result = await self.deliverer.deliver_proactive(await self.resolve_channel(), plan, None)
+        except DeliveryBlocked as blocked:
+            log.error("[delivery] 发不出去：%s", blocked.hint)
+            await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
+            await self._record_sent(blocked.result, now)
+            return
+        # 这是收尾，不是开口：挂在刚才那一批上，体检不会把它算成主动找他。
+        batch = None
+        if conv.last_user_message_at is not None:
+            recent = await self.memory.recent_messages(CONVERSATION_ID, 10)
+            his = [m for m in recent if m.author_kind == "user"]
+            if his:
+                batch = await self.memory.batch_of(his[-1].id)
+        await self._record_sent(result, now, batch)
+        if result.sent_texts:
+            await self.memory.add_diary_note(day, plan.inner_note or "睡前跟他说了一声", now)
 
     # -- 记忆整理 -----------------------------------------------------------
 

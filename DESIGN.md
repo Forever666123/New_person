@@ -317,7 +317,7 @@ python -m newperson photos
 - `memory`/`scheduler`：临时 SQLite；租约认领只成功一次；清扫过期租约；重启恢复 running；dedupe_key；过期策略；续发从 sent_parts 开始；每会话单飞。
 - `brain`：假 client；system 稳定块字节级不变；cache_control 存在；refusal → None；错误链；用量记录与日限。
 - `delivery`：假 channel；顺序、打字时长、打断、引用、2000 字拆分、{photo} 处理、Forbidden 分类。
-- `life`/`media`：候选抽样、未回应衰减、每日上限、照片 30 天冷却与 time_of_day 过滤。（sign_off 从来没有被排过，是死代码。）
+- `life`/`media`：候选抽样、未回应衰减、每日上限、睡前那一句（sign_off）、照片 30 天冷却与 time_of_day 过滤。
 - `discord_bot`：权限过滤（bot/self/非 owner）、`!np` 命令不入库、edit/delete 处理、on_typing 推迟。
 
 ## 8. 部署

@@ -627,6 +627,34 @@ class LifeEngine:
             reason="follow_up",
         )
 
+    async def maybe_schedule_sign_off(self, conversation_id: str) -> int:
+        """他在她快睡的时候说话了：准备好睡前那一句。一晚最多一次。
+
+        到点时还要再看一眼你们是不是真的还在聊（handle_sign_off_job），
+        这里只是占个位。
+        """
+        cfg = self.persona.proactive.sign_off
+        now = self.clock.now()
+        if not cfg.enabled or self.rhythm.is_sleeping(now):
+            return 0
+        bedtime = self.rhythm.next_sleep_after(now)
+        left = bedtime.astimezone(UTC) - now.astimezone(UTC)
+        if left > timedelta(minutes=cfg.watch_minutes) or left < timedelta(minutes=1):
+            return 0
+        lo, hi = cfg.lead_minutes
+        lead = timedelta(minutes=self.rng.uniform(lo, max(lo, hi)))
+        run_at = later(bedtime, -lead)
+        if run_at.astimezone(UTC) <= now.astimezone(UTC):
+            run_at = later(now, left / 2)
+        return await self.scheduler.schedule(
+            "sign_off",
+            run_at,
+            conversation_id=conversation_id,
+            payload={"kind": "sign_off", "note": cfg.note, "bedtime": bedtime.isoformat()},
+            dedupe_key=f"sign_off:{bedtime.astimezone(UTC).isoformat(timespec='minutes')}",
+            reason="sign_off",
+        )
+
     async def mark_proactive_sent(self, kind_name: str, day: date, conversation_id: str) -> None:
         """记下这次主动，用于同类间隔和"没被回应"的衰减。"""
         await self.memory.kv_set(f"last_proactive:{kind_name}", day.isoformat())

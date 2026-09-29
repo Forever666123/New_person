@@ -157,6 +157,7 @@ async def build(tmp_path: Path, persona: Persona, script: list, *, now=EVENING):
     scheduler.register("reply", app.handle_reply_job)
     scheduler.register("proactive", app.handle_proactive_job)
     scheduler.register("follow_up", app.handle_proactive_job)
+    scheduler.register("sign_off", app.handle_sign_off_job)
     scheduler.register("memory_update", app.handle_memory_update_job)
     return app, channel, llm, clock, memory
 
@@ -3185,3 +3186,108 @@ async def test_after_a_restore_a_later_opener_is_not_part_of_the_reply(
     )
     got = {r[0]: r[1] for r in await rows.fetchall()}
     assert got["加油"] and got["今天实验室好冷"] is None, got
+
+
+# -- 睡前说一声再走 ------------------------------------------------------------
+
+
+async def _bedtime(app: App, around: datetime) -> datetime:
+    return app.rhythm.next_sleep_after(around)
+
+
+async def test_she_says_she_is_going_to_sleep_when_they_were_chatting(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """聊着聊着到了她睡觉的点：她说一句再走，不是一声不吭下线、第二天才回。"""
+    goodnight = ProactivePlan(send=True, parts=[ReplyPart(text="困了 我睡了")])
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="哈哈")]), goodnight]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=30)
+    clock.set(at)
+    await send(app, "你还没睡啊", at=at, msg_id=1200)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, memory)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"]
+    assert len(sign) == 1 and sign[0].run_at < bedtime
+    clock.set(sign[0].run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts[-1] == "困了 我睡了"
+    assert clock.now() < bedtime
+
+
+async def test_his_last_words_before_her_bedtime_get_answered_before_she_sleeps(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他在她睡前几分钟说了一句，回复本来排到了明天：睡前回完，顺便说一声。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="我也是"), ReplyPart(text="睡了")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=12)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=1300)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, bedtime + timedelta(hours=9))
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(max(sign.run_at, at + timedelta(seconds=30)) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    moved = await memory.get_job(reply.id or 0)
+    assert moved.run_at < bedtime, "他那句还是要等到明天"
+    clock.set(moved.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["我也是", "睡了"]
+    assert "你准备睡了" in llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_she_does_not_announce_bedtime_when_the_chat_died_long_ago(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """聊天早就停了的晚上，她直接睡，不专门跑来道晚安。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=85)
+    clock.set(at)
+    await send(app, "在干嘛", at=at, msg_id=1400)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, memory)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    calls = len(llm.calls)
+    clock.set(sign.run_at + timedelta(seconds=1))
+    assert clock.now() - at > timedelta(minutes=30)
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["嗯"] and len(llm.calls) == calls
+    assert (await memory.get_job(sign.id or 0)).status == "cancelled"
+
+
+async def test_there_is_at_most_one_goodnight_a_night(tmp_path: Path, persona: Persona) -> None:
+    """他在她睡前连着说好几句，睡前那一句也只排一个。"""
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    bedtime = await _bedtime(app, EVENING)
+    for i in range(4):
+        clock.set(bedtime - timedelta(minutes=40 - i * 5))
+        await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    assert len([j for j in await memory.pending_jobs() if j.kind == "sign_off"]) == 1
+
+
+def test_every_job_kind_has_a_handler_when_she_starts() -> None:
+    """每一种任务，App.start 里都得有人接。
+
+    sign_off 就是这么死的：类型定义了、调度器认它、体检数它，
+    可是没人注册处理它——排上了也只会以"没有 handler"作废，一年都没说过一句。
+    """
+    import re
+    import typing
+
+    from newperson.models import JobKind
+
+    source = (Path(__file__).resolve().parent.parent / "newperson" / "discord_bot.py").read_text(
+        encoding="utf-8"
+    )
+    registered = set(re.findall(r'register\("(\w+)"', source))
+    missing = set(typing.get_args(JobKind)) - registered
+    assert not missing, f"没人接的任务：{missing}"
