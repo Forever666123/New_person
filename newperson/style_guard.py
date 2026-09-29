@@ -24,16 +24,22 @@ import re
 from .models import ReplyPart, StyleViolation
 from .persona import Boundaries, StyleConfig
 
-_EMOJI = re.compile(
+_EMOJI_BASE = (
     "["
     "\U0001f300-\U0001faff"
     "\U00002600-\U000027bf"
-    "\U0001f1e6-\U0001f1ff"
     "\U00002b00-\U00002bff"
-    "\U0000fe0f"
     "\U00002190-\U000021ff"
     "\U00002300-\U000023ff"
     "]"
+)
+_EMOJI = re.compile(
+    # **按一个表情整串认，不按码位。** 🤦‍♀️ 是四个码位、🇨🇳 是两个、❤️ 带一个变体符：
+    # 按码位数会把一个表情数成好几个，修剪时从中间截断（国旗剩半面，显示成一个字母方块）；
+    # 剥的时候留下零宽连接符，贴在后面的"睡过头了"就对不上了
+    "[\U0001f1e6-\U0001f1ff]{1,2}"
+    f"|{_EMOJI_BASE}(?:[\ufe0f\U0001f3fb-\U0001f3ff]|\u200d{_EMOJI_BASE})*"
+    "|[\ufe0f\u200d]"
 )
 _CJK = re.compile(r"[一-鿿]")
 _LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
@@ -132,10 +138,20 @@ def _opens_with_greeting(opening: str, phrase: str) -> bool:
     if not opening.lower().startswith(phrase.lower()):
         return False
     rest = opening[len(phrase) :]
-    return not rest or rest[0] in GREETING_TAIL
+    if not rest:
+        return True
+    if rest[0] in "了的" and phrase[-1:] in ("好", "嗨", "吗", "么"):
+        # "了""的"是给"好久没聊了"留的。接在"你好""在吗"后面就是别的意思了：
+        # "你好了没 我到楼下了""嗨了一晚上"
+        return False
+    return rest[0] in GREETING_TAIL
 
 
-EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", "啊", "嗯", "哦", "噢", "诶", "唉", "我")
+EXCUSE_FILLERS = (
+    "不好意思", "对不起", "抱歉", "sorry", "sry",
+    "哎呀", "哈", "啊", "嗯", "哦", "噢", "诶", "欸", "唉", "哎", "嘿", "呜", "h",
+    "我",
+)
 """交代行踪前面常垫的那几个字。垫一个"哈哈""抱歉""我"就能绕过去的话，这道闸形同虚设。"""
 
 

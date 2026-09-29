@@ -1802,10 +1802,17 @@ class App:
         raw_photo = job.progress.get("photo")
         photo = ResolvedPhoto.model_validate(raw_photo) if raw_photo else None
         ledger_id = job.progress.get("ledger_id")
-        if await self.memory.unread_messages(CONVERSATION_ID):
-            # 他在前半句之后已经接话了：剩下的不硬塞，交给回复。说出口的那半算数
+        raw_spoke = job.progress.get("spoke_at")
+        spoke_at = datetime.fromisoformat(raw_spoke) if raw_spoke else None
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        he_spoke = bool(
+            spoke_at and conv.last_user_message_at and conv.last_user_message_at > spoke_at
+        )
+        if he_spoke or await self.memory.unread_messages(CONVERSATION_ID):
+            # 他在前半句之后已经接话了（回复可能都回完了，未读是空的）：剩下的不硬塞，
+            # 不然她的回复后面又冒出一句旧的后半截，话说两遍。说出口的那半算数
             log.info("[proactive] 发到一半他已经接话了，剩下的不发了")
-            await self._finish_proactive(plan, now, kind, ledger_id, spoke=True)
+            await self._count_proactive(job, plan, now, kind, ledger_id, spoke=True)
             return
         await self._deliver_proactive_plan(job, plan, photo, now, kind, ledger_id, start_index)
 
@@ -1819,6 +1826,11 @@ class App:
         ledger_id: int | None,
         start_index: int = 0,
     ) -> None:
+        # 同一次主动的所有气泡记成同一个时刻：体检按时刻把没挂批次的消息聚成一次开口，
+        # 续发那半用续发时的时刻记，一次就被数成两次
+        raw_spoke = job.progress.get("spoke_at") if start_index else None
+        spoke_at = datetime.fromisoformat(raw_spoke) if raw_spoke else now
+
         async def remember(exc: BaseException) -> None:
             """发到一半断了：说出口的记进库，再记住发到哪了，重试从断点接着发。
 
@@ -1829,16 +1841,24 @@ class App:
             partial = _spoken_part(exc)
             if partial is None:
                 return
-            await self._record_sent(partial, now)
-            await self.memory.save_job_progress(
-                job.id or 0,
-                {
-                    "plan": plan.model_dump(mode="json"),
-                    "sent_parts": partial.next_index,
-                    "photo": photo.model_dump(mode="json") if photo else None,
-                    "ledger_id": ledger_id,
-                },
+            await self._record_sent(partial, spoke_at)
+            # **说出口就记账，不等整条发完。** 续发可能永远走不到（普通主动只重试几分钟、
+            # 到时候她睡了、停机太久被作废）：那半句已经到他手机上了，不记的话
+            # 回访第二天又问同一件事，他没回她当天也会再开一个话头
+            counted, asked = await self._count_proactive(
+                job, plan, now, kind, ledger_id, spoke=bool(partial.sent_texts) or start_index > 0
             )
+            progress = {
+                "plan": plan.model_dump(mode="json"),
+                "sent_parts": partial.next_index,
+                "photo": photo.model_dump(mode="json") if photo else None,
+                "ledger_id": ledger_id,
+                "counted": counted,
+                "asked": asked,
+                "spoke_at": spoke_at.isoformat(),
+            }
+            await self.memory.save_job_progress(job.id or 0, progress)
+            job.progress = progress
 
         await self._on_phone()
         try:
@@ -1852,7 +1872,7 @@ class App:
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
-            await self._record_sent(blocked.result, now)
+            await self._record_sent(blocked.result, spoke_at)
             return
         except asyncio.CancelledError as exc:
             await asyncio.shield(remember(exc))
@@ -1861,10 +1881,37 @@ class App:
             await remember(exc)
             raise
 
-        await self._record_sent(result, now)
+        await self._record_sent(result, spoke_at)
         spoke = bool(result.sent_texts) or start_index > 0
         if spoke or result.photo_sent:
+            # 前面几条是上一次说出口的；还没记过账（旧版本存的进度）就按说过话算
+            earlier = start_index > 0 and not job.progress.get("counted")
+            await self._count_proactive(
+                job, plan, now, kind, ledger_id, spoke=bool(result.sent_texts) or earlier
+            )
+
+    async def _count_proactive(
+        self,
+        job: Job,
+        plan: ProactivePlan,
+        now: datetime,
+        kind: str,
+        ledger_id: int | None,
+        spoke: bool,
+    ) -> tuple[bool, bool]:
+        """这次主动记账，一次主动只记一次。返回 (记过了, 回访算问过了)。
+
+        发到一半时就记过的，续发完不再重复加"没被回应"的次数；
+        只有第一次只发出了图、续发才说出文字的，补记一次"问过了"。
+        """
+        if not job.progress.get("counted"):
             await self._finish_proactive(plan, now, kind, ledger_id, spoke=spoke)
+            return True, spoke
+        asked = bool(job.progress.get("asked"))
+        if spoke and not asked and ledger_id is not None:
+            await self.memory.mark_ledger_asked(ledger_id, now)
+            asked = True
+        return True, asked
 
     async def _finish_proactive(
         self, plan: ProactivePlan, now: datetime, kind: str, ledger_id: int | None, spoke: bool
@@ -1910,6 +1957,14 @@ class App:
             await self._skip(job, "他早就不说话了，她直接睡")
             return
 
+        for other_kind in ("proactive", "follow_up"):
+            if any(j.progress.get("plan") for j in await self.memory.pending_jobs(other_kind, CONVERSATION_ID)):
+                # 她自己主动说到一半、在等续发：等它说完再道晚安，
+                # 不然"我查了"→"我睡了"→第二天醒来冒出后半句
+                await self.scheduler.defer(
+                    job.id or 0, later(now, timedelta(minutes=self.rng.uniform(1, 3)))
+                )
+                return
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
             reply = pending[0]
@@ -2380,5 +2435,13 @@ async def login_with_retry(
             raise
         except (aiohttp.ClientError, OSError, TimeoutError, discord.DiscordServerError) as exc:
             log.warning("[discord] 连不上 Discord（%r），%.0f 秒后再试", exc, delay)
+            await sleep(delay)
+            delay = min(delay * 2, cap)
+        except discord.HTTPException as exc:
+            # Cloudflare 临时封 IP（1015）时抛的是普通的 HTTPException(429)，
+            # 不是上面那几种；一退出就是二十次启动、systemd 熔断
+            if exc.status != 429:
+                raise
+            log.warning("[discord] 登录被限流（429），%.0f 秒后再试", delay)
             await sleep(delay)
             delay = min(delay * 2, cap)

@@ -223,7 +223,9 @@ def test_ordinary_sentences_are_not_taken_for_stock_phrases(persona: Persona, te
              "抱歉 刚在忙", "抱歉，刚在忙", "不好意思，刚刚在开会", "啊抱歉 刚在忙",
              "我刚刚才看到", "刚刚才看到你消息", "我才刚刚醒", "哈哈刚刚才醒",
              "刚起😂你呢", "我刚起🥱还没洗脸", "才起😭要迟到了",
-             "刚起了", "我刚起了", "刚起了 你呢", "才起了", "哈哈刚起了"],
+             "刚起了", "我刚起了", "刚起了 你呢", "才起了", "哈哈刚起了",
+             "🤦‍♀️睡过头了", "🙇‍♀️抱歉刚看到", "😮‍💨刚忙完",
+             "欸刚看到", "哎呀刚看到", "嘿嘿刚醒", "hhh刚看到"],
 )
 def test_the_stock_phrases_and_excuses_are_still_caught(persona: Persona, text: str) -> None:
     """套话说完了才算，交代行踪在开头才算——这两种照样拦。"""
@@ -248,3 +250,18 @@ def test_an_ordinary_slip_survives_the_guard(persona: Persona) -> None:
         [ReplyPart(text="我在图书馆", typo_text="我再图书馆")], persona.style, persona.boundaries
     )
     assert fixed[0].typo_text == "我再图书馆"
+
+
+@pytest.mark.parametrize("text", ["回国了🇨🇳", "无语🤦‍♀️", "好❤️", "好的👍🏻"])
+def test_one_emoji_is_one_emoji_however_many_code_points(persona: Persona, text: str) -> None:
+    """🤦‍♀️ 是四个码位、🇨🇳 是两个：按一个算，修剪时不从中间截断（国旗剩半面就是个字母方块）。"""
+    assert sg.count_emoji(text) == 1
+    fixed, _ = sg.enforce(parts(text), persona.style, persona.boundaries)
+    assert fixed[0].text == text
+
+
+@pytest.mark.parametrize("text", ["你好了没 我到楼下了", "你好了吗", "嗨了一晚上"])
+def test_you_done_yet_is_not_a_hello(persona: Persona, text: str) -> None:
+    """"你好了没""嗨了一晚上"不是寒暄："了"只在"好久没聊了"这种后面才算句末。"""
+    issues = sg.check([ReplyPart(text=text)], persona.style, persona.boundaries)
+    assert not [i for i in issues if i.kind == "banned_phrase"], issues

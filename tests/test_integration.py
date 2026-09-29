@@ -4475,6 +4475,121 @@ async def test_a_picture_that_cannot_be_sent_goes_into_cooldown(
     assert "big" in await memory.recently_used_photo_ids(clock.now())
 
 
+async def _promise_breaks_after_first_bubble(tmp_path: Path, persona: Persona, script: list):
+    """答应他的事两条气泡，第二条碰上一次 503。返回 (app, channel, llm, clock, memory, job_id)。"""
+    app, channel, llm, clock, memory = await build(tmp_path, persona, script)
+    real_send = channel.send
+    blips = {"left": 1}
+
+    async def one_blip(content=None, **kw):
+        if channel.texts and blips["left"]:
+            blips["left"] -= 1
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = one_blip
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "follow_up", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": at.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    return app, channel, llm, clock, memory, job_id
+
+
+async def test_the_rest_of_her_message_is_dropped_once_he_has_answered_the_first_half(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她说了前半句、第二句卡住，他马上接话、她也回完了：旧的后半句不再冒出来。
+
+    原来只看有没有未读，而她的回复已经把未读清掉了——她回完他，又补一句旧的尾巴，话说两遍。
+    """
+    app, channel, llm, clock, memory, job_id = await _promise_breaks_after_first_bubble(
+        tmp_path, persona,
+        [ProactivePlan(send=True, parts=[ReplyPart(text="诶我查了"), ReplyPart(text="那家周末不开")]),
+         ReplyPlan(parts=[ReplyPart(text="周末不开 白跑了哈哈")])],
+    )
+    assert channel.texts == ["诶我查了"]
+    await memory.reschedule_job(job_id, clock.now() + timedelta(minutes=10))
+    await send(app, "咋样 开不开", at=clock.now(), msg_id=4200)
+    await _deliver_one_reply(app, clock, memory)
+    assert channel.texts == ["诶我查了", "周末不开 白跑了哈哈"]
+    clock.set(clock.now() + timedelta(minutes=15))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["诶我查了", "周末不开 白跑了哈哈"], "旧的后半句又冒出来了"
+
+
+async def test_a_half_sent_message_is_counted_the_moment_it_is_spoken(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """前半句一到他手机上就记账：续发走不到（重试用完、她睡了），他没回也不会当天再开一个话头。
+    续发完成时也不重复记。"""
+    app, channel, llm, clock, memory, job_id = await _promise_breaks_after_first_bubble(
+        tmp_path, persona,
+        [ProactivePlan(send=True, parts=[ReplyPart(text="诶我查了"), ReplyPart(text="那家周末不开")])],
+    )
+    assert (await memory.get_conversation(CONVERSATION_ID)).unanswered_initiations == 1
+    await drain(app, clock, hops=5)
+    assert channel.texts == ["诶我查了", "那家周末不开"]
+    assert (await memory.get_conversation(CONVERSATION_ID)).unanswered_initiations == 1, "记了两次"
+    rows = await memory.db.execute(
+        "SELECT DISTINCT created_at FROM messages WHERE author_kind = 'bot'"
+    )
+    assert len(await rows.fetchall()) == 1, "同一次主动被记成两个时刻，体检会数成两次"
+
+
+async def test_the_goodnight_waits_for_her_own_unfinished_message(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她主动说到一半、在等续发：睡前那句等它说完，不插在中间。"""
+    app, _channel, llm, clock, memory = await build(tmp_path, persona, [])
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=10)
+    clock.set(at)
+    await memory.update_conversation(CONVERSATION_ID, last_user_message_at=at - timedelta(minutes=5))
+    unfinished = await app.scheduler.schedule(
+        "follow_up", at + timedelta(minutes=30), conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "x"},
+    )
+    await memory.save_job_progress(
+        unfinished,
+        {"plan": ProactivePlan(send=True, parts=[ReplyPart(text="a"), ReplyPart(text="b")])
+         .model_dump(mode="json"), "sent_parts": 1},
+    )
+    sign = await app.scheduler.schedule(
+        "sign_off", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "sign_off", "note": "", "bedtime": bedtime.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    moved = await memory.get_job(sign)
+    assert moved.status == "pending" and moved.run_at > at
+    assert llm.calls == [], "没等她说完就去想睡前那句了"
+
+
+async def test_being_rate_limited_at_login_is_waited_out() -> None:
+    """登录撞上 Cloudflare 的 429：退避重试，不是退出、让 systemd 熔断。"""
+    import discord
+
+    from newperson.discord_bot import login_with_retry
+
+    waits: list[float] = []
+    tries = {"n": 0}
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    class RateLimited:
+        async def login(self, _token: str) -> None:
+            tries["n"] += 1
+            if tries["n"] <= 2:
+                raise discord.HTTPException(SimpleNamespace(status=429, reason="Too Many Requests"), "1015")
+
+    await login_with_retry(RateLimited(), "x", sleep=fake_sleep)
+    assert tries["n"] == 3 and len(waits) == 2
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 
