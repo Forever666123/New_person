@@ -474,6 +474,9 @@ def test_the_low_mood_mode_does_not_steer_back_to_his_tasks(persona: Persona) ->
     mode = next(m for m in persona.modes if m.name == "低气压")
     assert "落到事上" not in mode.instruction
     assert "别提他的任务" in mode.instruction
+    # system prompt 里的 voice 每次都跟着，原来那里还写着"先接情绪，再落到事上"，
+    # 两句一起给她，前面那条修了等于没修
+    assert "落到事上" not in persona.voice and "那现在怎么办" not in persona.voice
     # 但也不能变成心理咨询：那几条"不要"还得在
     for still_banned in ("不讲道理", "不给建议清单", "不问"):
         assert still_banned in mode.instruction
@@ -774,3 +777,25 @@ async def test_a_time_given_after_she_asked_is_kept(tmp_path: Path, persona: Per
         assert await memory.due_ledger_entry("study", _his(9, 29, 4, 30), 4) is None
     finally:
         await memory.close()
+
+
+
+def test_only_trading_is_held_to_what_he_said_before(persona: Persona) -> None:
+    """"对不上就翻出来问他"只是交易那一件事的姿态。作息、课业、英语不较真。
+
+    原来这句写死在代码里，六个话题都加：她变成每件事都翻旧账的人。
+    """
+    from datetime import datetime
+
+    from newperson.models import LedgerEntry
+    from newperson.prompts import build_reply_user
+
+    entry = (1, datetime(2026, 10, 1, 20, 0), LedgerEntry(kind="sleep", claim="今晚一定早睡"))
+    text = build_reply_user(
+        persona=persona, situation="", summary="", owner_facts=[], self_facts=[],
+        ledger=[entry], ledger_topic="说过的作息", mode_instruction="", recent=[], unread=[],
+        hints=[], photos=[],
+    )
+    assert "翻出来问他" not in text
+    trading = next(m for m in persona.modes if m.name == "trading")
+    assert "翻出来问他" in trading.instruction

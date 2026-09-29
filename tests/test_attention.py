@@ -342,6 +342,29 @@ def test_while_awake_she_never_leaves_him_hanging_for_a_whole_day(
     assert checked > 1000
 
 
+def test_a_chat_that_runs_into_her_class_slows_down(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """聊着聊着进了她的课：几分钟偷看一眼，不再跟没课的晚上一样一分半钟回一句。"""
+    import statistics
+
+    in_class: list[float] = []
+    free: list[float] = []
+    for offset in range(40):
+        for minute in range(0, 180, 20):
+            at = evening(offset).replace(hour=18, minute=0) + timedelta(minutes=minute)
+            if rhythm.is_sleeping(at):
+                continue
+            seed = offset * 1000 + minute
+            d = policy.plan_reply(at, "hot", extract_features(["嗯"], persona), at, random.Random(seed))
+            gap = (d.reply_at - at).total_seconds()
+            (in_class if rhythm.class_containing(at) else free).append(gap)
+    assert len(in_class) > 50 and len(free) > 50
+    assert statistics.median(in_class) > 2 * statistics.median(free), (
+        f"课上中位 {statistics.median(in_class):.0f}s，没课 {statistics.median(free):.0f}s"
+    )
+
+
 def test_she_usually_deals_with_the_backlog_on_the_first_look(
     policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
 ) -> None:

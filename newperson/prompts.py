@@ -232,7 +232,8 @@ def build_situation(
     diary_notes: list[str],
 ) -> str:
     """"你现在在哪、在干嘛、今天什么状态"。每次请求都不一样，所以放 user 消息里。"""
-    lines = [f"现在是 {format_time(now)}，你这边的时间。"]
+    # 年份只放在易变层：人设里写的是出生年份、哪年认识，她得知道今年是哪年
+    lines = [f"现在是 {now.year} 年 {format_time(now)}，你这边的时间。"]
 
     owner_tz = persona.owner_tz
     if owner_tz is not None:
@@ -327,7 +328,9 @@ def build_reply_user(
         # 小标题跟着类别走。写死"在交易上说过的话"的话，一条作息承诺
         # 会被摆进查账的框里，而作息那段人设又明确禁止说教——两层指令打架。
         blocks.append(
-            _section(f"他之前{ledger_topic or '说过的话'}", f"{ledger_text}\n对不上的时候，直接翻出来问他。")
+            # 较不较真由各话题自己的指示说（只有交易那一条要当面点破）。
+            # 原来这里给所有话题都加一句"对不上就翻出来问他"，作息、课业也被较真
+            _section(f"他之前{ledger_topic or '说过的话'}", ledger_text)
         )
     not_yet_text = format_not_yet(not_yet)
     if not_yet_text:

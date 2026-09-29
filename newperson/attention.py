@@ -191,6 +191,11 @@ class AttentionPolicy:
     ) -> tuple[datetime, int]:
         """她什么时候看到这条消息。"""
         if heat == "hot":
+            if snapshot.state == "busy":
+                # 聊进了课里：嘴上说在上课，就不能还跟没课的晚上一样一分半钟回一句
+                steps.append(f"在{snapshot.block_title or '上课'}，偷偷看一眼")
+                median = self.persona.timing.class_hot_notice_minutes * 60
+                return later(now, timedelta(seconds=self._lognormal(median, 0.8, rng))), 0
             steps.append("正在聊，手机就在手上")
             return now, 0
 

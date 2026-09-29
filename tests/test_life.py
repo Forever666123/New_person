@@ -333,3 +333,43 @@ def test_persona_files_have_no_duplicate_keys(name: str) -> None:
     Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_dupes)
     root = Path(__file__).resolve().parent.parent
     yaml.load((root / "persona" / name).read_text(encoding="utf-8"), Loader=Strict)  # noqa: S506
+
+
+def test_she_rarely_starts_a_chat_in_the_middle_of_class(persona: Persona) -> None:
+    """有课的日子里，她主动开口落在课上的比例，不高于她看手机落在课上的比例。
+
+    原来按"当场处理的概率"接受，那个数被压在 0.55~1 之间：课上主动的比例是
+    看手机的近两倍——状态写着在上课，她却忽然说一句"今天雪好大"。
+    """
+    calendar = AcademicCalendar(persona.academic, persona.seed)
+    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    life = LifeEngine.__new__(LifeEngine)
+    life.rhythm, life.persona = rhythm, persona
+    kind = next(k for k in persona.proactive.kinds if k.name == "own_life")
+
+    in_class = total = 0
+    glance_in_class = glance_total = 0
+    for day_offset in range(90):
+        day = (datetime(2026, 9, 15, tzinfo=persona.tz) + timedelta(days=day_offset)).date()
+        daily = rhythm.for_day(day)
+        if not daily.classes or daily.sleep_start <= daily.wake:
+            continue
+        for seed in range(20):
+            life.rng = random.Random(day_offset * 100 + seed)
+            moment = life._sample_moment(kind, daily.wake, daily.sleep_start, day)
+            if moment is None:
+                continue
+            total += 1
+            in_class += rhythm.class_containing(moment) is not None
+        rng = random.Random(day_offset)
+        t = daily.wake
+        while t < daily.sleep_start:
+            t = rhythm.next_glance_after(t, rng)
+            if t >= daily.sleep_start:
+                break
+            glance_total += 1
+            glance_in_class += rhythm.class_containing(t) is not None
+    assert total > 300 and glance_total > 300
+    assert in_class / total <= glance_in_class / glance_total + 0.02, (
+        f"课上主动 {in_class / total:.1%}，课上看手机 {glance_in_class / glance_total:.1%}"
+    )

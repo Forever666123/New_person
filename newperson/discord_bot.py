@@ -888,12 +888,17 @@ class App:
         # 原来库里清成了 None，这一次却还拿着上一段热聊开始的时刻：
         # 隔了一夜他发的第一句，疲劳倍率顶满 ×8，还被提示"可以自然收尾了"。
         session = conv.hot_session_started_at
+        # 停了一阵再聊（还在 warm 里）也从头算，不然停二三十分钟再接上，
+        # 第二段一直按上一段的"聊了多久"放慢、被提示收尾
+        rested = prior is not None and unread[0].created_at - prior > timedelta(
+            minutes=self.persona.timing.fatigue_reset_minutes
+        )
+        if (heat == "cold" or rested) and session is not None:
+            session = None
+            await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
         if heat == "hot" and session is None:
             session = now
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=now)
-        elif heat == "cold":
-            session = None
-            await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         decision = self.attention.plan_reply(
             now,

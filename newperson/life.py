@@ -482,7 +482,10 @@ class LifeEngine:
             moment = wake + timedelta(seconds=self.rng.uniform(0, span))
             if not self._hours_allowed(kind, moment):
                 continue
-            if self.rng.random() <= self.rhythm.engage_probability_at(moment):
+            # 按活跃度本身接受，不按"当场处理的概率"：后者被压在 0.55~1 之间，
+            # 活跃度差四倍、接受率只差一倍半，结果她主动的时刻几乎均匀铺开——
+            # 上午九点多比例是她看手机的五倍，晚上她最常拿手机反而少，课上也照样开口
+            if self.rng.random() <= min(1.0, self.rhythm.activity_at(moment)):
                 return moment
         for _ in range(30):
             moment = wake + timedelta(seconds=self.rng.uniform(0, span))

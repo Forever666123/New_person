@@ -4083,6 +4083,30 @@ async def test_an_old_np_now_does_not_carry_her_retries_into_sleep(
     assert channel.texts == [] and llm.calls == []
 
 
+async def test_picking_up_after_a_pause_does_not_count_as_one_long_chat(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """聊了一个多小时，停了二十多分钟再接上：从头算"聊了多久"，不一接上就放慢、想收尾。"""
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    await memory.update_conversation(
+        CONVERSATION_ID, hot_session_started_at=EVENING - timedelta(minutes=100)
+    )
+    last = EVENING - timedelta(minutes=25)
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID, discord_message_id=4400, author_id=42,
+            author_name="Leo", content="好", created_at=last - timedelta(minutes=1),
+        )
+    )
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], last)
+    await memory.add_bot_message(CONVERSATION_ID, "嗯", last)
+    clock.set(EVENING)
+    await send(app, "对了", at=EVENING, msg_id=4401)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert "聊久了" not in (job.reason or ""), job.reason
+    assert not [h for h in job.payload.get("hints", []) if "收尾" in h]
+
+
 async def test_her_opening_after_a_quiet_spell_starts_a_fresh_chat(
     tmp_path: Path, persona: Persona
 ) -> None:

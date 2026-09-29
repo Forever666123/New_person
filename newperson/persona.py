@@ -496,6 +496,13 @@ class TimingConfig(BaseModel):
     中位数一分多钟，三五分钟才回也很常见。
     """
     hot_reply_sigma: float = 0.8
+    class_hot_notice_minutes: float = 5.0
+    """聊进了她的课里，隔多久偷看一眼手机（中位数）。
+
+    她嘴上说在上课，就不能还一分半钟回一句，跟没课的晚上一样快。
+    """
+    fatigue_reset_minutes: float = 15.0
+    """两句之间停了这么久，"聊了多久"就从头算。停一会儿再聊，不该一接上就想收尾。"""
     backlog_after_wake_hours: float = 3.0
     """睡着时积压的消息，醒来之后最多拖多久。
 
