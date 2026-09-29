@@ -119,11 +119,14 @@ def time_of_day_at(dt: datetime) -> TimeOfDay:
 
 
 def _tagged(photos: list, tags: list[str] | None) -> list:
-    """只留标签对得上的。没给标签就全留。"""
+    """只留标签对得上的。没给标签就全留。
+
+    跟照片库一样不分大小写：index.yaml 是手写的，"Boston"顺手就大写了。
+    """
     if not tags:
         return photos
-    wanted = set(tags)
-    return [p for p in photos if wanted & set(p.tags)]
+    wanted = {t.strip().lower() for t in tags}
+    return [p for p in photos if wanted & {t.strip().lower() for t in p.tags}]
 
 
 def _said_at(unread: list) -> datetime | None:
@@ -1203,6 +1206,19 @@ class App:
                 # 下标一错位，她就引用几个小时前的一句去回。
                 unread = await self.memory.batch_messages(CONVERSATION_ID, covers)
                 raw = job.progress.get("goodnight")
+                if (
+                    raw
+                    and start_index > 0
+                    and now.astimezone(UTC) >= datetime.fromisoformat(raw).astimezone(UTC)
+                    and not self._fresh_half(job, now)
+                ):
+                    # 剩下的是那晚睡前的话（多半就是"困了 先睡了"），那晚已经过去了。
+                    # 醒来第一句是"我先睡了"最像程序。前面说出口的算数，剩下的不补发，
+                    # 收尾照走：记下今晚说过了、台账和答应的事照记
+                    log.info("[job] 睡前那条回复剩下的半句过时了，不补发")
+                    reply_plan = reply_plan.model_copy(
+                        update={"parts": reply_plan.parts[:start_index], "photo_request": None}
+                    )
                 await self._deliver_reply(
                     job, reply_plan, unread, now, start_index, covers,
                     goodnight=datetime.fromisoformat(raw) if raw else None,

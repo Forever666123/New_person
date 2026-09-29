@@ -4186,6 +4186,55 @@ async def test_a_rethought_reply_is_stamped_with_when_it_was_thought(
     assert clock.now() - datetime.fromisoformat(progress["planned_at"]) < timedelta(minutes=5)
 
 
+async def test_the_unsent_half_of_a_goodnight_is_dropped_the_next_morning(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前那条回复发了一半卡住，拖到第二天醒来：剩下的"困了 先睡了"不补发。
+
+    醒来第一句是"我先睡了"最像程序。前面说出口的那句算数。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona,
+        [ReplyPlan(parts=[ReplyPart(text="哈哈对"), ReplyPart(text="困了 先睡了")])],
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=15)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=3600)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(job.id or 0, at + timedelta(minutes=1))
+    real_send = channel.send
+
+    async def second_fails(content=None, **kw):
+        if channel.texts:
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = second_fails
+    clock.set(at + timedelta(minutes=1, seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["哈哈对"]
+    assert (await memory.get_job(job.id or 0)).progress.get("goodnight")
+
+    channel.send = real_send
+    morning = app.rhythm.next_wake_after(bedtime) + timedelta(hours=1)
+    await memory.reschedule_job(job.id or 0, morning)
+    clock.set(morning + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["哈哈对"], "醒来第一句是'困了 先睡了'"
+    assert (await memory.get_job(job.id or 0)).status == "done"
+
+
+async def test_photo_tags_are_matched_regardless_of_case(tmp_path: Path, persona: Persona) -> None:
+    """index.yaml 是手写的，"Window""Boston"顺手就大写了：照样对得上。"""
+    from newperson.models import Photo
+
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    app.media.library.photos = [Photo(id="win-001", file="c.jpg", tags=["Window", "Boston"])]
+    window = next(k for k in persona.proactive.kinds if k.photo_tags and k.requires_photo)
+    assert await app.life.has_photos(window.photo_tags)
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

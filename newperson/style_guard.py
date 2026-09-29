@@ -152,7 +152,9 @@ def _clauses(text: str) -> list[tuple[str, bool]]:
     for m in _CLAUSE.finditer(text):
         clause = m.group()
         after = text[m.end() :].lstrip()[:1]
-        out.append((clause, clause.endswith(_ASKING_TAIL) or after in ("?", "？")))
+        # 句尾粘着的表情和笑声不改变语气："刚醒吗😂""刚醒吗哈哈"还是在问他
+        core = _EMOJI.sub("", clause).rstrip("哈hH")
+        out.append((clause, core.endswith(_ASKING_TAIL) or after in ("?", "？")))
     return out
 
 
