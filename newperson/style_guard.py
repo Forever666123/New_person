@@ -142,7 +142,7 @@ EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", 
 _JUST = re.compile("刚才|才刚|刚刚")
 """这几种说法都当"刚"：清单里写"刚看到"，模型写的常是"刚才看到""才刚看到"。"""
 
-_CLAUSE = re.compile(r"[^\s，。、！？!?,.~～…；;：:（）()【】「」]+")
+_CLAUSE = re.compile(r"[^\s，。、！？!?,.~～…；;：:（）()【】「」—–]+")
 _ASKING_TAIL = ("吗", "么", "没", "嘛")
 
 
@@ -156,11 +156,15 @@ def _clauses(text: str) -> list[tuple[str, bool]]:
     return out
 
 
-def _starts_with_excuse(text: str, phrase: str) -> bool:
+def _starts_with_excuse(text: str, phrase: str, whole: bool = False) -> bool:
     """这条消息是不是**一开口**就在交代自己刚才在干嘛。
 
-    看前两个小句：每句先剥掉打头的垫话（哈哈、抱歉、我……），"刚刚"当"刚"，
-    再比前缀。放在后面的是正常说话："我室友在睡觉""你说的那个我还没看到"。
+    看前两个真说了话的小句：每句先剥掉打头的垫话（哈哈、抱歉、我……），
+    "刚刚""刚才"当"刚"，再比前缀。放在后面的是正常说话："我室友在睡觉"
+    "你说的那个我还没看到"。只有垫话的小句（"哈哈 抱歉 刚看到"里的前两个）不占名额，
+    不然垫两下就绕过去了。
+
+    ``whole`` 为真时短语后面得到此为止："刚起 你呢"算，"刚起了个头"不算。
     """
     want = _JUST.sub("刚", phrase.lower())
     # "我"只在"刚/才/还"前面算垫话："我刚醒"是交代，"我在睡觉前看了会书"不是
@@ -168,20 +172,31 @@ def _starts_with_excuse(text: str, phrase: str) -> bool:
         EXCUSE_FILLERS if want[:1] in ("刚", "才", "还")
         else tuple(f for f in EXCUSE_FILLERS if f != "我")
     )
-    for clause, asking in _clauses(text.lower())[:2]:
+    counted = 0
+    for clause, asking in _clauses(text.lower()):
+        if counted >= 2:
+            break
         if asking:
+            counted += 1
             continue  # "早 刚醒吗""下课了？刚忙完没"是在问他，不是交代自己
         # 每剥一层都比一次：短语自己可能就带着垫话（"抱歉刚"），剥光了反而对不上
         # 打头的表情也是垫话："😂刚醒"
         rest = _EMOJI.sub("", _JUST.sub("刚", clause)).lstrip()
         while rest:
-            if rest.startswith(want):
+            if rest.startswith(want) and (not whole or _phrase_ends(rest[len(want) :])):
                 return True
             filler = next((f for f in fillers if rest.startswith(f)), None)
             if filler is None:
                 break
             rest = rest[len(filler) :]
+        if rest:
+            counted += 1
     return False
+
+
+def _phrase_ends(after: str) -> bool:
+    """短语说到这里就完了：后面没了，或者只跟着语气词、标点、表情。"""
+    return not after or after[0] in PHRASE_TAIL or not after[0].isalnum()
 
 
 def _says(text: str, phrase: str) -> bool:
@@ -285,8 +300,10 @@ def check(
         # 寒暄只有在开口那一下才是寒暄。掐掉前面的标点空白再比，
         # 这样"在吗"作为整条消息会被拦下，"我现在吗？在图书馆"不会。
         opening = text.lstrip(OPENING_NOISE)
-        for phrase in boundaries.never_start_with:
-            if _starts_with_excuse(text, phrase):
+        starts = [(p, False) for p in boundaries.never_start_with]
+        starts += [(p, True) for p in boundaries.never_start_with_whole]
+        for phrase, whole in starts:
+            if _starts_with_excuse(text, phrase, whole):
                 issues.append(
                     StyleViolation(
                         kind="banned_phrase",

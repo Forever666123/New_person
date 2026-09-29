@@ -75,6 +75,14 @@ OWNER_NOW_GRACE = timedelta(minutes=10)
 """!np now 的记号只管敲命令之后这么久。"""
 
 
+def _spoken_part(exc: BaseException) -> Any:
+    """投递半途出错时，已经发到他手机上的那部分。一个字都没发出去就是 None。"""
+    partial = getattr(exc, "delivery_result", None)
+    if partial is not None and (partial.sent_texts or partial.photo_sent):
+        return partial
+    return None
+
+
 def _owner_pushed_just_now(job: Job, now: datetime) -> bool:
     """你刚用 !np now 催过这一条。之后的重试不算，照样要过睡眠闸。"""
     raw = job.payload.get("owner_now")
@@ -1229,6 +1237,9 @@ class App:
         if goodnight is not None:
             progress["goodnight"] = goodnight.isoformat()
         await self.memory.save_job_progress(job.id or 0, progress, covers)
+        # 内存里的 job 也换成新的：重想的那几条路上它还拿着旧 plan 的 planned_at，
+        # 发出第一条后会被写回库里，新回复就被当成"很久以前的"
+        job.progress = progress
 
         if not reply_plan.parts and not reply_plan.reaction:
             log.info("[brain] 这条她不打算回")
@@ -1377,22 +1388,23 @@ class App:
             raise
 
         await self._record_sent(result, now, batch)
-        if goodnight is not None and result.sent_texts and not result.interrupted:
+        # 续发时前面几条是上一次发出去的：改错字那几秒里停机，重启续发时
+        # 一条都不剩，这一次的 sent_texts 是空的——可话其实已经说出口了
+        spoke = bool(result.sent_texts) or start_index > 0
+        if goodnight is not None and spoke and not result.interrupted:
             await self._mark_signed_off(goodnight)
         riding = job.payload.get("riding_follow_up")
-        if riding and result.sent_texts and not result.interrupted:
+        if riding and spoke and not result.interrupted:
             # 答应他的那件事跟着这次回复说出口了
             rider = await self.memory.get_job(int(riding))
             if rider is not None and rider.status == "pending":
                 await self.scheduler.cancel(int(riding))
-        if result.sent_texts or result.photo_sent:
+        if spoke or result.photo_sent:
             # 发得出去就把"发不出去"这个判断收回来。
             # 不收的话，一次 403（你临时退了共同服务器、关了私信）之后
             # 她就永远只回话、再也不主动了——而回复照常，你根本不会发现。
             await self._mark_deliverable(True)
-        await self._after_reply(
-            plan, now, sent_any=bool(result.sent_texts), said_at=_said_at(unread)
-        )
+        await self._after_reply(plan, now, sent_any=spoke, said_at=_said_at(unread))
 
         if result.interrupted:
             log.info("[delivery] 他又发了，剩下的不发了，重新排一次")
@@ -1722,13 +1734,18 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
             await self._record_sent(blocked.result, now)
             return
-        except (Exception, asyncio.CancelledError) as exc:
-            # 跟回复那条路一样：网络断在中间时前几条已经到他手机上了。
-            # 不记下来的话她自己的历史里就少一截，而重试会拿到同一条台账条目
-            # （asked_at 还没写），于是同一件事被问两遍，措辞还不一样——
-            # 因为第一次说的话根本不在她的 recent 里。
+        except asyncio.CancelledError as exc:
             await self._record_partial(exc, now)
             raise
+        except Exception as exc:
+            # 网络断在中间时前几条已经到他手机上了。**说出口的算数，不从头重来**：
+            # 主动消息不像回复那样记进度，重试是重新生成、从第一句重发。
+            # 答应他的事要重试十几个小时，要是第二条（常见的是那张图）一直发不出去，
+            # 同一件事会换着措辞说十几遍。一个字都没发出去的才交给调度器重试。
+            result = _spoken_part(exc)
+            if result is None:
+                raise
+            log.warning("[delivery] 主动消息发到一半断了，说出口的算数：%r", exc)
 
         await self._record_sent(result, now)
         # 回访必须真的发出了**文字**才算问过。只发一张没配字的照片
@@ -1842,9 +1859,14 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
             await self._record_sent(blocked.result, now, batch)
             return
-        except (Exception, asyncio.CancelledError) as exc:
+        except asyncio.CancelledError as exc:
             await self._record_partial(exc, now, batch)
             raise
+        except Exception as exc:
+            result = _spoken_part(exc)  # 同主动消息：说出口的算数，不从头再道一次晚安
+            if result is None:
+                raise
+            log.warning("[delivery] 睡前那句发到一半断了，说出口的算数：%r", exc)
         await self._record_sent(result, now, batch)
         if result.sent_texts:
             await self._mark_signed_off(bedtime)

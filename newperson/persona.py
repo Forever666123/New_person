@@ -301,6 +301,8 @@ class Boundaries(BaseModel):
     跟寒暄不一样，这种后面往往还接着话（"刚看到你消息"），所以只看前缀，
     不要求到此为止。放在句子中间是正常说话："我室友在睡觉""你说的那个我还没看到"。
     """
+    never_start_with_whole: list[str] = Field(default_factory=list)
+    """同上，但短语得到此为止："刚起 你呢""我刚起"算，"刚起了个头"不算。"""
     deflect_topics: list[str] = Field(default_factory=list)
     """被问到就岔开或者不答的话题。"""
     deflect_hint: str = ""

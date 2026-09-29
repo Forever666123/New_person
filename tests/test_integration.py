@@ -4082,6 +4082,110 @@ async def test_stopping_the_service_mid_reply_keeps_what_she_already_said(
     assert (await again.get_job(job.id or 0)).status == "pending"
 
 
+async def test_a_goodnight_fully_sent_before_a_restart_still_counts(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前那条回复最后一句已经发出去了，还没收尾就重启：续发时没有要发的，也算说过了。
+
+    改错字要等 4–20 秒，停机落在这段里就是这样。原来续发时 sent_texts 是空的，
+    "今晚说过了"不记，到点 sign_off 又说一遍要睡了。
+    """
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=18)
+    clock.set(at)
+    await send(app, "你还不睡", at=at, msg_id=3400)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    await memory.mark_read([m.id for m in unread], at)
+    plan = ReplyPlan(parts=[ReplyPart(text="哈哈我也困了 先睡了")])
+    await memory.save_job_progress(
+        job.id or 0,
+        {"plan": plan.model_dump(mode="json"), "sent_parts": 1,
+         "planned_at": at.isoformat(), "goodnight": bedtime.isoformat()},
+        max(m.id for m in unread),
+    )
+    await memory.reschedule_job(job.id or 0, at + timedelta(minutes=3))
+    clock.set(at + timedelta(minutes=3, seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [] and llm.calls == []
+    assert not [j for j in await memory.pending_jobs() if j.kind == "sign_off"], "到点还会再道一次晚安"
+
+
+async def test_a_promise_half_delivered_is_not_repeated_a_dozen_times(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """答应他的事发到一半断了：说出口的算数，任务结束，不从头重新生成、重发第一句。
+
+    follow_up 要重试十几个小时；第二条（常见的是那张图）一直发不出去的话，
+    同一件事原来会换着措辞说十几遍。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona,
+        [ProactivePlan(send=True, parts=[ReplyPart(text="我查了"), ReplyPart(text="那家周末不开")])] * 3,
+    )
+    real_send = channel.send
+
+    async def second_fails(content=None, **kw):
+        if channel.texts:
+            raise RuntimeError("413 Payload Too Large")
+        return await real_send(content, **kw)
+
+    channel.send = second_fails
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "follow_up", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": at.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    await drain(app, clock, hops=10)
+    assert channel.texts == ["我查了"] and len(llm.calls) == 1
+    assert (await memory.get_job(job_id)).status == "done"
+    rows = await memory.db.execute("SELECT content FROM messages WHERE author_kind = 'bot'")
+    assert [r[0] for r in await rows.fetchall()] == ["我查了"]
+
+
+async def test_a_rethought_reply_is_stamped_with_when_it_was_thought(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """!np now 当场重想的回复，进度里记的是这次想好的时刻，不是旧 plan 的。
+
+    原来发出第一条后写回的是几个小时前那份的时刻：第二条一抖，
+    剩下的半句就被当成"很久以前的"推到第二天。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona,
+        [ReplyPlan(parts=[ReplyPart(text="旧的")]),
+         ReplyPlan(parts=[ReplyPart(text="新的"), ReplyPart(text="第二句")])],
+    )
+    await send(app, "在吗", at=EVENING, msg_id=3500)
+    real_send = channel.send
+
+    async def discord_down(*_a, **_kw):
+        raise RuntimeError("503 Service Unavailable")
+
+    channel.send = discord_down
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+
+    async def second_fails(content=None, **kw):
+        if channel.texts:
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = second_fails
+    clock.set(clock.now() + timedelta(minutes=50))
+    await owner.handle("!np now", _owner_ctx(app))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["新的"]
+    progress = (await memory.get_job(job.id or 0)).progress
+    assert progress["sent_parts"] == 1
+    assert clock.now() - datetime.fromisoformat(progress["planned_at"]) < timedelta(minutes=5)
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

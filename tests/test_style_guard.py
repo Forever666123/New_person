@@ -213,7 +213,10 @@ def test_ordinary_sentences_are_not_taken_for_stock_phrases(persona: Persona, te
              "抱歉刚在忙", "哈哈 刚醒", "Sorry 刚看到", "我还在睡", "抱抱你", "加油鸭",
              "早点休息呗", "不好意思刚刚在开会", "嗯 我才看到",
              "刚才看到你消息", "才刚看到 等我一下", "我睡过头了 你说啥", "刚才在睡觉 怎么了",
-             "😂刚醒", "哈哈刚才看到", "我才刚醒"],
+             "😂刚醒", "哈哈刚才看到", "我才刚醒",
+             "哈哈 抱歉 刚看到", "啊 sorry 刚醒", "😂😂 抱歉 刚醒", "哈哈哈，不好意思，刚看到",
+             "嗯——刚醒", "sry sry 刚看到",
+             "刚起 你呢", "我刚起", "刚起来 头好痛", "哈哈刚起", "才起来"],
 )
 def test_the_stock_phrases_and_excuses_are_still_caught(persona: Persona, text: str) -> None:
     """套话说完了才算，交代行踪在开头才算——这两种照样拦。"""
