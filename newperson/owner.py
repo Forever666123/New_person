@@ -176,8 +176,11 @@ async def _now(_args: list[str], ctx: OwnerContext) -> str:
         unread = await ctx.memory.unread_messages(ctx.conversation_id)
         return "没有排着的回复" + (f"，但有 {len(unread)} 条未读" if unread else "")
     for job in jobs:
-        # 带个记号：她睡着的时候回复会被推到醒来，你亲手催的不算
-        await ctx.scheduler.reschedule(job.id or 0, ctx.now, {**job.payload, "owner_now": True})
+        # 带个记号：她睡着的时候回复会被推到醒来，你亲手催的这一下不算。
+        # 记的是时刻，只管这一下：之后重试十几个小时的，照样要过睡眠闸
+        await ctx.scheduler.reschedule(
+            job.id or 0, ctx.now, {**job.payload, "owner_now": ctx.now.isoformat()}
+        )
     return f"催了 {len(jobs)} 条，马上发"
 
 

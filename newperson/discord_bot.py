@@ -71,6 +71,20 @@ CATCHUP_CURSOR = "catchup_cursor:"
 STALE_PLAN = timedelta(minutes=30)
 """想好的回复一条都没发出去、又放了这么久，就不照原样发了，放回未读重新排。"""
 
+OWNER_NOW_GRACE = timedelta(minutes=10)
+"""!np now 的记号只管敲命令之后这么久。"""
+
+
+def _owner_pushed_just_now(job: Job, now: datetime) -> bool:
+    """你刚用 !np now 催过这一条。之后的重试不算，照样要过睡眠闸。"""
+    raw = job.payload.get("owner_now")
+    if not isinstance(raw, str):
+        return False  # 旧版本留下的 True 当作已经过期
+    try:
+        return now - datetime.fromisoformat(raw) <= OWNER_NOW_GRACE
+    except ValueError:
+        return False
+
 MEMORY_RETRY_BACKOFF = timedelta(hours=6)
 """记忆整理失败之后隔这么久才再试。见 _maybe_summarize 为什么不能不退避。"""
 
@@ -1127,15 +1141,13 @@ class App:
         now = self.clock.now()
         from .models import ReplyPlan
 
-        if (
-            self.rhythm.is_sleeping(now)
-            and not job.payload.get("owner_now")
-            and not int(job.progress.get("sent_parts", 0))
-        ):
+        pushed = _owner_pushed_just_now(job, now)
+        if self.rhythm.is_sleeping(now) and not pushed and not self._fresh_half(job, now):
             # **睡着的时候绝不回。** 排期时已经把回复推出了睡眠，可之后改时刻的几条路
             # 都不看作息：重试退避、重启后打散、他接着说话的防抖、睡前那句往前拉。
             # 睡前一两分钟排的回复，接口抖一下就会在她睡着之后发出去。
-            # 已经发了一半的照发，停在半截更怪；你亲手 !np now 的也照发。
+            # 刚发了一半的照发，停在半截更怪；发了一半、隔了很久的不算（重试一路拖进
+            # 睡眠里，凌晨冒出后半句）。你刚亲手 !np now 的也照发。
             wake = self.rhythm.next_wake_after(now)
             await self._later_reply(job, self.rhythm.first_glance_after_waking(wake, self.rng))
             return
@@ -1169,9 +1181,14 @@ class App:
                     # 几条还会在一两秒内连着冒出来。把那批话放回未读，按人的节奏重新排。
                     await self.memory.save_job_progress(job.id or 0, {}, covers)
                     await self.memory.restore_unread(CONVERSATION_ID, covers)
-                    log.info("[job] 想好的回复放太久了，重新排一次")
-                    await self._schedule_reply(now, channel_id=job.payload.get("channel_id"))
-                    return
+                    if not pushed:
+                        log.info("[job] 想好的回复放太久了，重新排一次")
+                        await self._schedule_reply(now, channel_id=job.payload.get("channel_id"))
+                        return
+                    # 你亲手催的：不照发旧话，也不重新排到十几分钟后——当场重想、马上发
+                    log.info("[job] 想好的回复放太久了，你催了，当场重想")
+                    saved = None
+            if saved is not None:
                 log.info("[job] 接着上次没发完的，从第 %d 条开始", start_index)
                 # 只取**那一批**。reply_to_index 是按那一批的下标算的；原来取的是
                 # "最近四十行里 id 不超过 covers 的全部"，早就回过的旧话也在里面，
@@ -1221,6 +1238,14 @@ class App:
         await self._deliver_reply(
             job, reply_plan, unread, now, start_index, covers, goodnight=goodnight
         )
+
+    @staticmethod
+    def _fresh_half(job: Job, now: datetime) -> bool:
+        """发了一半、而且是刚刚才开始发的。停在半截更怪，睡着了也接着发完。"""
+        if not int(job.progress.get("sent_parts", 0)):
+            return False
+        planned = job.progress.get("planned_at")
+        return bool(planned) and now - datetime.fromisoformat(planned) <= STALE_PLAN
 
     async def _later_reply(self, job: Job, run_at: datetime) -> None:
         log.info("[job] 她已经睡了，这条醒来再回：%s", run_at.strftime("%m-%d %H:%M"))
@@ -1596,6 +1621,11 @@ class App:
                 return
             await self._skip(job, "正聊着呢，不用另起话头")
             return
+        if heat == "cold" and conv.hot_session_started_at is not None:
+            # 冷了之后是她先开的口：上一段热聊已经结束。不清掉的话他一分钟就回，
+            # 这一段却拿着昨晚那段的起点算"聊了多久"——疲劳顶满、被提示收尾。
+            # 只在 cold 时清：warm 是聊到一半停了几分钟，那段还在继续
+            await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         day = self.rhythm.local_date(now)
         if not await self.life.can_initiate_today(CONVERSATION_ID, day):
@@ -2022,6 +2052,13 @@ class NewPersonClient(discord.Client):
         """
         log.info("[app] 收工，正在关掉手上的东西")
         self.app.scheduler.stop()
+        # **先等手上的任务收尾，再关库。** 停机时正在投递的那个任务收到取消，
+        # 要把已经发到他手机上的那几条记进库、把任务改回 pending——
+        # 原来这里第一时间就关库，那几次写全部失败：她自己的历史少一截。
+        # 不再取消它们一次：再取消会打断护着写库的那层 shield。
+        others = [t for t in self.app._tasks if t is not asyncio.current_task() and not t.done()]
+        if others:
+            await asyncio.wait(others, timeout=10)
         with contextlib.suppress(Exception):
             await self.app.memory.close()
         await super().close()

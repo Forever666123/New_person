@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from newperson import owner
 from newperson.attention import AttentionPolicy
 from newperson.brain import Brain
 from newperson.calendar import AcademicCalendar
@@ -3914,6 +3915,171 @@ async def test_catching_up_does_not_download_his_pictures_again(
     app._download_images = counting
     await app.catch_up()
     assert downloads == [], "库里已经有的那条，图又下了一遍"
+
+
+def _owner_ctx(app: App):
+    from newperson import owner
+
+    return owner.OwnerContext(
+        memory=app.memory,
+        rhythm=app.rhythm,
+        scheduler=app.scheduler,
+        life=app.life,
+        conversation_id=CONVERSATION_ID,
+        now=app.clock.now(),
+    )
+
+
+async def _two_bubbles_second_fails(tmp_path: Path, persona: Persona, at: datetime, script: list):
+    """回复两条气泡，第一条发出去、第二条 Discord 报错。返回 (app, channel, llm, clock, memory, job, restore)。"""
+    app, channel, llm, clock, memory = await build(tmp_path, persona, script)
+    clock.set(at)
+    await send(app, "在吗", at=at, msg_id=2900)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    real_send = channel.send
+
+    async def second_fails(content=None, **kw):
+        if channel.texts:
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = second_fails
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+
+    def restore() -> None:
+        channel.send = real_send
+
+    return app, channel, llm, clock, memory, job, restore
+
+
+async def test_the_second_half_of_an_old_reply_waits_until_she_wakes(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """发出第一句之后 Discord 挂了，重试一路拖进她的睡眠：后半句等她醒来再发，不在凌晨冒出来。"""
+    app, channel, _llm, clock, memory, job, restore = await _two_bubbles_second_fails(
+        tmp_path, persona, EVENING, [ReplyPlan(parts=[ReplyPart(text="第一句"), ReplyPart(text="第二句")])]
+    )
+    assert channel.texts == ["第一句"]
+    bedtime = app.rhythm.next_sleep_after(EVENING)
+    restore()
+    asleep = bedtime + timedelta(hours=1)
+    await memory.reschedule_job(job.id or 0, asleep)
+    clock.set(asleep + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["第一句"], "她睡着了，后半句还是发了出去"
+    moved = await memory.get_job(job.id or 0)
+    assert moved.status == "pending" and not app.rhythm.is_sleeping(moved.run_at)
+
+
+async def test_np_now_on_a_stale_reply_answers_right_away(tmp_path: Path, persona: Persona) -> None:
+    """放久了的旧回复，你 !np now 催了：当场重想、马上发，不是说"马上发"却排到十几分钟后。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona,
+        [ReplyPlan(parts=[ReplyPart(text="旧的")]), ReplyPlan(parts=[ReplyPart(text="新的")])],
+    )
+    await send(app, "在吗", at=EVENING, msg_id=3000)
+    real_send = channel.send
+
+    async def discord_down(*_a, **_kw):
+        raise RuntimeError("503 Service Unavailable")
+
+    channel.send = discord_down
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    channel.send = real_send
+
+    clock.set(clock.now() + timedelta(minutes=50))
+    await owner.handle("!np now", _owner_ctx(app))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["新的"]
+
+
+async def test_an_old_np_now_does_not_carry_her_retries_into_sleep(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """!np now 的记号只管敲命令那一下。几个小时后的重试落在她睡着的时候，照样推到醒来。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    await send(app, "在吗", at=EVENING, msg_id=3100)
+    await owner.handle("!np now", _owner_ctx(app))
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    asleep = app.rhythm.next_sleep_after(EVENING) + timedelta(hours=1)
+    await memory.reschedule_job(job.id or 0, asleep)  # 比如接口挂着、一路重试到半夜
+    clock.set(asleep + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [] and llm.calls == []
+
+
+async def test_her_opening_after_a_quiet_spell_starts_a_fresh_chat(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """冷了之后她先开口、他一分钟就回：这一段从头算，不拿昨晚那段热聊的起点算"聊了多久"。"""
+    app, _channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ProactivePlan(send=True, parts=[ReplyPart(text="刚下课 好饿")])]
+    )
+    yesterday = EVENING - timedelta(days=1)
+    await memory.update_conversation(
+        CONVERSATION_ID,
+        hot_session_started_at=yesterday,
+        last_user_message_at=yesterday + timedelta(hours=1),
+        last_bot_message_at=yesterday + timedelta(hours=1),
+    )
+    job_id = await app.scheduler.schedule(
+        "proactive", EVENING, conversation_id=CONVERSATION_ID, payload={"kind": "own_life"}
+    )
+    clock.set(EVENING + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(job_id)).status == "done"
+    assert (await memory.get_conversation(CONVERSATION_ID)).hot_session_started_at is None
+
+    reply_at = clock.now() + timedelta(minutes=1)
+    clock.set(reply_at)
+    await send(app, "哈哈 吃啥", at=reply_at, msg_id=3200)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert "聊久了" not in (job.reason or "")
+    assert not [h for h in job.payload.get("hints", []) if "收尾" in h]
+
+
+async def test_stopping_the_service_mid_reply_keeps_what_she_already_said(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """重启服务时正在发第二条：第一条要进她的库，任务回到 pending，再关库。
+
+    真实的收工是所有任务一起被取消、同时 close() 在跑。原来 close() 第一时间关库，
+    投递那边护着写库的那一步全部失败——她自己的历史少了已经到他手机上的那一句。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="第一句"), ReplyPart(text="第二句")])]
+    )
+    await send(app, "在吗", at=EVENING, msg_id=3300)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    real_send = channel.send
+    blocked = asyncio.Event()
+
+    async def hang_on_second(content=None, **kw):
+        if channel.texts:
+            blocked.set()
+            await asyncio.Event().wait()
+        return await real_send(content, **kw)
+
+    channel.send = hang_on_second
+    clock.set(job.run_at + timedelta(seconds=1))
+    delivering = app.spawn(app.scheduler.run_due_once(), "scheduler")
+    await asyncio.wait_for(blocked.wait(), timeout=5)
+
+    client = NewPersonClient(app)
+    delivering.cancel()  # Runner 收工时一起取消
+    await client.close()
+
+    again = Memory(tmp_path / "e2e.db")
+    await again.open()
+    _OPEN.append(again)
+    rows = await again.db.execute("SELECT content FROM messages WHERE author_kind = 'bot'")
+    assert [r[0] for r in await rows.fetchall()] == ["第一句"]
+    assert (await again.get_job(job.id or 0)).status == "pending"
 
 
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:

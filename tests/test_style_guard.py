@@ -195,7 +195,8 @@ def test_an_english_greeting_is_caught_whatever_its_case(persona: Persona) -> No
     ["下班顺路去加油站买了瓶水", "我在这里等车", "你可以的话明天发我", "那个模型我相信你的判断",
      "我室友在睡觉", "你说的那个我还没看到", "没看到 哪张", "他们在睡觉前吵起来了",
      "刚起了个头 还没写完", "我刚去加油了", "我相信你一定行", "抱歉这个我真不知道",
-     "早 刚醒吗", "下课了？刚忙完吗", "你呢 刚忙完没", "刚睡醒？", "我在睡觉前看了会书"],
+     "早 刚醒吗", "下课了？刚忙完吗", "你呢 刚忙完没", "刚睡醒？", "我在睡觉前看了会书",
+     "刚才你说的那个我去问了"],
 )
 def test_ordinary_sentences_are_not_taken_for_stock_phrases(persona: Persona, text: str) -> None:
     """含着那几个字不等于说了那句套话。
@@ -210,7 +211,9 @@ def test_ordinary_sentences_are_not_taken_for_stock_phrases(persona: Persona, te
     "text", ["加油", "加油！", "加油💪", "你可以的", "我在这里", "早点休息吧",
              "还在睡 没看到", "刚醒", "刚看到你消息", "抱歉刚看到",
              "抱歉刚在忙", "哈哈 刚醒", "Sorry 刚看到", "我还在睡", "抱抱你", "加油鸭",
-             "早点休息呗", "不好意思刚刚在开会", "嗯 我才看到"],
+             "早点休息呗", "不好意思刚刚在开会", "嗯 我才看到",
+             "刚才看到你消息", "才刚看到 等我一下", "我睡过头了 你说啥", "刚才在睡觉 怎么了",
+             "😂刚醒", "哈哈刚才看到", "我才刚醒"],
 )
 def test_the_stock_phrases_and_excuses_are_still_caught(persona: Persona, text: str) -> None:
     """套话说完了才算，交代行踪在开头才算——这两种照样拦。"""

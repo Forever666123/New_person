@@ -139,6 +139,9 @@ EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", 
 """交代行踪前面常垫的那几个字。垫一个"哈哈""抱歉""我"就能绕过去的话，这道闸形同虚设。"""
 
 
+_JUST = re.compile("刚才|才刚|刚刚")
+"""这几种说法都当"刚"：清单里写"刚看到"，模型写的常是"刚才看到""才刚看到"。"""
+
 _CLAUSE = re.compile(r"[^\s，。、！？!?,.~～…；;：:（）()【】「」]+")
 _ASKING_TAIL = ("吗", "么", "没", "嘛")
 
@@ -159,7 +162,7 @@ def _starts_with_excuse(text: str, phrase: str) -> bool:
     看前两个小句：每句先剥掉打头的垫话（哈哈、抱歉、我……），"刚刚"当"刚"，
     再比前缀。放在后面的是正常说话："我室友在睡觉""你说的那个我还没看到"。
     """
-    want = phrase.lower().replace("刚刚", "刚")
+    want = _JUST.sub("刚", phrase.lower())
     # "我"只在"刚/才/还"前面算垫话："我刚醒"是交代，"我在睡觉前看了会书"不是
     fillers = (
         EXCUSE_FILLERS if want[:1] in ("刚", "才", "还")
@@ -169,7 +172,8 @@ def _starts_with_excuse(text: str, phrase: str) -> bool:
         if asking:
             continue  # "早 刚醒吗""下课了？刚忙完没"是在问他，不是交代自己
         # 每剥一层都比一次：短语自己可能就带着垫话（"抱歉刚"），剥光了反而对不上
-        rest = clause.replace("刚刚", "刚")
+        # 打头的表情也是垫话："😂刚醒"
+        rest = _EMOJI.sub("", _JUST.sub("刚", clause)).lstrip()
         while rest:
             if rest.startswith(want):
                 return True
