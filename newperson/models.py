@@ -143,7 +143,6 @@ class TimingDecision(BaseModel):
     """人类可读的解释，写进日志方便调参。"""
     defers: int = 0
     """看到了先放着的次数。真人常有的"待会儿再回"。"""
-    quick_before_sleep: bool = False
     hints: list[str] = Field(default_factory=list)
     """给模型的处境提示，进上下文，不会直接发出去。"""
 

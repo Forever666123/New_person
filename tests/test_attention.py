@@ -281,6 +281,35 @@ def test_an_overnight_backlog_is_handled_soon_after_waking(
     assert checked >= 20
 
 
+def test_capped_overnight_replies_do_not_pile_up_on_one_minute(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """被"醒来之后不再拖"截住的回复，不能全堆在"起床后整三小时"那一分钟。
+
+    原来直接取上限：一年里 3.3% 的夜间消息精确落在起床后第 180 分钟，
+    是相邻时间段的十倍。他看得见她几点上线，这个规律几周就露出来。
+    """
+    from collections import Counter
+
+    limit = persona.timing.backlog_after_wake_hours * 60
+    minutes: Counter[int] = Counter()
+    for offset in range(60):
+        for hour in (2, 4, 6):
+            sent = evening(offset).replace(hour=hour, minute=17)
+            if not rhythm.is_sleeping(sent):
+                continue
+            wake = rhythm.next_wake_after(sent)
+            for seed in range(20):
+                d = policy.plan_reply(
+                    sent, "cold", extract_features(["在吗"], persona), sent, random.Random(seed)
+                )
+                minutes[round((d.reply_at - wake).total_seconds() / 60)] += 1
+    total = sum(minutes.values())
+    assert total > 500
+    at_cap = sum(n for m, n in minutes.items() if abs(m - limit) <= 1)
+    assert at_cap / total < 0.01, f"{at_cap}/{total} 条正好落在起床后第 {limit:.0f} 分钟"
+
+
 def test_she_usually_deals_with_the_backlog_on_the_first_look(
     policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
 ) -> None:

@@ -108,8 +108,15 @@ class Rhythm:
         """这一天处在哪个阶段。阶段序列从 ``_PHASE_EPOCH`` 起确定性推演。
 
         放假期间排除掉只在上课期出现的阶段（比如"赶 due"）。
+        **期末周不是放假**：原来用 ``in_session``（今天有没有正课）来判断，期末周返回 False，
+        于是"赶 due"整段被排除、权重分给了"松"，同一天的提示里写着
+        "期末周，你在赶 due 和复习，人很紧"和"你最近没什么事"。
         """
-        in_session = self.calendar.in_session(day) if self.calendar else True
+        in_session = (
+            self.calendar.period_for(day).kind in ("in_session", "finals")
+            if self.calendar
+            else True
+        )
         phases = [p for p in self.config.phases if in_session or not p.only_in_session]
         if not phases:
             return LifePhase(name="平常")
@@ -220,7 +227,10 @@ class Rhythm:
         sleep_start = max(sleep_start, wake + timedelta(hours=2))
 
         classes: list[ClassInstance] = []
-        rng = random.Random(self.seed * 1_000_003 + day.toordinal() + 17)
+        # 课要有自己的随机源。原来是 seed*1_000_003 + ordinal + 17，正好等于
+        # 17 天后抽当日变体的那个流：今天没去上课，17 天后必定是"心情差"或"闲"。
+        # 字符串种子走 sha512，跨进程、重启都一样
+        rng = random.Random(f"{self.seed}:classes:{day.isoformat()}")
         has_class = self.calendar.in_session(day) if self.calendar else True
         for block in cfg.classes if has_class else []:
             if day.weekday() not in block.days:

@@ -259,7 +259,7 @@ async def test_an_empty_photo_library_does_not_eat_the_day(harness: Harness) -> 
     原来 window_photo 照样抽签、占掉当天的名额，到点才发现没照片、跳过——
     大约六分之一本该开口的日子，她一句话都不说。
     """
-    harness.life.has_photos = lambda: False
+    harness.life.has_photos = lambda _tags: False
     _counts, kinds, _ = await harness.sweep(150, TERM_START)
     needs_photo = {k.name for k in harness.life.persona.proactive.kinds if k.requires_photo}
     assert needs_photo, "前提不成立：人设里没有要照片的主动种类"

@@ -289,7 +289,7 @@ def build_reply_user(
     summary: str,
     owner_facts: list[str],
     self_facts: list[str],
-    ledger: list[tuple[datetime, LedgerEntry]],
+    ledger: list[tuple[int, datetime, LedgerEntry]],
     ledger_topic: str = "",
     open_questions: list[tuple[int, datetime, LedgerEntry]] | None = None,
     not_yet: list[tuple[int, datetime, LedgerEntry]] | None = None,

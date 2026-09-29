@@ -3536,6 +3536,96 @@ async def test_a_shutdown_between_two_bubbles_keeps_the_first_in_her_memory(
     assert channel.texts == ["第一句", "第二句"]
 
 
+async def test_the_first_message_after_a_night_apart_is_not_treated_as_a_long_chat(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """昨晚热聊过，今天他发的第一句：不按"聊久了"放慢，也不提示她收尾。
+
+    原来库里的热聊起点清成了 None，这一次交给 plan_reply 的却还是昨晚那个时刻：
+    疲劳倍率顶满 ×8，user 消息里写着"你们已经聊了一阵了，可以自然收尾"——
+    一段对话刚开头她就被要求收尾。
+    """
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [])
+    await memory.update_conversation(
+        CONVERSATION_ID, hot_session_started_at=EVENING - timedelta(days=1)
+    )
+    await send(app, "早", at=EVENING, msg_id=2300)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    assert "聊久了" not in (job.reason or "")
+    assert not [h for h in job.payload.get("hints", []) if "收尾" in h]
+
+
+async def test_a_window_photo_needs_a_window_photo(tmp_path: Path, persona: Persona) -> None:
+    """"凌晨拍了一张窗外"只从对得上标签的照片里挑；库里只有午饭和猫就不排、不发。
+
+    原来 photo_tags 写进了任务却没人读：候选只按时段和冷却筛，
+    模型拿到"拍了一张窗外，不配字直接发"，手边却是牛肉面和猫。
+    """
+    from newperson.models import Photo
+
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    app.media.library.photos = [
+        Photo(id="lunch-001", file="a.jpg", tags=["food", "lunch"]),
+        Photo(id="cat-001", file="b.jpg", tags=["cat", "home"]),
+    ]
+    window = next(k for k in persona.proactive.kinds if k.photo_tags and k.requires_photo)
+    assert app.life.has_photos([]) and not app.life.has_photos(window.photo_tags)
+
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "proactive", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": window.name, "note": window.note if hasattr(window, "note") else "",
+                 "photo_tags": window.photo_tags, "requires_photo": True},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert llm.calls == [] and channel.sent == []
+    assert (await memory.get_job(job_id)).status == "cancelled"
+
+    app.media.library.photos.append(Photo(id="win-001", file="c.jpg", tags=["window", "night"]))
+    assert [p.id for p in await app._photo_shortlist(at, window.photo_tags)] == ["win-001"]
+
+
+async def test_her_custom_status_shows_up_on_some_days_and_not_at_midnight_sharp(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """自定义状态：三成左右的日子有，等当天日程出来才定，不在 00:00 整准点变。
+
+    原来按日历日、第一次调用就锁：那时日程还没生成，当天锁成"没有状态"，
+    实测六十天里一次都没出现过；偶尔有一条，也在午夜准点被清掉。
+    """
+    from newperson.discord_bot import PresenceManager
+    from newperson.models import DayPlan
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+
+    async def change_presence(**_kw) -> None:
+        return None
+
+    presence = PresenceManager(
+        SimpleNamespace(change_presence=change_presence),
+        persona, app.rhythm, memory, clock, random.Random(1),
+    )
+    shown = 0
+    for offset in range(40):
+        day = EVENING.date() + timedelta(days=offset)
+        wake = app.rhythm.for_day(day).wake
+        clock.set(wake + timedelta(minutes=1))
+        assert await presence._status_text(clock.now()) is None  # 日程还没出来
+        await memory.save_day_plan(day, DayPlan(date=day.isoformat(), mood="有点困但还行"))
+        clock.set(wake + timedelta(minutes=40))
+        text = await presence._status_text(clock.now())
+        shown += text is not None
+        midnight = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=TZ)
+        before, after = midnight - timedelta(minutes=1), midnight + timedelta(minutes=1)
+        if not app.rhythm.is_sleeping(before) and not app.rhythm.is_sleeping(after):
+            clock.set(before)
+            at_2359 = await presence._status_text(before)
+            clock.set(after)
+            assert await presence._status_text(after) == at_2359, f"{day} 午夜准点变了"
+    assert 4 <= shown <= 24, f"40 天里有状态的只有 {shown} 天"
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

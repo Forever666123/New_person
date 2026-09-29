@@ -155,17 +155,9 @@ class AttentionPolicy:
         reply = notice + timedelta(seconds=lag)
         steps.append(f"看到后 {self._pretty(lag)} 开始回")
 
-        # 快睡着的时候最后回一句，是真人会做的事
-        quick_before_sleep = False
-        if heat == "hot" and snapshot.state in ("winding_down", "free"):
-            since_sleep = (now - daily.sleep_start).total_seconds()
-            if 0 <= since_sleep <= 20 * 60:
-                quick_before_sleep = True
-                steps.append("已经躺下了，最后回一句")
-
         reply = self._push_out_of_sleep(reply, rng, steps)
         reply = self._respect_burst_gap(reply, last_user_message_at, heat, rng, steps)
-        reply = self._cap_total_delay(now, reply, notice, steps)
+        reply = self._cap_total_delay(now, reply, notice, steps, rng)
         notice = min(notice, reply)
 
         # 先按真实时长算处境提示，再缩放。
@@ -182,7 +174,6 @@ class AttentionPolicy:
             reply_at=self.rhythm.local_time(reply),
             reason="；".join(steps),
             defers=defers,
-            quick_before_sleep=quick_before_sleep,
             hints=hints,
         )
 
@@ -260,7 +251,12 @@ class AttentionPolicy:
         return pushed
 
     def _cap_total_delay(
-        self, now: datetime, reply: datetime, notice: datetime, steps: list[str]
+        self,
+        now: datetime,
+        reply: datetime,
+        notice: datetime,
+        steps: list[str],
+        rng: random.Random,
     ) -> datetime:
         """封顶。
 
@@ -271,10 +267,14 @@ class AttentionPolicy:
         """
         if self.rhythm.is_sleeping(now):
             wake = self.rhythm.next_wake_after(now)
-            cap = later(wake, timedelta(hours=self.persona.timing.backlog_after_wake_hours))
+            backlog = timedelta(hours=self.persona.timing.backlog_after_wake_hours)
+            cap = later(wake, backlog)
             if reply > cap:
                 steps.append("睡醒之后不会再拖了")
-                return cap
+                # 不能正好落在上限上：被截到的全堆在"起床后整三小时"那一分钟，
+                # 而他看得见她几点上线——"醒了正好三小时回我"几周里会反复出现
+                slack = min(timedelta(minutes=45), backlog / 4)
+                return later(cap, -slack * rng.random())
             return reply
 
         limit = timedelta(hours=self.persona.timing.max_delay_hours)

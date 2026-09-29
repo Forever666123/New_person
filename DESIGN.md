@@ -112,7 +112,7 @@ Northeastern 2026–2027 的真实日期，超出范围的年份按典型模式�
   三五分钟才回一句是常态。
 - warm：`notice_at = min(next_glance, now + LN(4min, σ0.8))`（刚聊过，手机还在附近）；`reply_at = notice_at + LN(40s, σ0.7)`。
 - cold：`notice_at = next_glance`；`reply_at = notice_at + LN(60s, σ0.7)`；**另以 p=0.15 "看了忘了回"**：`reply_at` 推到再下一次 glance + 短滞后（reason 里注明 `forgot_once`）。
-- sleeping：按 glance 规则自然落到起床后。（原设想"heat==hot 且入睡不到 20 min 允许快速回一句"**没有接上**：`quick_before_sleep` 永远是 False、也没人读。实际起作用的是回复落在入睡前 25 分钟内时，提示模型"你差不多要睡了"。）
+- sleeping：按 glance 规则自然落到起床后。（原设想"heat==hot 且入睡不到 20 min 允许快速回一句"从来没接上，那段死代码已删。实际起作用的是睡前那一句：回复落在入睡前 `sign_off.reply_within_minutes` 内时顺便说要睡了，见 `proactive.sign_off`。）
 - **看到了不一定当场处理**：每次 notice 之后按 `DailyRhythm.engage_probability` 掷一次骰子，
   没中就**先放着**，等下一次看手机再说，最多放 `max_defers` 次。
   注意这不是"把消息丢掉"，而是延迟自然被拉长到几小时。真正的"不回"由模型决定（`parts` 为空），
@@ -313,7 +313,7 @@ python -m newperson photos
 ## 7. 测试策略
 
 - `rhythm`：跨午夜、周五夜按工作日、周日夜按周末、winding_down 边界。
-- `attention`：固定种子；glance 序列落在清醒时段；hot/warm/cold 的分布区间；forgot 分支；sleeping 推迟；quick_before_sleep；防抖上限不饿死；疲劳倍率；边界提示；delay_scale。
+- `attention`：固定种子；glance 序列落在清醒时段；hot/warm/cold 的分布区间；forgot 分支；sleeping 推迟；防抖上限不饿死；疲劳倍率；边界提示；delay_scale。
 - `memory`/`scheduler`：临时 SQLite；租约认领只成功一次；清扫过期租约；重启恢复 running；dedupe_key；过期策略；续发从 sent_parts 开始；每会话单飞。
 - `brain`：假 client；system 稳定块字节级不变；cache_control 存在；refusal → None；错误链；用量记录与日限。
 - `delivery`：假 channel；顺序、打字时长、打断、引用、2000 字拆分、{photo} 处理、Forbidden 分类。

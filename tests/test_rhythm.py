@@ -350,7 +350,8 @@ def test_vacation_does_not_flatten_the_phase_mix(persona: Persona) -> None:
         rhythm = Rhythm(persona.rhythm, persona.tz, seed, calendar)
         for offset in range(730):
             day = start + timedelta(days=offset)
-            if not calendar.in_session(day):
+            # 期末周没有正课，但不是放假，见下一条
+            if calendar.period_for(day).kind not in ("in_session", "finals"):
                 counts[rhythm.phase_for(day).name] += 1
 
     total = sum(counts.values())
@@ -449,3 +450,23 @@ def test_the_local_time_follows_her_abroad(rhythm: Rhythm, persona: Persona) -> 
     shown = rhythm.local_time(noon_there.astimezone(persona.tz))
     assert shown.strftime("%H:%M") == "12:00"
     assert str(shown.tzinfo) == str(rhythm.tz_for(day))
+
+
+def test_finals_week_is_not_a_vacation(persona: Persona) -> None:
+    """期末周没有正课，但人最紧。「赶due」要抽得到，不能被当成放假排除掉。
+
+    原来阶段过滤用的是 in_session（今天有没有正课），期末周返回 False：
+    一整段期末周里赶due 0%、松过半，提示里同时写着"期末周，人很紧"和"你最近没什么事"。
+    """
+    start = date(2026, 9, 2)
+    counts: Counter[str] = Counter()
+    for seed in range(1, 25):
+        calendar = AcademicCalendar(persona.academic, seed)
+        rhythm = Rhythm(persona.rhythm, persona.tz, seed, calendar)
+        for offset in range(730):
+            day = start + timedelta(days=offset)
+            if calendar.period_for(day).kind == "finals":
+                counts[rhythm.phase_for(day).name] += 1
+    total = sum(counts.values())
+    assert total > 200, "样本太少"
+    assert counts["赶due"] / total > 0.1, counts

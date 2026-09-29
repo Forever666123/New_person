@@ -64,8 +64,8 @@ class LifeEngine:
         self.brain = brain
         self.clock = clock
         self.rng = rng
-        self.has_photos: Callable[[], bool] = lambda: True
-        """手边有没有能发的照片。App 接上照片库；没接的时候当作有。"""
+        self.has_photos: Callable[[list[str]], bool] = lambda _tags: True
+        """手边有没有能发的照片（给了标签就得对得上标签）。App 接上照片库；没接的时候当作有。"""
 
     # -- 日程 ---------------------------------------------------------------
 
@@ -361,11 +361,12 @@ class LifeEngine:
         shareable = [e for e in plan.events if e.shareable]
 
         eligible: list[ProactiveKind] = []
-        photos = self.has_photos()
         for kind in cfg.kinds:
             if kind.only_while_travelling and not travelling:
                 continue
-            if kind.requires_photo and not photos:
+            # 看的是**对得上这一种的**照片：库里只有午饭和猫的时候，
+            # "凌晨拍了一张窗外"排上了也只能拿牛肉面去凑，或者白占当天的名额
+            if kind.requires_photo and not self.has_photos(kind.photo_tags):
                 continue
             if await self._days_since_last(kind.name, day) < kind.min_days_since_last:
                 continue

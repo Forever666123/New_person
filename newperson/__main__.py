@@ -240,7 +240,13 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     attention = AttentionPolicy(persona, rhythm)
     rng = random.Random(args.seed)
 
-    start = datetime.now(tz=persona.tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    if args.start:
+        # 期末周、出行、感恩节这些最容易出错的日子，不用等到那天才看得到
+        start = datetime.combine(
+            datetime.strptime(args.start, "%Y-%m-%d").date(), datetime.min.time(), tzinfo=persona.tz
+        )
+    else:
+        start = RealClock(persona.tz).now().replace(hour=0, minute=0, second=0, microsecond=0)
     owner_tz = persona.owner_tz
     heat_names = {"hot": "在聊", "warm": "刚聊过", "cold": "冷了"}
 
@@ -764,6 +770,7 @@ def main(argv: list[str] | None = None) -> int:
     sim.add_argument("--seed", type=int, default=1)
     sim.add_argument("--messages-per-day", type=int, default=5)
     sim.add_argument("--verbose", action="store_true", help="打印每次的判断过程")
+    sim.add_argument("--start", default="", help="从哪天开始，YYYY-MM-DD，默认今天")
 
     plan_p = sub.add_parser("plan", help="让她编一份今天的日程")
     plan_p.add_argument("--save", action="store_true", help="存进日记")

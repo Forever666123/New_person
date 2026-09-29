@@ -87,6 +87,14 @@ def time_of_day_at(dt: datetime) -> TimeOfDay:
     return "evening"
 
 
+def _tagged(photos: list, tags: list[str] | None) -> list:
+    """只留标签对得上的。没给标签就全留。"""
+    if not tags:
+        return photos
+    wanted = set(tags)
+    return [p for p in photos if wanted & set(p.tags)]
+
+
 def _said_at(unread: list) -> datetime | None:
     """他这一批里最晚那句是几点说的。续发那条路上可能拿不到，就是 None。"""
     return max((m.created_at for m in unread), default=None)
@@ -136,7 +144,9 @@ class App:
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
         # 照片库空着的时候，要照片的那几种主动不进当天的候选。
         # 原来它照样抽签、占掉名额，到点再发现没照片跳过——那天就什么都不说了。
-        self.life.has_photos = lambda: bool(self.media.library.available(set(), None))
+        self.life.has_photos = lambda tags: bool(
+            _tagged(self.media.library.available(set(), None), tags)
+        )
         self.on_phone: Callable[[], Awaitable[None]] | None = None
         """她拿起手机了（在线状态马上亮，亮几分钟）。连上 Discord 之后由 client 接上。"""
 
@@ -840,9 +850,15 @@ class App:
             log.info("[timing] 他还在打字，回复推到 %s", new_at.strftime("%H:%M"))
             return
 
-        if heat == "hot" and conv.hot_session_started_at is None:
+        # **交给 plan_reply 的是这一次真正用的值，不是 conv 上读出来的旧值。**
+        # 原来库里清成了 None，这一次却还拿着上一段热聊开始的时刻：
+        # 隔了一夜他发的第一句，疲劳倍率顶满 ×8，还被提示"可以自然收尾了"。
+        session = conv.hot_session_started_at
+        if heat == "hot" and session is None:
+            session = now
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=now)
         elif heat == "cold":
+            session = None
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         decision = self.attention.plan_reply(
@@ -851,7 +867,7 @@ class App:
             features,
             unread[-1].created_at,
             self.rng,
-            session_started_at=conv.hot_session_started_at,
+            session_started_at=session,
         )
         log.info(
             "[timing] heat=%s 看到 %s 回 %s　%s",
@@ -1039,11 +1055,13 @@ class App:
         tz = self.rhythm.local_time(now).tzinfo
         return [m.model_copy(update={"created_at": m.created_at.astimezone(tz)}) for m in messages]
 
-    async def _photo_shortlist(self, now: datetime) -> list:
+    async def _photo_shortlist(self, now: datetime, tags: list[str] | None = None) -> list:
+        """``tags`` 是这一种主动要的照片标签（window_photo 要窗外、夜景）。不给就不限。"""
         used = await self.memory.recently_used_photo_ids(now)
         # 时段按她人在的地方算：她在苏州的半夜，纽约是中午
         here = self.rhythm.local_time(now)
-        return self.media.library.available(used, time_of_day_at(here))[:PHOTO_SHORTLIST]
+        found = self.media.library.available(used, time_of_day_at(here))
+        return _tagged(found, tags)[:PHOTO_SHORTLIST]
 
     async def _recall(self, now: datetime) -> tuple[list[str], list[str]]:
         cfg = self.persona.memory
@@ -1507,7 +1525,7 @@ class App:
                 await self._skip(job, f"请假中（{away}），这类主动跳过")
                 return
 
-        photos = await self._photo_shortlist(now)
+        photos = await self._photo_shortlist(now, job.payload.get("photo_tags"))
         if job.payload.get("requires_photo") and not photos:
             await self._skip(job, "想发照片但库里没有，跳过")
             return
@@ -1868,16 +1886,24 @@ class PresenceManager:
         """自定义状态一天最多换一次，而且多数时候不换。
 
         真人不会每两小时改一次签名，跟着日程自动轮换是明显的破绽。
+
+        **按她醒着的那一天算，等当天日程出来了再定。** 原来按日历日、第一次调用就锁：
+        第一次调用要么在午夜（她通常还醒着），要么在刚起床那一分钟，两个时刻
+        当天的日程都还没生成，mood 是空的，当天就锁成"没有状态"——
+        说好的三成日子有状态，实际一天都没有；偶尔有，也在 00:00 整准点消失。
         """
-        day = self.rhythm.local_date(now).isoformat()
-        if await self.memory.kv_get("status_text_day") == day:
+        day = self.rhythm.logical_day(now)
+        if await self.memory.kv_get("status_text_day") == day.isoformat():
             return await self.memory.kv_get("status_text") or None
-        await self.memory.kv_set("status_text_day", day)
-        if self.rng.random() > 0.3:
+        plan = await self.memory.get_day_plan(day)
+        if plan is None:
+            return None  # 刚醒、日程还没出来：先空着，出来了再定
+        await self.memory.kv_set("status_text_day", day.isoformat())
+        # 按天抽签，重启不会重抽
+        if random.Random(f"{self.persona.seed}:status:{day.isoformat()}").random() > 0.3:
             await self.memory.kv_set("status_text", "")
             return None
-        plan = await self.memory.get_day_plan(self.rhythm.local_date(now))
-        text = (plan.mood if plan else "")[:60]
+        text = plan.mood[:60]
         await self.memory.kv_set("status_text", text)
         return text or None
 
