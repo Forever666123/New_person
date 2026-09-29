@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from newperson import style_guard as sg
 from newperson.models import ReplyPart
 from newperson.persona import Persona
@@ -185,3 +187,28 @@ def test_an_english_greeting_is_caught_whatever_its_case(persona: Persona) -> No
     for innocent in ("His 那篇 paper 我看了", "Hinton 那套说法", "高数 hint 给了吗"):
         _, needs = sg.enforce(parts(innocent), persona.style, persona.boundaries)
         assert not needs, f"{innocent!r} 是正常说话，不该被拦"
+
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["下班顺路去加油站买了瓶水", "我在这里等车", "你可以的话明天发我", "那个模型我相信你的判断",
+     "我室友在睡觉", "你说的那个我还没看到", "没看到 哪张", "他们在睡觉前吵起来了"],
+)
+def test_ordinary_sentences_are_not_taken_for_stock_phrases(persona: Persona, text: str) -> None:
+    """含着那几个字不等于说了那句套话。
+
+    原来是裸子串匹配：每次误伤白花一次重写，重写还不掉就整条不发。
+    """
+    issues = sg.check([ReplyPart(text=text)], persona.style, persona.boundaries)
+    assert not [i for i in issues if i.kind == "banned_phrase"], issues
+
+
+@pytest.mark.parametrize(
+    "text", ["加油", "加油！", "加油💪", "你可以的", "我在这里", "早点休息吧",
+             "还在睡 没看到", "刚醒", "刚看到你消息", "抱歉刚看到"],
+)
+def test_the_stock_phrases_and_excuses_are_still_caught(persona: Persona, text: str) -> None:
+    """套话说完了才算，交代行踪在开头才算——这两种照样拦。"""
+    issues = sg.check([ReplyPart(text=text)], persona.style, persona.boundaries)
+    assert [i for i in issues if i.kind == "banned_phrase"], text

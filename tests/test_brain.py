@@ -893,8 +893,8 @@ async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(
     重试只会让模型把同一个词写三遍、烧六次调用，然后任务判死，
     他那句一直挂在未读里，有未读期间主动消息也全被压住。
     """
-    bad = ReplyPlan(parts=[ReplyPart(text="没看到")])
-    client = fake_client(bad, ReplyPlan(parts=[ReplyPart(text="没看到啊")]))
+    bad = ReplyPlan(parts=[ReplyPart(text="还在睡 刚看到")])
+    client = fake_client(bad, ReplyPlan(parts=[ReplyPart(text="刚醒 才看到")]))
     brain = Brain(client, settings(tmp_path), persona, memory)
     got = await brain.generate_reply(reply_request(), TODAY)
     assert got is not None and got.parts == []

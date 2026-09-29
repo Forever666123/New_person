@@ -135,6 +135,27 @@ def _opens_with_greeting(opening: str, phrase: str) -> bool:
     return not rest or rest[0] in GREETING_TAIL
 
 
+def _says(text: str, phrase: str) -> bool:
+    """``text`` 里是不是**说了**这句话，而不只是碰巧含着这几个字。
+
+    原来是裸子串：她说"下班顺路去加油站"被当成"加油"，"我在这里等车"被当成
+    "我在这里"，"你可以的话明天发我"被当成"你可以的"——每次误伤白花一次重写，
+    重写还不掉就整条不发。真正的套话后面接的是句末：没了、标点、空格、
+    语气词、emoji。后面紧跟着别的字，那就是另一个词的前半截。
+    """
+    start = text.find(phrase)
+    while start != -1:
+        after = text[start + len(phrase) : start + len(phrase) + 1]
+        if not after or after in PHRASE_TAIL or not (after.isalnum()):
+            return True
+        start = text.find(phrase, start + 1)
+    return False
+
+
+PHRASE_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢喔嘛哈诶欸吧啦"
+"""套话后面允许跟的字。跟"的"不行："我相信你的判断"是一句正经话。"""
+
+
 GREETING_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢喔嘛哈诶欸的"
 """寒暄后面允许跟的东西。再往后就是别的句子了，不是打招呼。
 
@@ -190,7 +211,7 @@ def check(
         text = part.text
 
         for phrase in boundaries.never_say:
-            if phrase in text:
+            if _says(text, phrase):
                 issues.append(
                     StyleViolation(
                         kind="banned_phrase",
@@ -203,6 +224,16 @@ def check(
         # 寒暄只有在开口那一下才是寒暄。掐掉前面的标点空白再比，
         # 这样"在吗"作为整条消息会被拦下，"我现在吗？在图书馆"不会。
         opening = text.lstrip(OPENING_NOISE)
+        for phrase in boundaries.never_start_with:
+            if opening.startswith(phrase):
+                issues.append(
+                    StyleViolation(
+                        kind="banned_phrase",
+                        detail=f"一开口就在交代自己刚才在干嘛：{phrase}",
+                        part_index=i,
+                        fixable=False,
+                    )
+                )
         for phrase in boundaries.never_open_with:
             if _opens_with_greeting(opening, phrase):
                 issues.append(

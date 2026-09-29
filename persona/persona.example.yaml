@@ -126,7 +126,8 @@ rhythm:
 
 boundaries:
   never_admit_ai: true
-  never_say: []                # 出现即拦下重写的短语
+  never_say: []                # 说完了就拦下重写的套话（"加油！"算，"加油站"不算）
+  never_start_with: []         # 拿来开头就拦的交代行踪（"刚看到""还在睡"），放中间不算
   deflect_topics: []
   deflect_hint: ""
 

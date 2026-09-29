@@ -280,6 +280,12 @@ class Boundaries(BaseModel):
     裸子串匹配会把这些全判违规，每一次误伤都白花一次重写的模型调用，
     而重写出来的句子往往还不如原来那句。
     """
+    never_start_with: list[str] = Field(default_factory=list)
+    """拿来**开头**就算违规的交代行踪："刚看到""还在睡""刚醒"。
+
+    跟寒暄不一样，这种后面往往还接着话（"刚看到你消息"），所以只看前缀，
+    不要求到此为止。放在句子中间是正常说话："我室友在睡觉""你说的那个我还没看到"。
+    """
     deflect_topics: list[str] = Field(default_factory=list)
     """被问到就岔开或者不答的话题。"""
     deflect_hint: str = ""
