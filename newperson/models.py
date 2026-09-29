@@ -249,6 +249,10 @@ class ReplyPart(BaseModel):
     """一条聊天气泡。"""
 
     text: str = Field(description="这一条的文字。短。可以包含 {photo} 占位符表示这条配图。")
+    typo_text: str = Field(
+        default="",
+        description="只有上下文要你这次手滑时才填：这一条你打错的样子。其余时候留空。",
+    )
     pause_before_seconds: float = Field(
         default=0.0, ge=0.0, le=180.0, description="发这条之前先停几秒。通常 0 到 10。"
     )

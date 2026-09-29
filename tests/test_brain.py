@@ -899,3 +899,33 @@ async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(
     got = await brain.generate_reply(reply_request(), TODAY)
     assert got is not None and got.parts == []
     assert len(client.messages.calls) == 2
+
+
+
+async def test_she_only_slips_when_the_code_says_so(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """打错字多久一次由代码定：没让她手滑，模型自己写的 typo_text 也不用；让了，只留一条。"""
+    typed = ReplyPlan(
+        parts=[ReplyPart(text="我在图书馆", typo_text="我再图书馆"), ReplyPart(text="你呢", typo_text="你尼")]
+    )
+    brain = Brain(fake_client(typed.model_copy(deep=True)), settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(), TODAY)
+    assert got is not None and all(not p.typo_text for p in got.parts)
+
+    brain = Brain(fake_client(typed.model_copy(deep=True)), settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(typo=True), TODAY)
+    assert got is not None and [p.typo_text for p in got.parts] == ["我再图书馆", ""]
+
+
+def test_the_slip_is_asked_for_only_in_the_request_that_slips(persona: Persona) -> None:
+    """"这次打字手滑了"只进那一次的 user 消息；稳定层只有一句固定的"平时留空"。"""
+    from newperson.prompts import build_reply_user
+
+    base = dict(
+        persona=persona, situation="此刻", summary="", owner_facts=[], self_facts=[],
+        ledger=[], mode_instruction="", recent=[], unread=[], hints=[], photos=[],
+    )
+    assert "这次打字手滑了" in build_reply_user(**base, typo=True)
+    assert "这次打字手滑了" not in build_reply_user(**base)
+    assert "typo_text" in build_system(persona)

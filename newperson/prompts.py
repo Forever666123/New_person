@@ -130,6 +130,7 @@ _OUTPUT_RULES = """
 - `resolved_ledger_ids` 放那些他这次给了下文的条目编号（上下文里的 `#12` 那个数）。
   做了、没做、改主意了、不打算做了——**都算有下文**，都要放进去。
   放进去之后你就不会再问它了。他没提到的条目别放。
+- `typo_text` 平时留空。只有上下文里写着"这次打字手滑了"才填。
 - `inner_note` 是你自己的状态，一句话，进你的日记，不会发给他。
 
 上下文里会告诉你此刻在干什么（在上课、刚醒、准备睡了）。
@@ -292,6 +293,7 @@ def build_reply_user(
     ledger_topic: str = "",
     open_questions: list[tuple[int, datetime, LedgerEntry]] | None = None,
     not_yet: list[tuple[int, datetime, LedgerEntry]] | None = None,
+    typo: bool = False,
     mode_instruction: str,
     recent: list[StoredMessage],
     unread: list[StoredMessage],
@@ -343,6 +345,15 @@ def build_reply_user(
         blocks.append(_section("你的处境", "\n".join(f"- {h}" for h in hints)))
 
     blocks.append(_section("你手边有的照片", format_photos(photos)))
+    if typo:
+        blocks.append(
+            _section(
+                "这次打字手滑了",
+                "挑一条气泡，在它的 typo_text 里写你手机上真会打错的样子："
+                "拼音输入法选错了同音字（在/再、的/得、做/作、那/哪），或者多打、漏打一个字。"
+                "意思别变，就错一两个字。text 里还是写对的——发出去几秒后你会把它改回来。",
+            )
+        )
     blocks.append("现在回他。不想回就把 parts 留空。")
     return "\n".join(b for b in blocks if b).strip()
 

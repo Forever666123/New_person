@@ -312,7 +312,14 @@ def apply_fixes(parts: list[ReplyPart], style: StyleConfig) -> list[ReplyPart]:
         text = normalize_punctuation(text, style)
         if not text and "{photo}" not in part.text:
             continue
-        fixed.append(ReplyPart(text=text, pause_before_seconds=part.pause_before_seconds))
+        fixed.append(
+            ReplyPart(
+                text=text,
+                # 打错的样子跟着过同一遍标点修剪，不然两句对不上，发出去会先"错"在句号上
+                typo_text=normalize_punctuation(part.typo_text, style) if part.typo_text else "",
+                pause_before_seconds=part.pause_before_seconds,
+            )
+        )
 
     if len(fixed) > style.max_parts + 1:
         # 超出的合并进最后一条，而不是直接丢掉内容

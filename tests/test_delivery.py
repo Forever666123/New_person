@@ -57,8 +57,13 @@ class Sent:
 
 
 class FakeMessage:
-    def __init__(self, message_id: int) -> None:
+    def __init__(self, message_id: int, channel: FakeChannel | None = None) -> None:
         self.id = message_id
+        self.channel = channel
+
+    async def edit(self, *, content: str) -> None:
+        if self.channel is not None:
+            self.channel.log("edit", content=content)
 
 
 class FakeTyping:
@@ -115,7 +120,7 @@ class FakeChannel:
             raise self.error
         self.sends.append(Sent(content, file, reference))
         self.log("send", content=content)
-        return FakeMessage(1000 + len(self.sends))
+        return FakeMessage(1000 + len(self.sends), self)
 
 
 class FakeReactable:
@@ -620,3 +625,29 @@ async def test_a_photo_in_the_middle_does_not_shift_the_ids(
     assert result.sent_texts == ["刚吃完", "好看吧"]
     assert len(result.sent_message_ids) == 2
     assert result.sent_message_ids[1] == max(result.sent_message_ids)
+
+
+
+async def test_a_typo_is_sent_then_fixed_a_few_seconds_later(
+    deliverer: Deliverer, channel: FakeChannel
+) -> None:
+    """手滑打错一个字：先发出去错的，过几秒改回来。记下来的是改好的那句。"""
+    slip = [ReplyPart(text="我在图书馆", typo_text="我再图书馆")]
+    result = await deliverer.deliver(channel, slip, None)
+    assert channel.texts == ["我再图书馆"]
+    edits = [e for e in channel.events if e.kind == "edit"]
+    assert [e.payload["content"] for e in edits] == ["我在图书馆"]
+    sent_at = next(e.at for e in channel.events if e.kind == "send")
+    assert edits[0].at - sent_at >= 4 * deliverer.attention.delay_scale
+    assert result.sent_texts == ["我在图书馆"]
+
+
+@pytest.mark.parametrize("typo", ["完全是另一句话了", "我在图书馆", "", "我再图书馆里面坐着呢"])
+async def test_a_typo_that_is_not_a_slip_is_ignored(
+    deliverer: Deliverer, channel: FakeChannel, typo: str
+) -> None:
+    """模型写的"打错的样子"要是跟原句差太多、或者根本没错，就当没写：直接发对的。"""
+    result = await deliverer.deliver(channel, [ReplyPart(text="我在图书馆", typo_text=typo)], None)
+    assert channel.texts == ["我在图书馆"]
+    assert not [e for e in channel.events if e.kind == "edit"]
+    assert result.sent_texts == ["我在图书馆"]

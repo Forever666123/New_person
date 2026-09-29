@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 import random
 import re
@@ -96,6 +97,23 @@ class DeliveryBlocked(RuntimeError):
         self.result = result
         """已经发出去的部分。拒绝往往发生在第 n 条上，前面几条是真的发出去了。"""
         self.hint = hint
+
+
+def _usable_typo(part: ReplyPart) -> str:
+    """模型写的"打错的样子"能不能用。
+
+    得是同一句话打错了一两个字，不是另一句话：差太多就不是手滑，
+    是说了一句又撤回——那比不打错更怪。
+    """
+    typo = (part.typo_text or "").strip()
+    text = part.text.strip()
+    if not typo or not text or typo == text or "{photo}" in typo:
+        return ""
+    if abs(len(typo) - len(text)) > 2:
+        return ""
+    if difflib.SequenceMatcher(None, typo, text).ratio() < 0.6:
+        return ""
+    return typo
 
 
 def _is_forbidden(exc: BaseException) -> bool:
@@ -197,6 +215,10 @@ class Deliverer:
                     (
                         ReplyPart(
                             text=chunk,
+                            # 拆开或者带图的就不手滑了：打错的样子是对着整句写的
+                            typo_text=part.typo_text
+                            if len(chunks) == 1 and PHOTO_PLACEHOLDER not in part.text
+                            else "",
                             # 拆出来的后半段是同一口气说完的，中间不再停
                             pause_before_seconds=part.pause_before_seconds if i == 0 else 0.0,
                         ),
@@ -249,19 +271,26 @@ class Deliverer:
                     # 拿起手机之前的停顿，跟着 delay_scale 一起缩放，调试时才不用真等
                     await self.clock.sleep(part.pause_before_seconds * self.attention.delay_scale)
 
-                if part.text:
-                    await self._type(channel, part.text)
+                typo = "" if attach else _usable_typo(part)
+                shown = typo or part.text
+                if shown:
+                    await self._type(channel, shown)
 
                 message = await self._send(
                     channel,
-                    part.text,
+                    shown,
                     file=self.make_file(Path(photo.path)) if attach and photo else None,
                     # 引用只挂在第一条上；续发（start_index>0）时第一条早发过了
                     reference=reply_to if index == 0 else None,
                 )
+                if typo:
+                    # 发出去了才看见打错了，过几秒改回来
+                    await self.clock.sleep(self.rng.uniform(4, 20) * self.attention.delay_scale)
+                    if await self._edit(message, part.text):
+                        shown = part.text
 
-                if part.text:
-                    result.sent_texts.append(part.text)
+                if shown:
+                    result.sent_texts.append(shown)
                 if attach and photo:
                     result.photo_sent = photo
                 message_id = getattr(message, "id", None)
@@ -390,6 +419,18 @@ class Deliverer:
         """一段连续的打字。上下文管理器会自己续期，中途不用管。"""
         async with channel.typing():
             await self.clock.sleep(seconds)
+
+    async def _edit(self, message: Any, text: str) -> bool:
+        """把打错的那条改回来。改不了（没有 edit、网络抖了）就留着——打错字而已。"""
+        edit = getattr(message, "edit", None)
+        if edit is None:
+            return False
+        try:
+            await edit(content=text)
+        except Exception as exc:  # noqa: BLE001 - 改不回来不值得让整条回复失败
+            log.info("打错的那条没改回来：%r", exc)
+            return False
+        return True
 
     async def _send(
         self, channel: Channel, text: str, *, file: Any = None, reference: Any = None

@@ -260,7 +260,10 @@ class StyleConfig(BaseModel):
     typing_chars_per_second: float = 2.6
     """打字速度，手机打字比键盘慢。"""
     typo_probability: float = 0.05
-    """发出错别字然后过几秒编辑掉的概率。"""
+    """一次回复里手滑打错一个字、发出去几秒后改回来的概率。
+
+    打错的样子让模型写（拼音选错同音字最像手滑），多久一次由这里定。
+    """
 
 
 class Boundaries(BaseModel):

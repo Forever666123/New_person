@@ -1081,6 +1081,8 @@ class App:
                 # 通常一个触发词都没有，模式匹配不上，她就没办法把这件事记成翻篇。
                 open_questions=await self.memory.open_questions(now),
                 not_yet=await self.memory.pending_timed(now),
+                # 偶尔手滑打错一个字，发出去几秒后改回来。多久一次看人设。
+                typo=self.rng.random() < self.persona.style.typo_probability,
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
                 unread=self._local_stamps(unread, now),

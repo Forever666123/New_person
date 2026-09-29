@@ -12,8 +12,8 @@ style:
   allow_reactions: true
   english_sentence_max_words: 0   # 0 表示不限制整句英文
   typing_chars_per_second: 2.6
-  # extra_part_probability / english_words_allowed / typo_probability：
-  #   代码里没人读，写了也没效果。
+  typo_probability: 0.05       # 偶尔手滑打错一个字，几秒后改回来（错的样子让模型写）
+  # extra_part_probability / english_words_allowed：代码里没人读，写了也没效果。
 
 # 人物设定模板。复制成 persona/persona.yaml 再改。
 # 已经有一份填好的真实例子：persona/persona.yaml（沈亦宁）。

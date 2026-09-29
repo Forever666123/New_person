@@ -57,6 +57,19 @@ PRICING_PER_MTOK = {
 }
 """(输入, 输出) 美元每百万 token。缓存命中按输入的十分之一算，写入按 1.25 倍。"""
 
+def _keep_one_typo(plan: ReplyPlan, *, allowed: bool) -> None:
+    """打错字多久一次由代码定，不由模型定：没让她手滑，写了也不用；让了，也只留一条。
+
+    交给模型自己拿捏频率的话，它要么从来不打错，要么每句都错。
+    """
+    kept = False
+    for part in plan.parts:
+        if not allowed or kept:
+            part.typo_text = ""
+        elif part.typo_text:
+            kept = True
+
+
 def price_of(model: str) -> tuple[float, float]:
     """(输入, 输出) 单价。带日期的正式 ID（claude-haiku-4-5-20251001）按别名算。
 
@@ -136,6 +149,8 @@ class ReplyRequest:
     """她问过、还没听到下文的那几条。跟话题模式无关，永远带着。"""
     not_yet: list[tuple[int, datetime, LedgerEntry]] = field(default_factory=list)
     """他说了时间、还没到该问的时候的那几条。"""
+    typo: bool = False
+    """这次让她手滑打错一个字（发出去几秒后改回来）。"""
 
 
 @dataclass
@@ -427,6 +442,7 @@ class Brain:
             ledger_topic=req.ledger_topic,
             open_questions=req.open_questions,
             not_yet=req.not_yet,
+            typo=req.typo,
             mode_instruction=req.mode_instruction,
             recent=req.recent,
             unread=req.unread,
@@ -457,7 +473,10 @@ class Brain:
             if second is not None and (second.parts or second.reaction):
                 plan = second
 
-        return await self._polish(plan, prompt, req.images, today)
+        polished = await self._polish(plan, prompt, req.images, today)
+        if polished is not None:
+            _keep_one_typo(polished, allowed=req.typo)
+        return polished
 
     async def _polish(
         self,
