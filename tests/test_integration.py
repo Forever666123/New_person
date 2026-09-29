@@ -3342,6 +3342,41 @@ async def test_a_goodnight_reply_that_slips_past_bedtime_does_not_say_goodnight_
     assert "要睡" not in prompt
 
 
+async def test_a_goodnight_reply_delayed_into_her_sleep_waits_until_she_wakes(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前被拉回来的那条回复，重试退避之后过了睡点：醒来再回，不在她睡着时发。
+
+    拉回来之后离睡点只剩几分钟，两次瞬时失败的退避就能把它推过去。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="早")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=12)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=1650)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, bedtime + timedelta(hours=9))
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(max(sign.run_at, at + timedelta(seconds=30)) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+
+    asleep = bedtime + timedelta(minutes=3)
+    assert app.rhythm.is_sleeping(asleep)
+    await memory.reschedule_job(reply.id or 0, asleep)  # 比如重试退避推过了睡点
+    clock.set(asleep + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [] and llm.calls == []
+    moved = await memory.get_job(reply.id or 0)
+    assert moved.status == "pending" and not app.rhythm.is_sleeping(moved.run_at)
+    clock.set(moved.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["早"]
+    assert persona.proactive.sign_off.reply_note not in llm.calls[-1]["messages"][0]["content"]
+
+
 async def test_she_says_goodnight_where_he_was_talking_not_in_the_public_channel(
     tmp_path: Path, persona: Persona
 ) -> None:
@@ -3569,7 +3604,7 @@ async def test_a_window_photo_needs_a_window_photo(tmp_path: Path, persona: Pers
         Photo(id="cat-001", file="b.jpg", tags=["cat", "home"]),
     ]
     window = next(k for k in persona.proactive.kinds if k.photo_tags and k.requires_photo)
-    assert app.life.has_photos([]) and not app.life.has_photos(window.photo_tags)
+    assert await app.life.has_photos([]) and not await app.life.has_photos(window.photo_tags)
 
     at = EVENING + timedelta(hours=1)
     job_id = await app.scheduler.schedule(
@@ -3584,6 +3619,10 @@ async def test_a_window_photo_needs_a_window_photo(tmp_path: Path, persona: Pers
 
     app.media.library.photos.append(Photo(id="win-001", file="c.jpg", tags=["window", "night"]))
     assert [p.id for p in await app._photo_shortlist(at, window.photo_tags)] == ["win-001"]
+    assert await app.life.has_photos(window.photo_tags)
+    # 唯一那张窗外照片刚发过、还在冷却里：不进当天候选，免得白占名额
+    await memory.mark_photo_used("win-001", CONVERSATION_ID, clock.now(), False)
+    assert not await app.life.has_photos(window.photo_tags)
 
 
 async def test_her_custom_status_shows_up_on_some_days_and_not_at_midnight_sharp(
@@ -3602,9 +3641,13 @@ async def test_her_custom_status_shows_up_on_some_days_and_not_at_midnight_sharp
     async def change_presence(**_kw) -> None:
         return None
 
+    assert persona.style.status_text_probability == 0, "默认该关着：挂的是心情原文"
+    on = persona.model_copy(
+        update={"style": persona.style.model_copy(update={"status_text_probability": 0.3})}
+    )
     presence = PresenceManager(
         SimpleNamespace(change_presence=change_presence),
-        persona, app.rhythm, memory, clock, random.Random(1),
+        on, app.rhythm, memory, clock, random.Random(1),
     )
     shown = 0
     for offset in range(40):

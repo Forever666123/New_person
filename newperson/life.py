@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, time, timedelta
 
 from .brain import Brain, DayPlanRequest
@@ -44,6 +44,10 @@ OPENER_KEY = "opener"
 log = logging.getLogger(__name__)
 
 
+async def _always_has_photos(_tags: list[str]) -> bool:
+    return True
+
+
 class LifeEngine:
     def __init__(
         self,
@@ -64,8 +68,11 @@ class LifeEngine:
         self.brain = brain
         self.clock = clock
         self.rng = rng
-        self.has_photos: Callable[[list[str]], bool] = lambda _tags: True
-        """手边有没有能发的照片（给了标签就得对得上标签）。App 接上照片库；没接的时候当作有。"""
+        self.has_photos: Callable[[list[str]], Awaitable[bool]] = _always_has_photos
+        """手边有没有能发的照片（不在冷却里，给了标签就得对得上标签）。
+
+        App 接上照片库；没接的时候当作有。
+        """
 
     # -- 日程 ---------------------------------------------------------------
 
@@ -366,7 +373,7 @@ class LifeEngine:
                 continue
             # 看的是**对得上这一种的**照片：库里只有午饭和猫的时候，
             # "凌晨拍了一张窗外"排上了也只能拿牛肉面去凑，或者白占当天的名额
-            if kind.requires_photo and not self.has_photos(kind.photo_tags):
+            if kind.requires_photo and not await self.has_photos(kind.photo_tags):
                 continue
             if await self._days_since_last(kind.name, day) < kind.min_days_since_last:
                 continue

@@ -264,6 +264,12 @@ class StyleConfig(BaseModel):
 
     打错的样子让模型写（拼音选错同音字最像手滑），多久一次由这里定。
     """
+    status_text_probability: float = 0.0
+    """多大比例的日子挂一个 Discord 自定义状态。0 就是从不挂。
+
+    挂的是当天日程里 mood 那一句的原文。那句是写给她自己看的心情，
+    写它的时候并不知道会被公开，所以默认关着。
+    """
 
 
 class Boundaries(BaseModel):

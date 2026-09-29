@@ -144,9 +144,7 @@ class App:
         """留着引用。只 create_task 不保存的话，任务可能被 GC 掉，循环无声无息就停了。"""
         # 照片库空着的时候，要照片的那几种主动不进当天的候选。
         # 原来它照样抽签、占掉名额，到点再发现没照片跳过——那天就什么都不说了。
-        self.life.has_photos = lambda tags: bool(
-            _tagged(self.media.library.available(set(), None), tags)
-        )
+        self.life.has_photos = self._has_photos
         self.on_phone: Callable[[], Awaitable[None]] | None = None
         """她拿起手机了（在线状态马上亮，亮几分钟）。连上 Discord 之后由 client 接上。"""
 
@@ -1055,6 +1053,15 @@ class App:
         tz = self.rhythm.local_time(now).tzinfo
         return [m.model_copy(update={"created_at": m.created_at.astimezone(tz)}) for m in messages]
 
+    async def _has_photos(self, tags: list[str]) -> bool:
+        """排当天候选时用：有没有不在冷却里、标签对得上的照片。
+
+        不看冷却的话，唯一一张窗外照片刚发过，window_photo 照样进候选，
+        到点挑不出图、任务作废，当天的主动名额就白占了。时段到点再看。
+        """
+        used = await self.memory.recently_used_photo_ids(self.clock.now())
+        return bool(_tagged(self.media.library.available(used, None), tags))
+
     async def _photo_shortlist(self, now: datetime, tags: list[str] | None = None) -> list:
         """``tags`` 是这一种主动要的照片标签（window_photo 要窗外、夜景）。不给就不限。"""
         used = await self.memory.recently_used_photo_ids(now)
@@ -1091,6 +1098,13 @@ class App:
 
         now = self.clock.now()
         from .models import ReplyPlan
+
+        if job.payload.get("sign_off_before") and self.rhythm.is_sleeping(now):
+            # 睡前那句把它拉到离睡点只剩几分钟，之后任何顺延（重试退避、重启打散）
+            # 都会让它在她睡着的时候发出去。她已经睡了，那就醒来再回。
+            wake = self.rhythm.next_wake_after(now)
+            await self._later_reply(job, self.rhythm.first_glance_after_waking(wake, self.rng))
+            return
 
         saved = job.progress.get("plan")
         if saved is not None:
@@ -1154,6 +1168,10 @@ class App:
         await self._deliver_reply(
             job, reply_plan, unread, now, start_index, covers, goodnight=goodnight
         )
+
+    async def _later_reply(self, job: Job, run_at: datetime) -> None:
+        log.info("[job] 她已经睡了，这条醒来再回：%s", run_at.strftime("%m-%d %H:%M"))
+        await self.scheduler.defer(job.id or 0, run_at)
 
     async def _defer_to_tomorrow(self, job: Job, now: datetime, why: str) -> None:
         """把任务推到明天她醒来。用于不是故障、只是今天做不了的情况。"""
@@ -1883,7 +1901,7 @@ class PresenceManager:
         return "dnd" if roll < 0.2 else "idle"
 
     async def _status_text(self, now: datetime) -> str | None:
-        """自定义状态一天最多换一次，而且多数时候不换。
+        """自定义状态一天最多换一次，而且多数日子没有（``style.status_text_probability``）。
 
         真人不会每两小时改一次签名，跟着日程自动轮换是明显的破绽。
 
@@ -1892,6 +1910,9 @@ class PresenceManager:
         当天的日程都还没生成，mood 是空的，当天就锁成"没有状态"——
         说好的三成日子有状态，实际一天都没有；偶尔有，也在 00:00 整准点消失。
         """
+        chance = self.persona.style.status_text_probability
+        if chance <= 0:
+            return None
         day = self.rhythm.logical_day(now)
         if await self.memory.kv_get("status_text_day") == day.isoformat():
             return await self.memory.kv_get("status_text") or None
@@ -1900,7 +1921,7 @@ class PresenceManager:
             return None  # 刚醒、日程还没出来：先空着，出来了再定
         await self.memory.kv_set("status_text_day", day.isoformat())
         # 按天抽签，重启不会重抽
-        if random.Random(f"{self.persona.seed}:status:{day.isoformat()}").random() > 0.3:
+        if random.Random(f"{self.persona.seed}:status:{day.isoformat()}").random() >= chance:
             await self.memory.kv_set("status_text", "")
             return None
         text = plan.mood[:60]

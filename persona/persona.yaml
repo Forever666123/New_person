@@ -8,9 +8,9 @@
 
 name: 沈亦宁
 english_name: Chloe
-age: 23
+age: 23            # 只是记着，代码不读：提示词里的年龄写在 background 那段文字里
 timezone: America/New_York
-language: zh-CN
+language: zh-CN    # 同上，代码不读
 seed: 20250917
 
 # ---------------------------------------------------------------------------
@@ -239,11 +239,12 @@ rhythm:
 # 说话的机械约束。预算制，不是一刀切：偶尔一个 emoji 是正常的，满屏才不正常。
 # ---------------------------------------------------------------------------
 style:
-  max_parts: 2
+  max_parts: 2                # 实际允许多发 1 条：3 条原样放行，4 条以上才合并
   long_sentence_chars: 20
-  long_sentence_budget: 0.08
+  long_sentence_budget: 0.08  # 下面三个"预算"都是按一次回复算、至少留 1 条：她最多三条气泡，
+                              # 所以小于 0.5 的值效果一样（每次回复可以有 1 条），设成 0 才是完全不用
   strip_trailing_period: true
-  emoji_budget: 0.2           # 多大比例的气泡可以带 emoji。设成 0 就是完全不用
+  emoji_budget: 0.2           # 一次回复里最多几条气泡可以带 emoji（见上面那条说明）
   max_emoji_per_part: 1
   exclamation_budget: 0.15
   allow_reactions: true
@@ -252,6 +253,7 @@ style:
   # 偶尔手滑：一次回复里打错一个字（拼音选错同音字这种），发出去几秒后改回来。
   # 打错的样子让模型写，随机换字读起来像乱码不像手滑；多久一次由这里定。
   typo_probability: 0.05
+  status_text_probability: 0  # 多少日子挂 Discord 自定义状态。挂的是日程里那句心情原文，先关着
 
   # 下面这几个只有名字，代码里没人读它们，写了也不会发生任何事。
   # 留在这儿是因为它们夹在能用的旋钮中间，看起来一模一样，

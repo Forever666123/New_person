@@ -139,8 +139,18 @@ EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", 
 """交代行踪前面常垫的那几个字。垫一个"哈哈""抱歉""我"就能绕过去的话，这道闸形同虚设。"""
 
 
-def _clauses(text: str) -> list[str]:
-    return [c for c in re.split(r"[\s，。、！？!?,.~～…；;：:（）()【】「」]+", text) if c]
+_CLAUSE = re.compile(r"[^\s，。、！？!?,.~～…；;：:（）()【】「」]+")
+_ASKING_TAIL = ("吗", "么", "没", "嘛")
+
+
+def _clauses(text: str) -> list[tuple[str, bool]]:
+    """切成小句，顺带标出每句是不是在**问**。"""
+    out: list[tuple[str, bool]] = []
+    for m in _CLAUSE.finditer(text):
+        clause = m.group()
+        after = text[m.end() :].lstrip()[:1]
+        out.append((clause, clause.endswith(_ASKING_TAIL) or after in ("?", "？")))
+    return out
 
 
 def _starts_with_excuse(text: str, phrase: str) -> bool:
@@ -150,13 +160,20 @@ def _starts_with_excuse(text: str, phrase: str) -> bool:
     再比前缀。放在后面的是正常说话："我室友在睡觉""你说的那个我还没看到"。
     """
     want = phrase.lower().replace("刚刚", "刚")
-    for clause in _clauses(text.lower())[:2]:
+    # "我"只在"刚/才/还"前面算垫话："我刚醒"是交代，"我在睡觉前看了会书"不是
+    fillers = (
+        EXCUSE_FILLERS if want[:1] in ("刚", "才", "还")
+        else tuple(f for f in EXCUSE_FILLERS if f != "我")
+    )
+    for clause, asking in _clauses(text.lower())[:2]:
+        if asking:
+            continue  # "早 刚醒吗""下课了？刚忙完没"是在问他，不是交代自己
         # 每剥一层都比一次：短语自己可能就带着垫话（"抱歉刚"），剥光了反而对不上
         rest = clause.replace("刚刚", "刚")
         while rest:
             if rest.startswith(want):
                 return True
-            filler = next((f for f in EXCUSE_FILLERS if rest.startswith(f)), None)
+            filler = next((f for f in fillers if rest.startswith(f)), None)
             if filler is None:
                 break
             rest = rest[len(filler) :]
