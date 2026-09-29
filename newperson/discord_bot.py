@@ -1222,6 +1222,8 @@ class App:
                     reply_plan = reply_plan.model_copy(
                         update={"parts": reply_plan.parts[:start_index], "photo_request": None}
                     )
+                    # 存下的那张图也不补：不然它没人认领，醒来第一眼单独冒出来一张
+                    job.progress = {**job.progress, "photo": None}
                 await self._deliver_reply(
                     job, reply_plan, unread, now, start_index, covers,
                     goodnight=datetime.fromisoformat(raw) if raw else None,
@@ -1401,6 +1403,8 @@ class App:
                 reply_to=reply_to,
                 on_progress=on_progress,
                 start_index=start_index,
+                # 重试过几次还是那张图的问题，就不带图接着说，别让整条回复一直卡着
+                drop_photo_on_error=job.attempts >= 3,
             )
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
@@ -1493,6 +1497,10 @@ class App:
             await self.memory.mark_photo_used(
                 result.photo_sent.photo_id, CONVERSATION_ID, now, result.photo_sent.is_fresh
             )
+        failed = getattr(result, "photo_failed", None)
+        if failed is not None and failed.photo_id:
+            # 发不出去的那张也进冷却：不然下次又被挑中，每次都是"你看"后面没图
+            await self.memory.mark_photo_used(failed.photo_id, CONVERSATION_ID, now, failed.is_fresh)
 
     async def _after_reply(
         self, plan, now: datetime, sent_any: bool, said_at: datetime | None = None
@@ -1755,7 +1763,7 @@ class App:
         await self._on_phone()
         try:
             result = await self.deliverer.deliver_proactive(
-                await self.resolve_channel(), plan, photo
+                await self.resolve_channel(), plan, photo, drop_photo_on_error=job.attempts >= 3
             )
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)

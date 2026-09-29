@@ -211,7 +211,13 @@ def _starts_with_excuse(text: str, phrase: str, whole: bool = False) -> bool:
 
 
 def _phrase_ends(after: str) -> bool:
-    """短语说到这里就完了：后面没了，或者只跟着语气词、标点、表情。"""
+    """短语说到这里就完了：后面没了，或者只跟着语气词、标点、表情。
+
+    句尾的"了"也算（"刚起了""才起了 你呢"）。PHRASE_TAIL 故意不收"了"，
+    那是给 never_say 用的（"我去加油了"不是在说"加油"），这里单独放过一个。
+    """
+    if after[:1] == "了":
+        after = after[1:]
     return not after or after[0] in PHRASE_TAIL or not after[0].isalnum()
 
 

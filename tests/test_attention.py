@@ -310,6 +310,38 @@ def test_capped_overnight_replies_do_not_pile_up_on_one_minute(
     assert at_cap / total < 0.01, f"{at_cap}/{total} 条正好落在起床后第 {limit:.0f} 分钟"
 
 
+def test_while_awake_she_never_leaves_him_hanging_for_a_whole_day(
+    policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
+) -> None:
+    """醒着时收到的消息：不跨一觉就不超过 max_delay_hours；跨了一觉，醒来后最多再拖 backlog。
+
+    原来醒着那一支的上限判断的是"看到之后到开始回"，那只有几十秒——上限是死代码。
+    快睡前、刚醒那段活跃度很低，一次"先放着"实测能让她醒着 30 小时不回。
+    """
+    limit = timedelta(hours=persona.timing.max_delay_hours)
+    backlog = timedelta(hours=persona.timing.backlog_after_wake_hours)
+    checked = 0
+    for offset in range(40):
+        day = evening(offset).date()
+        daily = rhythm.for_day(day)
+        for sent in (daily.wake + timedelta(minutes=15), daily.sleep_start - timedelta(minutes=50)):
+            if rhythm.is_sleeping(sent):
+                continue
+            for heat in ("warm", "cold"):
+                for seed in range(15):
+                    d = policy.plan_reply(
+                        sent, heat, extract_features(["嗯"], persona), sent, random.Random(seed)
+                    )
+                    checked += 1
+                    bedtime = rhythm.next_sleep_after(sent)
+                    if d.reply_at <= bedtime:
+                        assert d.reply_at - sent <= limit + timedelta(minutes=1), d.reason
+                    else:
+                        cap = rhythm.next_wake_after(bedtime) + backlog
+                        assert d.reply_at <= cap + timedelta(minutes=1), d.reason
+    assert checked > 1000
+
+
 def test_she_usually_deals_with_the_backlog_on_the_first_look(
     policy: AttentionPolicy, persona: Persona, rhythm: Rhythm
 ) -> None:

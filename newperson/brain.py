@@ -213,6 +213,52 @@ def sniff_media_type(raw: bytes) -> str | None:
     return None
 
 
+MAX_IMAGE_SIDE = 8000
+"""接口对单张图任一边的上限，超了整个请求 400。"""
+MAX_IMAGES = 20
+"""一次最多带几张。超过 20 张时接口要求每张都不超过 2000px，干脆只带最新的 20 张。"""
+MAX_IMAGES_BASE64 = 24 * 1024 * 1024
+"""所有图 base64 之后的总量。请求体超过 32MB 是 413，给提示词留点余量。"""
+
+
+def image_size(raw: bytes) -> tuple[int, int] | None:
+    """从字节头读 (宽, 高)。只认 sniff_media_type 认得的四种，读不出来返回 None。"""
+    try:
+        if raw.startswith(b"\x89PNG") and raw[12:16] == b"IHDR":
+            return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            return int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little")
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            chunk = raw[12:16]
+            if chunk == b"VP8X":
+                return 1 + int.from_bytes(raw[24:27], "little"), 1 + int.from_bytes(raw[27:30], "little")
+            if chunk == b"VP8L":
+                b = raw[21:25]
+                return 1 + (b[0] | (b[1] & 0x3F) << 8), 1 + (b[1] >> 6 | b[2] << 2 | (b[3] & 0x0F) << 10)
+            if chunk == b"VP8 ":
+                return (int.from_bytes(raw[26:28], "little") & 0x3FFF,
+                        int.from_bytes(raw[28:30], "little") & 0x3FFF)
+            return None
+        if raw.startswith(b"\xff\xd8"):
+            i = 2
+            while i + 9 < len(raw):
+                if raw[i] != 0xFF:
+                    return None
+                marker = raw[i + 1]
+                if marker == 0xFF:  # 填充字节
+                    i += 1
+                    continue
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    return int.from_bytes(raw[i + 7 : i + 9], "big"), int.from_bytes(raw[i + 5 : i + 7], "big")
+                i += 2 + int.from_bytes(raw[i + 2 : i + 4], "big")
+    except IndexError:
+        return None
+    return None
+
+
 class Brain:
     def __init__(
         self,
@@ -222,6 +268,8 @@ class Brain:
         memory: Memory | None = None,
         clock: Clock | None = None,
     ) -> None:
+        self._last_status: int | None = None
+        """上一次调用接口回的错误码（400、413……）。没出错或者不是这类错误就是 None。"""
         self.client = client
         self.settings = settings
         self.persona = persona
@@ -308,6 +356,7 @@ class Brain:
         model: str | None = None,
     ) -> T | None:
         """调一次模型。任何失败都返回 None，让上层当作"没看手机"。"""
+        self._last_status = None
         if await self._over_budget(today):
             return None
 
@@ -337,6 +386,7 @@ class Brain:
             )
             return None
         except anthropic.APIStatusError as exc:
+            self._last_status = exc.status_code
             level = log.warning if exc.status_code >= 500 else log.error
             level("[brain] %s 接口返回 %s：%s", purpose, exc.status_code, exc)
             await self._note_error(
@@ -413,7 +463,16 @@ class Brain:
             if media_type is None:
                 log.warning("[brain] 认不出这张图的格式（%d 字节），不发给模型", len(raw))
                 continue
+            size = image_size(raw)
+            if size is not None and max(size) > MAX_IMAGE_SIDE:
+                # 聊天记录的长截图常见到一万多像素高，接口每次都拒——同上，那就是永久哑掉
+                log.warning("[brain] 这张图 %dx%d 超过接口上限，不发给模型", *size)
+                continue
             usable.append((media_type, raw))
+        # 张数和总量也有上限，超了同样每次都拒：留最新的，丢最旧的
+        usable = usable[-MAX_IMAGES:]
+        while usable and sum(len(raw) * 4 // 3 for _t, raw in usable) > MAX_IMAGES_BASE64:
+            usable.pop(0)
         if not usable:
             return text
         blocks: list[dict[str, Any]] = [
@@ -449,9 +508,15 @@ class Brain:
             hints=req.hints,
             photos=req.photos,
         )
-        plan = await self._call(
-            ReplyPlan, self._with_images(prompt, req.images), purpose="reply", today=today
-        )
+        images = req.images
+        content = self._with_images(prompt, images)
+        plan = await self._call(ReplyPlan, content, purpose="reply", today=today)
+        if plan is None and not isinstance(content, str) and self._last_status in (400, 413):
+            # 带着图被接口拒了（预检没认出来的毛病）。图每次都会被拒，重试十几个小时
+            # 也没用，他后面说的话全堵在这里——不带图再问一次，她照样回，只是没看见图
+            log.warning("[brain] 带图被接口拒了（%s），不带图再试一次", self._last_status)
+            images = []
+            plan = await self._call(ReplyPlan, prompt, purpose="reply", today=today)
         if plan is None:
             return None
 
@@ -466,14 +531,14 @@ class Brain:
             )
             second = await self._call(
                 ReplyPlan,
-                self._with_images(nudge, req.images),
+                self._with_images(nudge, images),
                 purpose="reply-nudge",
                 today=today,
             )
             if second is not None and (second.parts or second.reaction):
                 plan = second
 
-        polished = await self._polish(plan, prompt, req.images, today)
+        polished = await self._polish(plan, prompt, images, today)
         if polished is not None:
             _keep_one_typo(polished, allowed=req.typo)
         return polished

@@ -939,3 +939,74 @@ async def test_proactive_messages_never_slip(
     brain = Brain(fake_client(first), settings(tmp_path), persona, memory)
     got = await brain.generate_proactive(proactive_request(), TODAY)
     assert got is not None and got.parts and not got.parts[0].typo_text
+
+
+def _png(width: int, height: int) -> bytes:
+    import struct
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + b"\0" * 8
+
+
+def _image_blocks(call: dict) -> list:
+    content = call["messages"][0]["content"]
+    return [] if isinstance(content, str) else [b for b in content if b["type"] == "image"]
+
+
+async def test_a_long_screenshot_is_not_sent_to_the_model(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """聊天记录的长截图一万多像素高，接口每次都拒：不带它，她照样回。
+
+    带着它的话每次都 400，那批话一直未读、他后面说的也全堵住——
+    直到两周后那张图被清理掉。
+    """
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="哈哈")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(
+        reply_request(images=[("image/png", _png(1080, 9000)), ("image/png", _png(1080, 1920))]),
+        TODAY,
+    )
+    assert got is not None and got.parts
+    assert len(_image_blocks(client.messages.calls[0])) == 1
+
+
+async def test_too_many_pictures_keeps_the_newest_twenty(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """一次最多带二十张：超过了接口对每张的尺寸要求更严，干脆只带最新的。"""
+    client = fake_client(ReplyPlan(parts=[ReplyPart(text="好多")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    images = [("image/png", _png(100 + i, 100)) for i in range(25)]
+    await brain.generate_reply(reply_request(images=images), TODAY)
+    blocks = _image_blocks(client.messages.calls[0])
+    assert len(blocks) == 20
+
+
+async def test_a_picture_the_api_rejects_is_dropped_and_she_still_answers(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """预检没认出来的毛病、带图被接口 400 了：不带图马上再问一次，不交给调度器重试十几个小时。"""
+    request = httpx.Request("POST", "http://x")
+    rejected = anthropic.BadRequestError(
+        "image exceeds limits", response=httpx.Response(400, request=request), body=None
+    )
+    client = fake_client(rejected, ReplyPlan(parts=[ReplyPart(text="看不清")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(images=[("image/png", PNG_BYTES)]), TODAY)
+    assert got is not None and [p.text for p in got.parts] == ["看不清"]
+    assert _image_blocks(client.messages.calls[0]) and not _image_blocks(client.messages.calls[1])
+
+
+async def test_a_server_hiccup_with_a_picture_is_not_a_reason_to_drop_it(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """接口 5xx 是暂时的：不丢图重问，交给调度器过一会儿带着图再试。"""
+    request = httpx.Request("POST", "http://x")
+    hiccup = anthropic.InternalServerError(
+        "overloaded", response=httpx.Response(529, request=request), body=None
+    )
+    client = fake_client(hiccup, ReplyPlan(parts=[ReplyPart(text="嗯")]))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    got = await brain.generate_reply(reply_request(images=[("image/png", PNG_BYTES)]), TODAY)
+    assert got is None and len(client.messages.calls) == 1

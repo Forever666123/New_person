@@ -739,3 +739,39 @@ async def test_a_forbidden_picture_still_stops_the_delivery(
     channel.send = forbidden  # type: ignore[method-assign]
     with pytest.raises(DeliveryBlocked):
         await deliverer.deliver(channel, parts("{photo}"), PHOTO)
+
+
+async def test_a_network_blip_while_sending_a_picture_is_retried_not_dropped(
+    deliverer: Deliverer, clock: FakeClock
+) -> None:
+    """上传图时网络抖了一下：交给上层重试，不把图永远丢掉、光发一句"你看"。"""
+    channel = FakeChannel(clock)
+    real_send = channel.send
+
+    async def blip(content=None, *, file=None, reference=None):
+        if file is not None:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return await real_send(content, reference=reference)
+
+    channel.send = blip  # type: ignore[method-assign]
+    with pytest.raises(ConnectionResetError):
+        await deliverer.deliver(channel, parts("你看{photo}"), PHOTO)
+    assert channel.texts == []
+
+
+async def test_after_a_few_tries_an_unknown_picture_error_stops_blocking_the_words(
+    deliverer: Deliverer, clock: FakeClock
+) -> None:
+    """认不出来的错误、已经重试过几次：不带图接着说，并且记下这张图，让它进冷却。"""
+    channel = FakeChannel(clock)
+    real_send = channel.send
+
+    async def weird(content=None, *, file=None, reference=None):
+        if file is not None:
+            raise RuntimeError("something odd")
+        return await real_send(content, reference=reference)
+
+    channel.send = weird  # type: ignore[method-assign]
+    result = await deliverer.deliver(channel, parts("你看{photo}"), PHOTO, drop_photo_on_error=True)
+    assert channel.texts == ["你看"]
+    assert result.photo_failed == PHOTO

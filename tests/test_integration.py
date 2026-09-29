@@ -4300,6 +4300,71 @@ async def test_a_promise_folded_into_a_dropped_goodnight_half_is_still_kept(
     assert (await memory.get_job(promise)).status == "pending", "答应他的事没说出口就作废了"
 
 
+async def test_the_picture_of_a_dropped_goodnight_half_is_not_sent_the_next_morning(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前那条回复带图、后半截醒来被裁掉：那张图也不补，醒来第一眼不是单独一张图。"""
+    from newperson.models import Photo, PhotoRequest
+
+    plan = ReplyPlan(
+        parts=[ReplyPart(text="哈哈对"), ReplyPart(text="困了 先睡了")],
+        photo_request=PhotoRequest(photo_id="p1"),
+    )
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [plan])
+    app.media.library.photos = [Photo(id="p1", file="p.jpg", tags=["sky"])]
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=15)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=3900)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(job.id or 0, at + timedelta(minutes=1))
+    real_send = channel.send
+
+    async def second_fails(content=None, **kw):
+        if channel.sent:
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = second_fails
+    clock.set(at + timedelta(minutes=1, seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.sent == [("哈哈对", False)]
+
+    channel.send = real_send
+    morning = app.rhythm.next_wake_after(bedtime) + timedelta(hours=1)
+    await memory.reschedule_job(job.id or 0, morning)
+    clock.set(morning + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.sent == [("哈哈对", False)], "醒来第一眼单独冒出来一张图"
+
+
+async def test_a_picture_that_cannot_be_sent_goes_into_cooldown(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """发不出去的那张图也进冷却：不然下次又被挑中，每次都是"你看"后面没图。"""
+    from newperson.models import Photo, PhotoRequest
+
+    plan = ReplyPlan(parts=[ReplyPart(text="你看{photo}")], photo_request=PhotoRequest(photo_id="big"))
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [plan])
+    app.media.library.photos = [Photo(id="big", file="big.jpg", tags=["sky"])]
+
+    class TooLarge(Exception):
+        status = 413
+
+    real_send = channel.send
+
+    async def too_large(content=None, *, file=None, reference=None):
+        if file:
+            raise TooLarge("413 Payload Too Large")
+        return await real_send(content, reference=reference)
+
+    channel.send = too_large
+    await send(app, "今天天气怎么样", at=EVENING, msg_id=4000)
+    await drain(app, clock, hops=5)
+    assert channel.texts == ["你看"]
+    assert "big" in await memory.recently_used_photo_ids(clock.now())
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

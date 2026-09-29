@@ -280,11 +280,22 @@ class AttentionPolicy:
                 return later(cap, -slack * rng.random())
             return reply
 
+        # 醒着的时候：按"醒着拖了多久"封顶。原来的条件是 `reply - notice <= limit`，
+        # 而看到之后到开始回只有几十秒到几分钟，这一半永远成立——上限是死代码。
+        # 快睡前、刚醒那段活跃度很低，一次"先放着"能跨过她醒着的一整天。
         limit = timedelta(hours=self.persona.timing.max_delay_hours)
-        if reply - now <= limit or reply - notice <= limit:
+        backlog = timedelta(hours=self.persona.timing.backlog_after_wake_hours)
+        bedtime = self.rhythm.next_sleep_after(now)
+        if reply <= bedtime or bedtime - now >= limit:
+            cap = later(now, limit)  # 没跨过一觉，或者睡前醒着那段就已经够长
+        else:
+            cap = later(self.rhythm.next_wake_after(bedtime), backlog)  # 跨过一觉：醒来后最多再拖这么久
+        if reply <= cap:
             return reply
         steps.append(f"封顶到 {self.persona.timing.max_delay_hours} 小时")
-        return later(notice, limit)
+        # 同睡着那一支：不正好落在上限那一分钟
+        slack = min(timedelta(minutes=45), backlog / 4)
+        return later(cap, -slack * rng.random())
 
     def _show(self, dt: datetime) -> str:
         """日志里的时刻按她当时所在的时区写。里面算的是 UTC，直接打出来没人看得懂。"""

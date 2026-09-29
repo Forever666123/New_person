@@ -82,6 +82,8 @@ class DeliveryResult:
     """表情被 Discord 拒了（403）。只有"这一轮她一个字都没发"时才当成会话发不出去。"""
     interrupted: bool = False
     """发到一半发现对方又发了新消息，剩余气泡没发。"""
+    photo_failed: ResolvedPhoto | None = None
+    """这张图重试也发不出去，不带图接着说了。上层让它进冷却，免得下次又挑中它。"""
     next_index: int = 0
     """下一条该从这里发。中途失败或被打断时，重启/重试靠它续上，不会重发。"""
 
@@ -115,6 +117,16 @@ def _usable_typo(part: ReplyPart) -> str:
     if difflib.SequenceMatcher(None, typo, text).ratio() < 0.6:
         return ""
     return typo
+
+
+def _photo_is_hopeless(exc: BaseException) -> bool:
+    """这张图重试也没用：文件没了、读不了，或者 Discord 嫌它太大。
+
+    网络抖一下、Discord 5xx 这种是暂时的，交给调度器重试，续发时还用同一张图。
+    """
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError)):
+        return True
+    return getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005
 
 
 def _is_forbidden(exc: BaseException) -> bool:
@@ -248,6 +260,7 @@ class Deliverer:
         on_progress: Callable[[int], Awaitable[None]] | None = None,
         reply_to: Any = None,
         start_index: int = 0,
+        drop_photo_on_error: bool = False,
     ) -> DeliveryResult:
         """按顺序：先加表情反应（如果有），再逐条：pause_before → typing(时长由 timing.typing_duration) → send。
         每条发完后调用 interrupted()，为 True 就停止并标记 interrupted。任何一条发送异常：记录日志，
@@ -289,10 +302,15 @@ class Deliverer:
                 except Exception as exc:
                     if not attach or _is_forbidden(exc):
                         raise
+                    if not (_photo_is_hopeless(exc) or drop_photo_on_error):
+                        raise  # 暂时的：交给调度器重试，续发还用这张图
                     # **那张图发不出去就不带图接着说。** 图是锦上添花：超过上传上限、
                     # 文件被挪走，这种每次都失败。原来整条任务跟着重试十几个小时，
                     # 他这期间说的话都被并进这条发不完的任务，一直没人回。
-                    log.warning("那张图发不出去（%r），不带图接着说", exc)
+                    # 认不出来的错误，重试过几次（drop_photo_on_error）也这样处理。
+                    log.warning("图 %s 发不出去（%r），不带图接着说",
+                                photo.photo_id if photo else "?", exc)
+                    result.photo_failed = photo
                     attach = False
                     if not shown:
                         result.next_index = index + 1
@@ -361,6 +379,7 @@ class Deliverer:
         reply_to: Any = None,
         on_progress: Callable[[int], Awaitable[None]] | None = None,
         start_index: int = 0,
+        drop_photo_on_error: bool = False,
     ) -> DeliveryResult:
         """回复一批未读消息。``reply_to`` 是要引用的那条消息对象（有 ``.id``），不引用就传 None。"""
         return await self.deliver(
@@ -373,6 +392,7 @@ class Deliverer:
             on_progress=on_progress,
             reply_to=reply_to,
             start_index=start_index,
+            drop_photo_on_error=drop_photo_on_error,
         )
 
     async def deliver_proactive(
@@ -384,6 +404,7 @@ class Deliverer:
         interrupted: Callable[[], Awaitable[bool]] | None = None,
         on_progress: Callable[[int], Awaitable[None]] | None = None,
         start_index: int = 0,
+        drop_photo_on_error: bool = False,
     ) -> DeliveryResult:
         """主动开口。没有反应、也不引用——她主动说事的时候不是在回谁的话。"""
         if not plan.send:
@@ -396,6 +417,7 @@ class Deliverer:
             interrupted=interrupted,
             on_progress=on_progress,
             start_index=start_index,
+            drop_photo_on_error=drop_photo_on_error,
         )
 
     # -- 细节 ---------------------------------------------------------------
