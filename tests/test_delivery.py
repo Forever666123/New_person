@@ -697,3 +697,45 @@ async def test_a_shutdown_while_fixing_a_typo_still_reports_what_was_sent(
         )
     partial = caught.value.delivery_result  # type: ignore[attr-defined]
     assert partial.sent_texts == ["我再图书馆"] and partial.next_index == 1
+
+
+class PictureRejected(Exception):
+    status = 413
+
+
+@pytest.mark.parametrize("texts", [["看这个", "{photo}"], ["你看{photo}", "好看吧"]])
+async def test_a_picture_that_cannot_be_sent_does_not_block_the_words(
+    deliverer: Deliverer, clock: FakeClock, texts: list[str]
+) -> None:
+    """那张图 Discord 每次都拒收（太大、文件没了）：不带图接着说，不整条卡住。
+
+    原来整条任务跟着重试十几个小时，他这期间说的话都被并进这条发不完的任务。
+    """
+    channel = FakeChannel(clock)
+    real_send = channel.send
+
+    async def no_pictures(content=None, *, file=None, reference=None):
+        if file is not None:
+            raise PictureRejected("413 Payload Too Large")
+        return await real_send(content, reference=reference)
+
+    channel.send = no_pictures  # type: ignore[method-assign]
+    result = await deliverer.deliver(channel, parts(*texts), PHOTO)
+    words = [t.replace("{photo}", "") for t in texts if t.replace("{photo}", "")]
+    assert channel.texts == words
+    assert result.photo_sent is None
+    assert result.next_index == len(deliverer.prepare_parts(parts(*texts), PHOTO))
+
+
+async def test_a_forbidden_picture_still_stops_the_delivery(
+    deliverer: Deliverer, clock: FakeClock
+) -> None:
+    """403 不是图的问题，是发不出去了：照旧交给上层处理。"""
+    channel = FakeChannel(clock)
+
+    async def forbidden(content=None, *, file=None, reference=None):
+        raise Forbidden()
+
+    channel.send = forbidden  # type: ignore[method-assign]
+    with pytest.raises(DeliveryBlocked):
+        await deliverer.deliver(channel, parts("{photo}"), PHOTO)

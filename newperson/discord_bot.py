@@ -48,6 +48,7 @@ from .models import (
     Job,
     LedgerEntry,
     PhotoRequest,
+    ResolvedPhoto,
     RhythmSnapshot,
     TimeOfDay,
 )
@@ -1216,6 +1217,8 @@ class App:
                     # 醒来第一句是"我先睡了"最像程序。前面说出口的算数，剩下的不补发，
                     # 收尾照走：记下今晚说过了、台账和答应的事照记
                     log.info("[job] 睡前那条回复剩下的半句过时了，不补发")
+                    # 并进这条的承诺可能就在被裁掉的那一截里：不算说过，它到点自己说
+                    job.payload.pop("riding_follow_up", None)
                     reply_plan = reply_plan.model_copy(
                         update={"parts": reply_plan.parts[:start_index], "photo_request": None}
                     )
@@ -1356,7 +1359,13 @@ class App:
         # 万一还没写下（理论上不会），退回 `now`——那正是 mark_read 用的值。
         batch = await self.memory.batch_of(covers) or now
         channel = await self.resolve_channel(channel_id)
-        photo = await self._resolve_photo(plan.photo_request, now)
+        if start_index > 0 and "photo" in job.progress:
+            # 续发用第一次挑中的那张（或者第一次就没图）。重新挑的话，发过的图进了冷却、
+            # 挑不到，只放图的那格被丢掉，下标整体前移——后面一句永远不发；反过来会重发一句
+            saved_photo = job.progress["photo"]
+            photo = ResolvedPhoto.model_validate(saved_photo) if saved_photo else None
+        else:
+            photo = await self._resolve_photo(plan.photo_request, now)
         react_to = (
             await self._fetch_message(unread[-1].discord_message_id, channel) if unread else None
         )
@@ -1376,6 +1385,7 @@ class App:
                 "plan": plan.model_dump(mode="json"),
                 "sent_parts": index + 1,
                 "planned_at": job.progress.get("planned_at") or now.isoformat(),
+                "photo": photo.model_dump(mode="json") if photo else None,
             }
             if goodnight is not None:
                 progress["goodnight"] = goodnight.isoformat()
@@ -1410,7 +1420,9 @@ class App:
         if goodnight is not None and spoke and not result.interrupted:
             await self._mark_signed_off(goodnight)
         riding = job.payload.get("riding_follow_up")
-        if riding and spoke and not result.interrupted:
+        # 承诺要**整条**说完才算：续发时一条没发、而计划里还有没发的，那件事可能就在里面
+        whole = bool(result.sent_texts) or start_index >= len(plan.parts)
+        if riding and spoke and whole and not result.interrupted:
             # 答应他的那件事跟着这次回复说出口了
             rider = await self.memory.get_job(int(riding))
             if rider is not None and rider.status == "pending":

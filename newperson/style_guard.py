@@ -142,6 +142,13 @@ EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", 
 _JUST = re.compile("刚才|才刚|刚刚")
 """这几种说法都当"刚"：清单里写"刚看到"，模型写的常是"刚才看到""才刚看到"。"""
 
+def _as_just(text: str) -> str:
+    """叠着说的（"刚刚才""才刚刚"）换一遍还剩一个，换到不再变为止。"""
+    while (out := _JUST.sub("刚", text)) != text:
+        text = out
+    return text
+
+
 _CLAUSE = re.compile(r"[^\s，。、！？!?,.~～…；;：:（）()【】「」—–]+")
 _ASKING_TAIL = ("吗", "么", "没", "嘛")
 
@@ -168,31 +175,38 @@ def _starts_with_excuse(text: str, phrase: str, whole: bool = False) -> bool:
 
     ``whole`` 为真时短语后面得到此为止："刚起 你呢"算，"刚起了个头"不算。
     """
-    want = _JUST.sub("刚", phrase.lower())
+    want = _as_just(phrase.lower())
     # "我"只在"刚/才/还"前面算垫话："我刚醒"是交代，"我在睡觉前看了会书"不是
     fillers = (
         EXCUSE_FILLERS if want[:1] in ("刚", "才", "还")
         else tuple(f for f in EXCUSE_FILLERS if f != "我")
     )
     counted = 0
+    carried = ""
     for clause, asking in _clauses(text.lower()):
         if counted >= 2:
             break
         if asking:
             counted += 1
+            carried = ""
             continue  # "早 刚醒吗""下课了？刚忙完没"是在问他，不是交代自己
+        # 表情换成空格：打头的跟垫话一起剥掉（"😂刚醒"），夹在中间的当边界（"刚起😂你呢"）
+        own = _EMOJI.sub(" ", _as_just(clause)).strip()
+        # 前面只有垫话的小句接到这句前头："抱歉 刚在忙"跟"抱歉刚在忙"一样判
+        rest = carried + own
         # 每剥一层都比一次：短语自己可能就带着垫话（"抱歉刚"），剥光了反而对不上
-        # 打头的表情也是垫话："😂刚醒"
-        rest = _EMOJI.sub("", _JUST.sub("刚", clause)).lstrip()
         while rest:
             if rest.startswith(want) and (not whole or _phrase_ends(rest[len(want) :])):
                 return True
             filler = next((f for f in fillers if rest.startswith(f)), None)
             if filler is None:
                 break
-            rest = rest[len(filler) :]
+            rest = rest[len(filler) :].lstrip()
         if rest:
             counted += 1
+            carried = ""
+        else:
+            carried += own
     return False
 
 

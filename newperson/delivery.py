@@ -277,13 +277,29 @@ class Deliverer:
                 if shown:
                     await self._type(channel, shown)
 
-                message = await self._send(
-                    channel,
-                    shown,
-                    file=self.make_file(Path(photo.path)) if attach and photo else None,
-                    # 引用只挂在第一条上；续发（start_index>0）时第一条早发过了
-                    reference=reply_to if index == 0 else None,
-                )
+                # 引用只挂在第一条上；续发（start_index>0）时第一条早发过了
+                reference = reply_to if index == 0 else None
+                try:
+                    message = await self._send(
+                        channel,
+                        shown,
+                        file=self.make_file(Path(photo.path)) if attach and photo else None,
+                        reference=reference,
+                    )
+                except Exception as exc:
+                    if not attach or _is_forbidden(exc):
+                        raise
+                    # **那张图发不出去就不带图接着说。** 图是锦上添花：超过上传上限、
+                    # 文件被挪走，这种每次都失败。原来整条任务跟着重试十几个小时，
+                    # 他这期间说的话都被并进这条发不完的任务，一直没人回。
+                    log.warning("那张图发不出去（%r），不带图接着说", exc)
+                    attach = False
+                    if not shown:
+                        result.next_index = index + 1
+                        if on_progress is not None:
+                            await on_progress(index)
+                        continue
+                    message = await self._send(channel, shown, reference=reference)
                 if shown:
                     result.sent_texts.append(shown)
                 if attach and photo:

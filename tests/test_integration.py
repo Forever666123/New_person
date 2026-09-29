@@ -4235,6 +4235,71 @@ async def test_photo_tags_are_matched_regardless_of_case(tmp_path: Path, persona
     assert await app.life.has_photos(window.photo_tags)
 
 
+async def test_resuming_a_reply_keeps_the_picture_it_started_with(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """图发出去了、后面一句抖了一下：续发用第一次挑中的那张，后面的话一句不少。
+
+    原来续发时重新挑图：刚发过的那张进了冷却、挑不到，只放图的那格被丢掉，
+    下标整体前移——"你看"永远没发，他看到一张图后直接是"好看吧"。
+    """
+    from newperson.models import Photo, PhotoRequest
+
+    plan = ReplyPlan(
+        parts=[ReplyPart(text="{photo}"), ReplyPart(text="你看"), ReplyPart(text="好看吧")],
+        photo_request=PhotoRequest(photo_id="p1"),
+    )
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [plan])
+    app.media.library.photos = [Photo(id="p1", file="p.jpg", tags=["food"])]
+    await send(app, "晚饭吃啥了", at=EVENING, msg_id=3700)
+    real_send = channel.send
+    fails = {"left": 1}
+
+    async def flaky(content=None, **kw):
+        if content == "你看" and fails["left"]:
+            fails["left"] -= 1
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = flaky
+    await drain(app, clock, hops=10)
+    assert channel.sent == [(None, True), ("你看", False), ("好看吧", False)]
+
+
+async def test_a_promise_folded_into_a_dropped_goodnight_half_is_still_kept(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """并进睡前那条回复的承诺，在醒来被裁掉的后半句里：不算说过，它到点自己说。"""
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=15)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=3800)
+    promise = await app.scheduler.schedule(
+        "follow_up", bedtime + timedelta(hours=12), conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开"},
+    )
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    unread = await memory.unread_messages(CONVERSATION_ID)
+    await memory.mark_read([m.id for m in unread], at)
+    plan = ReplyPlan(parts=[ReplyPart(text="哈哈对"), ReplyPart(text="那家周末不开 困了 先睡了")])
+    await memory.save_job_progress(
+        job.id or 0,
+        {"plan": plan.model_dump(mode="json"), "sent_parts": 1, "planned_at": at.isoformat(),
+         "goodnight": bedtime.isoformat()},
+        max(m.id for m in unread),
+    )
+    await app.scheduler.reschedule(
+        job.id or 0, at, {**job.payload, "riding_follow_up": promise}
+    )
+    morning = app.rhythm.next_wake_after(bedtime) + timedelta(hours=1)
+    await memory.reschedule_job(job.id or 0, morning)
+    clock.set(morning + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == []
+    assert (await memory.get_job(promise)).status == "pending", "答应他的事没说出口就作废了"
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 
