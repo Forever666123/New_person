@@ -561,6 +561,9 @@ class Brain:
         plan = await self._call(ProactivePlan, prompt, purpose="proactive", today=today)
         if plan is None or not plan.send:
             return plan
+        # 手滑只在回复里掷骰子。schema 里一样有 typo_text，模型自己填了也不用：
+        # 主动开口那一句要是每次都打错再改，那就不是手滑了
+        _keep_one_typo(plan, allowed=False)
 
         # 原来这里只做机械修剪，把"要重写"的那部分直接扔了——
         # 于是回复有两道关（修剪 + 重写一次），主动消息只有一道。
@@ -590,6 +593,7 @@ class Brain:
                 return plan
             plan.parts = fixed
             return plan
+        _keep_one_typo(again, allowed=False)
         again.parts, _ = style_guard.enforce(
             again.parts, self.persona.style, self.persona.boundaries
         )

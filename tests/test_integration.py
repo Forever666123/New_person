@@ -3274,6 +3274,268 @@ async def test_there_is_at_most_one_goodnight_a_night(tmp_path: Path, persona: P
     assert len([j for j in await memory.pending_jobs() if j.kind == "sign_off"]) == 1
 
 
+async def test_a_reply_pulled_before_bedtime_drops_its_stale_timing_hints(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """排到明早的回复被拉回睡前：提示按新时刻重算，不在旧的后面追加。
+
+    原来拉回来的那条还带着"他这条是九个小时前发的，别说在睡觉""你其实早看到了"，
+    再追加一句"你准备睡了"——三条互相矛盾，而他几分钟前刚说过话。
+    """
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="我也是")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=12)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=1500)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    stale = {
+        **reply.payload,
+        "hints": [
+            "他这条消息是 9.5 小时 前发的。**别解释这段时间你在干嘛**：不说在睡觉。",
+            "你其实早看到了，只是当时没回。别提这件事。",
+        ],
+    }
+    await app.scheduler.reschedule(reply.id or 0, bedtime + timedelta(hours=9), stale)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(max(sign.run_at, at + timedelta(seconds=30)) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    moved = await memory.get_job(reply.id or 0)
+    clock.set(moved.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert "小时 前发的" not in prompt and "早看到了" not in prompt, prompt
+    assert persona.proactive.sign_off.reply_note in prompt
+
+
+async def test_a_goodnight_reply_that_slips_past_bedtime_does_not_say_goodnight_at_breakfast(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """并进睡前的那条回复又被推迟过了睡点：醒来回的时候不该还说"我要睡了"。
+
+    原来"你准备睡了"是写死进任务里的，额度用完顺延到明天、暂停中一再推迟，
+    它都跟着走。现在要不要说是生成那一刻决定的。
+    """
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="早")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=12)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=1600)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, bedtime + timedelta(hours=9))
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(max(sign.run_at, at + timedelta(seconds=30)) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(reply.id or 0)).payload.get("sign_off_before")
+
+    morning = app.rhythm.next_wake_after(bedtime) + timedelta(minutes=30)
+    await memory.reschedule_job(reply.id or 0, morning)  # 比如额度用完、顺延到了明早
+    clock.set(morning + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert persona.proactive.sign_off.reply_note not in prompt
+    assert "要睡" not in prompt
+
+
+async def test_she_says_goodnight_where_he_was_talking_not_in_the_public_channel(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """私聊聊到睡前，那句"我睡了"回到私聊。
+
+    不带参数的 resolve_channel 是主动消息的去处，配了公开频道就是那里——
+    睡前这句是刚才那段对话的收尾，不是主动开口。
+    """
+    goodnight = ProactivePlan(send=True, parts=[ReplyPart(text="困了 我睡了")])
+    app, _channel, _llm, clock, _memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="哈哈")]), goodnight]
+    )
+    dm, public = FakeChannel(), FakeChannel()
+    app.settings.proactive_channel_id = 777
+
+    async def resolve(channel_id=None):
+        return dm if channel_id == 999 else public
+
+    app.resolve_channel = resolve
+    await app._remember_inbound(999)
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=30)
+    clock.set(at)
+    await send(app, "你还没睡啊", at=at, msg_id=1700)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, app.memory)
+    sign = [j for j in await app.memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(sign.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert dm.texts == ["哈哈", "困了 我睡了"]
+    assert public.texts == []
+
+
+async def test_nothing_else_pops_up_after_she_said_she_was_going_to_sleep(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """说完"我睡了"，同一晚排着的主动消息作废，答应他的事挪到她醒来之后。"""
+    goodnight = ProactivePlan(send=True, parts=[ReplyPart(text="困了 我睡了")])
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="哈哈")]), goodnight]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=30)
+    clock.set(at)
+    await send(app, "你还没睡啊", at=at, msg_id=1800)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, memory)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    # 道别之后隔过"正在热聊"那几分钟、又还没到睡点：原来这段里什么都拦不住
+    await memory.reschedule_job(sign.id or 0, bedtime - timedelta(minutes=10))
+    clock.set(bedtime - timedelta(minutes=10) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts[-1] == "困了 我睡了"
+
+    soon = bedtime - timedelta(minutes=4)
+    promise = await app.scheduler.schedule(
+        "follow_up", soon, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": soon.isoformat()},
+    )
+    chatter = await app.scheduler.schedule(
+        "proactive", soon, conversation_id=CONVERSATION_ID, payload={"kind": "own_life"},
+    )
+    calls = len(llm.calls)
+    clock.set(soon + timedelta(seconds=1))
+    assert clock.now() < bedtime
+    while await app.scheduler.run_due_once():
+        pass
+    assert channel.texts[-1] == "困了 我睡了" and len(llm.calls) == calls
+    assert (await memory.get_job(chatter)).status == "cancelled"
+    moved = await memory.get_job(promise)
+    assert moved.status == "pending" and moved.run_at > bedtime
+    assert not app.rhythm.is_sleeping(moved.run_at)
+
+
+async def test_a_goodnight_said_in_a_reply_is_not_said_again(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """回他的时候已经顺便说了要睡：到点那一句就不再说，也不再调一次模型。
+
+    原来 attention 给一句软提示"可以顺口说一句就下线"，模型说了，
+    到点 sign_off 看最后一次说话在半小时内，又调一次模型，再说一遍。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="哈哈"), ReplyPart(text="我睡了")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=20)
+    clock.set(at)
+    await send(app, "你还没睡啊", at=at, msg_id=1900)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, at + timedelta(minutes=2))
+    await _deliver_one_reply(app, clock, memory)
+    prompt = llm.calls[-1]["messages"][0]["content"]
+    assert persona.proactive.sign_off.reply_note in prompt
+    assert "可以顺口说一句" not in prompt
+    assert not [j for j in await memory.pending_jobs() if j.kind == "sign_off"]
+    clock.set(bedtime - timedelta(minutes=1))
+    while await app.scheduler.run_due_once():
+        pass
+    assert channel.texts == ["哈哈", "我睡了"] and len(llm.calls) == 1
+
+
+async def test_her_own_unanswered_message_does_not_count_as_still_chatting(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他早就不说话了，只是她自己主动说了一句没人回：睡前那句不补。
+
+    原来"还在聊"看的是两个人谁最后说话，她自己那句也算——
+    于是没人回的主动消息后面又跟一句"我睡了"，成了追发。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=85)
+    clock.set(at)
+    await send(app, "在干嘛", at=at, msg_id=2000)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, memory)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    her_own = sign.run_at - timedelta(minutes=15)
+    await memory.add_bot_message(CONVERSATION_ID, "今天实验室好冷", her_own)
+    await memory.update_conversation(CONVERSATION_ID, unanswered_initiations=1)
+    calls = len(llm.calls)
+    clock.set(sign.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert len(llm.calls) == calls
+    assert (await memory.get_job(sign.id or 0)).status == "cancelled"
+
+
+async def test_the_goodnight_knows_what_he_said_is_not_due_yet(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前那句的上下文里也有"他说了时间、还没到的"。
+
+    他刚说完"明早九点起来做完"，她道晚安时最容易顺口问一句"那个做完没"。
+    """
+    from newperson.models import LedgerEntry
+
+    goodnight = ProactivePlan(send=True, parts=[ReplyPart(text="困了 我睡了")])
+    app, _channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="哈哈")]), goodnight]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=30)
+    clock.set(at)
+    there = at.astimezone(SYDNEY) + timedelta(days=1)
+    when = there.replace(hour=9, minute=0).strftime("%m-%d %H:%M")
+    await memory.add_ledger_entries(
+        [LedgerEntry(kind="trading", claim="明早九点跑回测", when_there=when)],
+        at,
+        [app.life.resolve_when_there(when, at)],
+    )
+    await send(app, "你还没睡啊", at=at, msg_id=2100)
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    await _deliver_one_reply(app, clock, memory)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(sign.run_at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert "他说了时间、还没到的" in llm.calls[-1]["messages"][0]["content"]
+
+
+async def test_a_shutdown_between_two_bubbles_keeps_the_first_in_her_memory(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """停机取消落在两条气泡之间：已经到他手机上的那条要进库，重启后从第二条接着发。
+
+    CancelledError 不是 Exception，原来记"已发出的部分"那条 except 接不住它。
+    """
+    app, channel, _llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="第一句"), ReplyPart(text="第二句")])]
+    )
+    await send(app, "在吗", at=EVENING, msg_id=2200)
+    real_send = channel.send
+
+    async def send_then_shutdown(content=None, **kw):
+        if channel.texts:
+            raise asyncio.CancelledError
+        return await real_send(content, **kw)
+
+    channel.send = send_then_shutdown
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    clock.set(job.run_at + timedelta(seconds=1))
+    with pytest.raises(asyncio.CancelledError):
+        await app.scheduler.run_due_once()
+    rows = await memory.db.execute("SELECT content FROM messages WHERE author_kind = 'bot'")
+    assert [r[0] for r in await rows.fetchall()] == ["第一句"]
+
+    channel.send = real_send
+    await drain(app, clock)
+    assert channel.texts == ["第一句", "第二句"]
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 

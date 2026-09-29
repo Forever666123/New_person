@@ -28,7 +28,7 @@ from typing import Any
 import discord
 
 from . import owner as owner_cmds
-from .attention import AttentionPolicy, extract_features, heat_of
+from .attention import SLEEP_SOON_HINT, AttentionPolicy, extract_features, heat_of
 from .brain import Brain, MemoryUpdateRequest, ProactiveRequest, ReplyRequest, build_client
 from .calendar import AcademicCalendar
 from .clock import Clock, RealClock, later
@@ -70,6 +70,9 @@ CATCHUP_SEEN = "catchup_channels"
 
 LAST_INBOUND = "last_inbound_channel"
 """他最后一次说话的频道。消息表里不存频道，补救路径只能靠它才知道该回哪儿。"""
+
+SIGNED_OFF_UNTIL = "signed_off_until"
+"""她今晚已经说过要睡了，值是那晚的入睡时刻。那之前不再另起话头、不再道一次晚安。"""
 
 
 def time_of_day_at(dt: datetime) -> TimeOfDay:
@@ -771,9 +774,7 @@ class App:
             # （上一轮半途炸了、这一轮全是重复）走的正是这条，
             # 于是他在私聊里说的话会被当着别人的面回出去。
             # 消息表里不存频道，所以这个值得单独记一份。
-            remembered = await self.memory.kv_get(LAST_INBOUND)
-            if (remembered or "").isdigit():
-                channel_id = int(remembered)
+            channel_id = await self._last_inbound_id()
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         if not unread:
@@ -872,6 +873,94 @@ class App:
             },
             reason=decision.reason[:180],
         )
+
+    async def _last_inbound_id(self) -> int | None:
+        remembered = await self.memory.kv_get(LAST_INBOUND)
+        return int(remembered) if (remembered or "").isdigit() else None
+
+    async def _pull_reply_earlier(
+        self,
+        reply: Job,
+        now: datetime,
+        seconds: tuple[float, float],
+        extra: dict[str, Any] | None = None,
+        cap: datetime | None = None,
+    ) -> datetime:
+        """把排着的回复往前拉到现在附近。只往前拉，不往后推。
+
+        **处境提示按新时刻重算，不在旧的后面追加。** 被拉回来的往往是排到了
+        明早的那条，它带着"他这条是九个小时前发的，别说在睡觉""你其实早看到了"——
+        而她马上就要回、他几分钟前刚说过话。
+        """
+        utc = lambda t: t.astimezone(UTC)  # noqa: E731
+        run_at = later(now, timedelta(seconds=self.rng.uniform(*seconds)))
+        if cap is not None:
+            run_at = min(run_at, cap, key=utc)
+        run_at = min(run_at, max(reply.run_at, now, key=utc), key=utc)
+        payload = None
+        if not reply.progress.get("plan"):
+            unread = await self.memory.unread_messages(CONVERSATION_ID)
+            if unread:
+                said = unread[-1].created_at
+            else:
+                conv = await self.memory.get_conversation(CONVERSATION_ID)
+                said = conv.last_user_message_at or now
+            payload = {
+                **reply.payload,
+                "hints": self.attention.hints_at(run_at, now, said),
+                **(extra or {}),
+            }
+        await self.scheduler.reschedule(reply.id or 0, run_at, payload)
+        return run_at
+
+    # -- 睡前那一句 ---------------------------------------------------------
+
+    async def _signed_off_until(self, now: datetime) -> datetime | None:
+        """她今晚已经说过要睡了的话，返回那晚的入睡时刻；过了就是 None。"""
+        raw = await self.memory.kv_get(SIGNED_OFF_UNTIL)
+        try:
+            until = datetime.fromisoformat(raw) if raw else None
+        except ValueError:
+            return None
+        if until is None or now.astimezone(UTC) >= until.astimezone(UTC):
+            return None
+        return until
+
+    async def _mark_signed_off(self, bedtime: datetime) -> None:
+        """记下"今晚说过了"，排着的睡前那句作废：一晚只说一次。"""
+        await self.memory.kv_set(SIGNED_OFF_UNTIL, bedtime.isoformat())
+        for job in await self.memory.pending_jobs("sign_off", CONVERSATION_ID):
+            await self.scheduler.cancel(job.id or 0)
+
+    async def _reply_hints(self, job: Job, now: datetime) -> tuple[list[str], datetime | None]:
+        """这次回复的处境提示，以及要不要顺便说睡了（要的话是那晚的入睡时刻）。
+
+        睡前那句在**生成的那一刻**决定，不写死在任务里：回复被推迟过了睡点
+        （额度用完、暂停、重试退避），醒来那条回复不该还带着"你准备睡了"。
+        """
+        hints = list(job.payload.get("hints", []))
+        cfg = self.persona.proactive.sign_off
+        goodnight: datetime | None = None
+        if cfg.enabled and not self.rhythm.is_sleeping(now):
+            # attention 那句"可以顺口说一句"是软的，模型说了、到点 sign_off 又说一遍；
+            # 开着睡前那一句的时候换成这里的判断，说了就记下
+            hints = [h for h in hints if h != SLEEP_SOON_HINT]
+            bedtime = self.rhythm.next_sleep_after(now)
+            left = bedtime.astimezone(UTC) - now.astimezone(UTC)
+            asked = job.payload.get("sign_off_before")
+            if asked and now.astimezone(UTC) < datetime.fromisoformat(asked).astimezone(UTC):
+                bedtime, left = datetime.fromisoformat(asked), timedelta(0)
+            if await self._signed_off_until(now) is not None:
+                hints.append(cfg.said_note)
+            elif left <= timedelta(minutes=cfg.reply_within_minutes):
+                hints.append(cfg.reply_note)
+                goodnight = bedtime
+        riding = job.payload.get("riding_follow_up")
+        if riding:
+            rider = await self.memory.get_job(int(riding))
+            if rider is not None and rider.status == "pending":
+                hints.append(f"你之前答应过他的事，这次顺便说：{rider.payload.get('note', '')}")
+        return hints, goodnight
 
     async def _download_images(self, message: discord.Message) -> list:
         """把他发的图片存下来，之后要真的给她看。"""
@@ -1007,7 +1096,11 @@ class App:
                 # "最近四十行里 id 不超过 covers 的全部"，早就回过的旧话也在里面，
                 # 下标一错位，她就引用几个小时前的一句去回。
                 unread = await self.memory.batch_messages(CONVERSATION_ID, covers)
-                await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
+                raw = job.progress.get("goodnight")
+                await self._deliver_reply(
+                    job, reply_plan, unread, now, start_index, covers,
+                    goodnight=datetime.fromisoformat(raw) if raw else None,
+                )
                 return
 
         unread = await self.memory.unread_messages(CONVERSATION_ID)
@@ -1015,7 +1108,8 @@ class App:
             return
         covers = max(m.id for m in unread)
 
-        reply_plan = await self._generate_reply(job, unread, now)
+        hints, goodnight = await self._reply_hints(job, now)
+        reply_plan = await self._generate_reply(job, unread, now, hints)
         if reply_plan is None:
             # 模型没给出结果。**这里绝不能提前把消息标成已读**，
             # 否则重试的时候未读是空的，这批消息就永远回不出去了。
@@ -1029,16 +1123,19 @@ class App:
         # 生成成功了才算她真的处理过这批消息
         await self.memory.mark_read([m.id for m in unread], now)
         start_index = 0
-        await self.memory.save_job_progress(
-            job.id or 0, {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}, covers
-        )
+        progress: dict[str, Any] = {"plan": reply_plan.model_dump(mode="json"), "sent_parts": 0}
+        if goodnight is not None:
+            progress["goodnight"] = goodnight.isoformat()
+        await self.memory.save_job_progress(job.id or 0, progress, covers)
 
         if not reply_plan.parts and not reply_plan.reaction:
             log.info("[brain] 这条她不打算回")
             await self._after_reply(reply_plan, now, sent_any=False, said_at=_said_at(unread))
             return
 
-        await self._deliver_reply(job, reply_plan, unread, now, start_index, covers)
+        await self._deliver_reply(
+            job, reply_plan, unread, now, start_index, covers, goodnight=goodnight
+        )
 
     async def _defer_to_tomorrow(self, job: Job, now: datetime, why: str) -> None:
         """把任务推到明天她醒来。用于不是故障、只是今天做不了的情况。"""
@@ -1047,7 +1144,7 @@ class App:
         log.warning("[job] %s，推到 %s", why, run_at.strftime("%m-%d %H:%M"))
         await self.scheduler.defer(job.id or 0, run_at)
 
-    async def _generate_reply(self, job: Job, unread: list, now: datetime):
+    async def _generate_reply(self, job: Job, unread: list, now: datetime, hints: list[str]):
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         owner_facts, self_facts = await self._recall(now)
         recent = await self.memory.recent_messages(
@@ -1086,7 +1183,7 @@ class App:
                 mode_instruction=mode.instruction if mode else "",
                 recent=recent,
                 unread=self._local_stamps(unread, now),
-                hints=list(job.payload.get("hints", [])),
+                hints=hints,
                 photos=await self._photo_shortlist(now),
                 images=images,
                 must_reply=must_reply,
@@ -1095,8 +1192,16 @@ class App:
         )
 
     async def _deliver_reply(
-        self, job: Job, plan, unread: list, now: datetime, start_index: int, covers: int
+        self,
+        job: Job,
+        plan,
+        unread: list,
+        now: datetime,
+        start_index: int,
+        covers: int,
+        goodnight: datetime | None = None,
     ) -> None:
+        """``goodnight`` 不为空表示这次回复里顺便说了要睡，值是那晚的入睡时刻。"""
         channel_id = job.payload.get("channel_id")
         # 这一批的身份：一批一个 read_at（mark_read 一批一条 UPDATE）。
         #
@@ -1126,11 +1231,10 @@ class App:
         await self._on_phone()
 
         async def on_progress(index: int) -> None:
-            await self.memory.save_job_progress(
-                job.id or 0,
-                {"plan": plan.model_dump(mode="json"), "sent_parts": index + 1},
-                covers,
-            )
+            progress: dict[str, Any] = {"plan": plan.model_dump(mode="json"), "sent_parts": index + 1}
+            if goodnight is not None:
+                progress["goodnight"] = goodnight.isoformat()
+            await self.memory.save_job_progress(job.id or 0, progress, covers)
 
         try:
             result = await self.deliverer.deliver_reply(
@@ -1148,14 +1252,15 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
             await self._record_sent(blocked.result, now, batch)
             return
-        except Exception as exc:
-            # 网络断在中间时，前几条其实已经到对方手机上了。不记下来的话
-            # 她自己的历史里就少一截，重试续发会重复或者前后矛盾。
-            if partial := getattr(exc, "delivery_result", None):
-                await self._record_sent(partial, now, batch)
+        except (Exception, asyncio.CancelledError) as exc:
+            # 网络断在中间、或者停机取消落在两条之间时，前几条其实已经到对方手机上了。
+            # 不记下来的话她自己的历史里就少一截，重试续发会重复或者前后矛盾。
+            await self._record_partial(exc, now, batch)
             raise
 
         await self._record_sent(result, now, batch)
+        if goodnight is not None and result.sent_texts and not result.interrupted:
+            await self._mark_signed_off(goodnight)
         riding = job.payload.get("riding_follow_up")
         if riding and result.sent_texts and not result.interrupted:
             # 答应他的那件事跟着这次回复说出口了
@@ -1196,6 +1301,17 @@ class App:
         except Exception as exc:  # noqa: BLE001
             log.debug("[delivery] 取不到消息 %s：%r", message_id, exc)
             return None
+
+    async def _record_partial(
+        self, exc: BaseException, now: datetime, reply_batch: datetime | None = None
+    ) -> None:
+        """投递半途出事时，把已经发出去的那几条记下来。
+
+        停机取消（CancelledError）也走这里：用 shield 护着写库，
+        不然第二次取消会把这一步也打断，已经到他手机上的话就不在她的库里。
+        """
+        if partial := getattr(exc, "delivery_result", None):
+            await asyncio.shield(self._record_sent(partial, now, reply_batch))
 
     async def _record_sent(
         self, result, now: datetime, reply_batch: datetime | None = None
@@ -1312,6 +1428,16 @@ class App:
                 return
             await self._skip(job, "这会儿在睡觉，算了")
             return
+        if (bedtime := await self._signed_off_until(now)) is not None:
+            # 她刚说完"我睡了"，接着又冒出一句，那句"我睡了"就是假的
+            if promised:
+                run_at = self.life._awake_at_or_after(later(bedtime, timedelta(minutes=1)))
+                log.info("[proactive] 她已经说过要睡了，答应他的事 %s 再说",
+                         run_at.strftime("%m-%d %H:%M"))
+                await self.scheduler.defer(job.id or 0, run_at)
+                return
+            await self._skip(job, "她已经说过要睡了")
+            return
 
         if promised and job.created_at:
             # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
@@ -1341,19 +1467,15 @@ class App:
         if unread or pending:
             if pending:
                 reply = pending[0]
-                payload = None
-                if promised and not reply.progress.get("plan"):
-                    # 并进这次回复：她正要回他，顺便把答应的事说了。
-                    # 这个 follow_up 先不作废，挪后一阵留着：回复真的说出口了
-                    # （_deliver_reply 发出了文字）才作废它。回复没发出来——
-                    # 他撤回了、模型觉得这句不用回——它到点照样说。
-                    hints = [*reply.payload.get("hints", []),
-                             f"你之前答应过他的事，这次顺便说：{job.payload.get('note', '')}"]
-                    payload = {**reply.payload, "hints": hints, "riding_follow_up": job.id}
-                await self.scheduler.reschedule(
-                    reply.id or 0, later(now, timedelta(seconds=self.rng.uniform(20, 90))), payload
+                riding = promised and not reply.progress.get("plan")
+                # 并进这次回复：她正要回他，顺便把答应的事说了（那句提示在生成时才加）。
+                # 这个 follow_up 先不作废，挪后一阵留着：回复真的说出口了
+                # （_deliver_reply 发出了文字）才作废它。回复没发出来——
+                # 他撤回了、模型觉得这句不用回——它到点照样说。
+                await self._pull_reply_earlier(
+                    reply, now, (20, 90), {"riding_follow_up": job.id} if riding else None
                 )
-                if payload is not None:
+                if riding:
                     await self._later(job, now, (60, 120), "有未读，答应他的事并进这次回复里说")
                     return
             if promised:
@@ -1471,13 +1593,12 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
             await self._record_sent(blocked.result, now)
             return
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             # 跟回复那条路一样：网络断在中间时前几条已经到他手机上了。
             # 不记下来的话她自己的历史里就少一截，而重试会拿到同一条台账条目
             # （asked_at 还没写），于是同一件事被问两遍，措辞还不一样——
             # 因为第一次说的话根本不在她的 recent 里。
-            if partial := getattr(exc, "delivery_result", None):
-                await self._record_sent(partial, now)
+            await self._record_partial(exc, now)
             raise
 
         await self._record_sent(result, now)
@@ -1495,7 +1616,7 @@ class App:
     async def handle_sign_off_job(self, job: Job) -> None:
         """睡前说一声再走。
 
-        到点时再看一眼：你们还在聊吗？还在聊，她说一句"我睡了"；
+        到点时再看一眼：他还在跟她聊吗？在聊，她说一句"我睡了"；
         他刚说的话还没回，就回完顺便说；聊天早就停了，她直接睡。
         不算"主动开口"：不占当天的名额，他不回也不会让她以后更少开口。
         """
@@ -1504,38 +1625,43 @@ class App:
             await self._skip(job, "暂停中，睡前那句不说了")
             return
         bedtime_raw = job.payload.get("bedtime")
-        bedtime = datetime.fromisoformat(bedtime_raw) if bedtime_raw else None
-        if self.rhythm.is_sleeping(now) or (bedtime is not None and now >= bedtime):
+        bedtime = (
+            datetime.fromisoformat(bedtime_raw) if bedtime_raw
+            else self.rhythm.next_sleep_after(now)
+        )
+        if self.rhythm.is_sleeping(now) or now.astimezone(UTC) >= bedtime.astimezone(UTC):
             await self._skip(job, "已经睡了，睡前那句来不及了")
+            return
+        if await self._signed_off_until(now) is not None:
+            await self._skip(job, "她刚才已经说过要睡了")
             return
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         if not conv.deliverable:
             await self._skip(job, "发不出去")
             return
         cfg = self.persona.proactive.sign_off
-        last = max(
-            [t for t in (conv.last_user_message_at, conv.last_bot_message_at) if t],
-            default=None,
-        )
-        if last is None or now - last > timedelta(minutes=cfg.active_within_minutes):
-            await self._skip(job, "你们早就不聊了，她直接睡")
+        # 只看**他**：她主动开口他没回，那不是在聊，睡前再补一句就成了追发
+        his = conv.last_user_message_at
+        if his is None or now - his > timedelta(minutes=cfg.active_within_minutes):
+            await self._skip(job, "他早就不说话了，她直接睡")
             return
 
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
             reply = pending[0]
-            if not reply.progress.get("plan"):
-                # 他刚说的还没回：睡前回完，顺便说一声。不然他那句要等到明天。
-                hints = [*reply.payload.get("hints", []),
-                         "你准备睡了。回完这条顺便跟他说一声你要睡了，一句就够。"]
-                room = (bedtime - now) if bedtime else timedelta(minutes=2)
-                run_at = later(now, min(timedelta(seconds=self.rng.uniform(20, 60)), room / 2))
-                # 只往前拉，不往后推：本来就排在睡前的，照原来的时刻回
-                run_at = min(run_at, max(reply.run_at, now), key=lambda t: t.astimezone(UTC))
-                await self.scheduler.reschedule(
-                    reply.id or 0, run_at, {**reply.payload, "hints": hints}
+            if reply.progress.get("plan"):
+                # 正在发的那条（续发、重试）。等它发完再看：
+                # 它要是顺便说了，到时候这里会看到"已经说过了"
+                await self.scheduler.defer(
+                    job.id or 0, later(now, timedelta(minutes=self.rng.uniform(1, 3)))
                 )
-                log.info("[proactive] 睡前把他那句回了，顺便说一声")
+                return
+            # 他刚说的还没回：睡前回完，顺便说一声。不然他那句要等到明天。
+            await self._pull_reply_earlier(
+                reply, now, (20, 60), {"sign_off_before": bedtime.isoformat()},
+                cap=later(now, (bedtime.astimezone(UTC) - now.astimezone(UTC)) / 2),
+            )
+            await self._skip(job, "睡前把他那句回了，顺便说一声")
             return
         if await self.memory.unread_messages(CONVERSATION_ID):
             await self._skip(job, "有未读却没排回复，睡前那句先不说")
@@ -1543,6 +1669,7 @@ class App:
 
         day = self.rhythm.local_date(now)
         owner_facts, self_facts = await self._recall(now)
+        last = max([t for t in (his, conv.last_bot_message_at) if t])
         plan = await self.brain.generate_proactive(
             ProactiveRequest(
                 situation=await self._build_situation(now),
@@ -1554,8 +1681,10 @@ class App:
                     await self.memory.recent_messages(CONVERSATION_ID, 20), now
                 ),
                 hours_since_last_exchange=(now - last).total_seconds() / 3600,
-                unanswered_initiations=0,
+                unanswered_initiations=conv.unanswered_initiations,
                 photos=[],
+                # 睡前正是他刚说完"明早九点起来做完"的时候，道晚安时最容易顺口问一句
+                not_yet=await self.memory.pending_timed(now),
             ),
             day,
         )
@@ -1568,23 +1697,28 @@ class App:
             await self._skip(job, "她刚才已经说过要睡了")
             return
         plan.photo_request = None
+        # 这是收尾，不是开口：挂在他最后那一批上，体检不会把它算成主动找他。
+        recent = await self.memory.recent_messages(CONVERSATION_ID, 10)
+        last_his = [m for m in recent if m.author_kind == "user"]
+        batch = await self.memory.batch_of(last_his[-1].id) if last_his else None
         await self._on_phone()
         try:
-            result = await self.deliverer.deliver_proactive(await self.resolve_channel(), plan, None)
+            # 回到他最后说话的地方。不带参数是主动消息的去处，配了公开频道的话
+            # 私聊聊到一半的"我睡了"会当着别人的面说出去
+            result = await self.deliverer.deliver_proactive(
+                await self.resolve_channel(await self._last_inbound_id()), plan, None
+            )
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
             await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
-            await self._record_sent(blocked.result, now)
+            await self._record_sent(blocked.result, now, batch)
             return
-        # 这是收尾，不是开口：挂在刚才那一批上，体检不会把它算成主动找他。
-        batch = None
-        if conv.last_user_message_at is not None:
-            recent = await self.memory.recent_messages(CONVERSATION_ID, 10)
-            his = [m for m in recent if m.author_kind == "user"]
-            if his:
-                batch = await self.memory.batch_of(his[-1].id)
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._record_partial(exc, now, batch)
+            raise
         await self._record_sent(result, now, batch)
         if result.sent_texts:
+            await self._mark_signed_off(bedtime)
             await self.memory.add_diary_note(day, plan.inner_note or "睡前跟他说了一声", now)
 
     # -- 记忆整理 -----------------------------------------------------------

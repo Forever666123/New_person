@@ -215,3 +215,22 @@ def test_the_stock_phrases_and_excuses_are_still_caught(persona: Persona, text: 
     """套话说完了才算，交代行踪在开头才算——这两种照样拦。"""
     issues = sg.check([ReplyPart(text=text)], persona.style, persona.boundaries)
     assert [i for i in issues if i.kind == "banned_phrase"], text
+
+
+@pytest.mark.parametrize(
+    ("text", "typo"),
+    [("好啊", "好啊😄"), ("行", "行！"), ("你说呢", "加油")],
+)
+def test_the_slipped_version_obeys_the_same_rules(persona: Persona, text: str, typo: str) -> None:
+    """错的那版也在他屏幕上挂十几秒：多出表情、感叹号，或者带着禁语，就不手滑。"""
+    fixed, _ = sg.enforce(
+        [ReplyPart(text=text, typo_text=typo)], persona.style, persona.boundaries
+    )
+    assert fixed[0].typo_text == ""
+
+
+def test_an_ordinary_slip_survives_the_guard(persona: Persona) -> None:
+    fixed, _ = sg.enforce(
+        [ReplyPart(text="我在图书馆", typo_text="我再图书馆")], persona.style, persona.boundaries
+    )
+    assert fixed[0].typo_text == "我再图书馆"

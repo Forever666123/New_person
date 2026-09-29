@@ -352,13 +352,17 @@ def apply_fixes(parts: list[ReplyPart], style: StyleConfig) -> list[ReplyPart]:
         text = normalize_punctuation(text, style)
         if not text and "{photo}" not in part.text:
             continue
+        # 打错的样子跟着过同一遍标点修剪，不然两句对不上，发出去会先"错"在句号上
+        typo = normalize_punctuation(part.typo_text, style) if part.typo_text else ""
+        if typo and (
+            count_emoji(typo) > count_emoji(text)
+            or count_exclamations(typo) > count_exclamations(text)
+        ):
+            # 错的那版也在他屏幕上挂十几秒，改完还带着"已编辑"。
+            # 表情和感叹号比对的那版多，就是绕过了上面的预算，不如不手滑
+            typo = ""
         fixed.append(
-            ReplyPart(
-                text=text,
-                # 打错的样子跟着过同一遍标点修剪，不然两句对不上，发出去会先"错"在句号上
-                typo_text=normalize_punctuation(part.typo_text, style) if part.typo_text else "",
-                pause_before_seconds=part.pause_before_seconds,
-            )
+            ReplyPart(text=text, typo_text=typo, pause_before_seconds=part.pause_before_seconds)
         )
 
     if len(fixed) > style.max_parts + 1:
@@ -383,6 +387,13 @@ def enforce(
     """
     issues = check(parts, style, boundaries)
     fixed = apply_fixes(parts, style)
+    for part in fixed:
+        # 错的那版里带着禁语的话，那几秒就是把禁语发出去了
+        if part.typo_text and any(
+            v.kind == "banned_phrase"
+            for v in check([ReplyPart(text=part.typo_text)], style, boundaries)
+        ):
+            part.typo_text = ""
     needs_rewrite = [v for v in issues if not v.fixable]
     return fixed, needs_rewrite
 

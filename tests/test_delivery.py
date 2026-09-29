@@ -651,3 +651,49 @@ async def test_a_typo_that_is_not_a_slip_is_ignored(
     assert channel.texts == ["我在图书馆"]
     assert not [e for e in channel.events if e.kind == "edit"]
     assert result.sent_texts == ["我在图书馆"]
+
+
+async def test_progress_is_saved_before_the_typo_is_fixed(
+    deliverer: Deliverer, channel: FakeChannel
+) -> None:
+    """错的那条一发出去就记进度，改之前。
+
+    改错字要等 4–20 秒。进度原来记在改完之后：停机取消落在这段里，
+    重启后整条重发，他看到两条，第一条的错字永远没改。
+    """
+    seen: list[list[str]] = []
+
+    async def on_progress(_index: int) -> None:
+        seen.append([e.kind for e in channel.events])
+
+    await deliverer.deliver(
+        channel, [ReplyPart(text="我在图书馆", typo_text="我再图书馆")], None,
+        on_progress=on_progress,
+    )
+    assert seen and "send" in seen[0] and "edit" not in seen[0]
+
+
+async def test_a_shutdown_while_fixing_a_typo_still_reports_what_was_sent(
+    deliverer: Deliverer, channel: FakeChannel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停机取消落在"发了错的、还没改"那几秒里：发出去的那条要挂在异常上带出去。
+
+    CancelledError 不是 Exception，原来那条 except 接不住，
+    已经到他手机上的话就不进她的库。
+    """
+    import asyncio
+
+    real_sleep = deliverer.clock.sleep
+
+    async def sleep(seconds: float) -> None:
+        if "send" in channel.kinds:
+            raise asyncio.CancelledError
+        await real_sleep(seconds)
+
+    monkeypatch.setattr(deliverer.clock, "sleep", sleep)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await deliverer.deliver(
+            channel, [ReplyPart(text="我在图书馆", typo_text="我再图书馆")], None
+        )
+    partial = caught.value.delivery_result  # type: ignore[attr-defined]
+    assert partial.sent_texts == ["我再图书馆"] and partial.next_index == 1

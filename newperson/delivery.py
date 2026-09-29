@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import random
@@ -283,12 +284,6 @@ class Deliverer:
                     # 引用只挂在第一条上；续发（start_index>0）时第一条早发过了
                     reference=reply_to if index == 0 else None,
                 )
-                if typo:
-                    # 发出去了才看见打错了，过几秒改回来
-                    await self.clock.sleep(self.rng.uniform(4, 20) * self.attention.delay_scale)
-                    if await self._edit(message, part.text):
-                        shown = part.text
-
                 if shown:
                     result.sent_texts.append(shown)
                 if attach and photo:
@@ -300,14 +295,28 @@ class Deliverer:
                     result.sent_message_ids.append(message_id)
                 result.next_index = index + 1
 
+                # **发出去就记进度，改错字之前。** 改错字要等 4–20 秒，
+                # 停机的取消落在这段里的话，进度还是"这条没发"，重启后整条重发：
+                # 他看到两条，第一条的错字永远没改。改不回来就留着，这本来就允许。
                 if on_progress is not None:
                     await on_progress(index)
+
+                if typo:
+                    # 发出去了才看见打错了，过几秒改回来
+                    await self.clock.sleep(self.rng.uniform(4, 20) * self.attention.delay_scale)
+                    if await self._edit(message, part.text):
+                        result.sent_texts[-1] = part.text
 
                 # 最后一条发完就不用问了：这时候标 interrupted 只会让上层以为还有没发的
                 if index < len(prepared) - 1 and interrupted is not None and await interrupted():
                     log.info("发到第 %d 条被打断，剩下的不发了", index + 1)
                     result.interrupted = True
                     break
+        except asyncio.CancelledError as exc:
+            # 停机取消不是 Exception，下面那条接不住。不挂上进度的话，
+            # 已经到他手机上的那几条不进库，她自己的历史就少一截。
+            _attach_partial(exc, result)
+            raise
         except Exception as exc:
             if _is_forbidden(exc):
                 log.error("私聊被拒绝（%s）：%s", type(exc).__name__, BLOCKED_HINT)

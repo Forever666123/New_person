@@ -929,3 +929,13 @@ def test_the_slip_is_asked_for_only_in_the_request_that_slips(persona: Persona) 
     assert "这次打字手滑了" in build_reply_user(**base, typo=True)
     assert "这次打字手滑了" not in build_reply_user(**base)
     assert "typo_text" in build_system(persona)
+
+
+async def test_proactive_messages_never_slip(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """手滑只在回复里由代码掷骰子。主动开口的那句，模型自己填了 typo_text 也不用。"""
+    first = ProactivePlan(send=True, parts=[ReplyPart(text="我在图书馆", typo_text="我再图书馆")])
+    brain = Brain(fake_client(first), settings(tmp_path), persona, memory)
+    got = await brain.generate_proactive(proactive_request(), TODAY)
+    assert got is not None and got.parts and not got.parts[0].typo_text

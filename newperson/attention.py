@@ -28,6 +28,9 @@ _URGENT = re.compile(r"(急|快点|救命|出事|紧急|马上|!!!|？？？)")
 MIN_DELAY_SECONDS = 8.0
 """再急也不会比这更快。"""
 
+SLEEP_SOON_HINT = "你差不多要睡了，可以顺口说一句就下线。"
+"""回复落在睡前不久时给的软提示。开着睡前那一句时，生成回复那一刻会换成更明确的那句。"""
+
 
 def heat_of(
     now: datetime,
@@ -325,12 +328,34 @@ class AttentionPolicy:
 
         to_sleep = (snapshot.next_sleep - reply).total_seconds() / 60
         if 0 < to_sleep < 25:
-            hints.append("你差不多要睡了，可以顺口说一句就下线。")
+            hints.append(SLEEP_SOON_HINT)
         if snapshot.state == "busy" and snapshot.block_title:
             hints.append(f"你现在在{snapshot.block_title}，只能偷偷回一句。")
         if snapshot.trip_place:
             hints.append(f"你人在{snapshot.trip_place}，跟他那边的时差和平时不一样。")
         return hints
+
+    def hints_at(
+        self, reply_at: datetime, now: datetime, last_user_message_at: datetime
+    ) -> list[str]:
+        """回复被挪到新时刻之后，按新时刻重算处境提示。
+
+        排期时写进任务的提示是按**原来那个时刻**算的。把一条排到明早的回复
+        拉回睡前（并进睡前那一句、并进答应他的事）之后还用旧的，
+        她会同时收到"他这条是九个小时前发的，别说在睡觉"和"你准备睡了"，
+        而聊天记录上他几分钟前刚说过话。
+
+        拉回来就是现在看到、现在回：没有"早看到了没回"，疲劳也不重算。
+        """
+        now = now.astimezone(UTC)
+        return self._context_hints(
+            reply_at.astimezone(UTC),
+            now,
+            last_user_message_at.astimezone(UTC),
+            self.rhythm.state_at(now),
+            defers=0,
+            fatigue=0.0,
+        )
 
     # -- 其他 ---------------------------------------------------------------
 
