@@ -2562,6 +2562,12 @@ async def test_his_message_does_not_turn_her_green(tmp_path: Path, persona: Pers
     )
     app._started = True
     client = NewPersonClient(app)
+    applied: list[str] = []
+
+    async def change_presence(*, status=None, activity=None) -> None:
+        applied.append(str(status))
+
+    client.change_presence = change_presence  # 没连网关，真的调会抛；这里只看设了什么
     await client.on_ready()
     for task in [t for t in app._tasks if t.get_name() == "presence"]:
         task.cancel()
@@ -2583,6 +2589,70 @@ async def test_his_message_does_not_turn_her_green(tmp_path: Path, persona: Pers
     assert client.presence._online_until > job.run_at
     # 而且是**马上**亮的，不是等下一轮一分钟的循环：不然气泡总比绿灯先到
     assert client.presence._current is not None and client.presence._current[0] == "online"
+    assert applied and applied[-1] == "online"
+
+
+async def test_a_failed_status_change_is_tried_again(tmp_path: Path, persona: Persona) -> None:
+    """睡点那一次改状态正好赶上断线：下一轮接着设隐身，不整夜挂着闲置。
+
+    原来先记后设，设失败了缓存也记成了隐身，之后每一轮都判"没变化"。
+    """
+    from newperson.discord_bot import PresenceManager
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    applied: list[str] = []
+    broken = {"now": True}
+
+    async def change_presence(*, status=None, activity=None) -> None:
+        if broken["now"]:
+            raise ConnectionResetError("Cannot write to closing transport")
+        applied.append(str(status))
+
+    presence = PresenceManager(
+        SimpleNamespace(change_presence=change_presence),
+        persona, app.rhythm, memory, clock, random.Random(1),
+    )
+    asleep = app.rhythm.next_sleep_after(EVENING) + timedelta(minutes=5)
+    clock.set(asleep)
+    await presence.apply_once()
+    broken["now"] = False
+    clock.set(asleep + timedelta(minutes=1))
+    await presence.apply_once()
+    assert applied == ["invisible"]
+
+
+async def test_she_is_invisible_the_moment_she_connects(tmp_path: Path, persona: Persona) -> None:
+    """连上网关那一刻默认隐身，不是 Discord 默认的在线：启动失败重试期间不亮绿灯。"""
+    import discord
+
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    client = NewPersonClient(app)
+    assert client._connection._status == str(discord.Status.invisible)
+
+
+async def test_she_keeps_trying_when_the_gateway_is_down_right_after_login() -> None:
+    """登录过了、网关第一次就连不上：退避重试，不是崩出 AttributeError 让 systemd 熔断。"""
+    from newperson.discord_bot import connect_with_retry
+
+    waits: list[float] = []
+    tries = {"n": 0}
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    class GatewayDown:
+        ws = None
+
+        def is_closed(self) -> bool:
+            return False
+
+        async def connect(self, *, reconnect: bool) -> None:
+            tries["n"] += 1
+            if tries["n"] <= 3:
+                raise AttributeError("'NoneType' object has no attribute 'sequence'")
+
+    await connect_with_retry(GatewayDown(), sleep=fake_sleep)
+    assert tries["n"] == 4 and waits == [30.0, 60.0, 120.0]
 
 
 async def test_her_promise_is_not_dropped_when_they_are_mid_chat(
@@ -4566,6 +4636,40 @@ async def test_the_goodnight_waits_for_her_own_unfinished_message(
     moved = await memory.get_job(sign)
     assert moved.status == "pending" and moved.run_at > at
     assert llm.calls == [], "没等她说完就去想睡前那句了"
+
+
+async def test_her_unfinished_message_does_not_hold_up_his_last_words_before_bed(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她有一条主动说到一半、续发排到了睡点之后，他睡前又说了一句：照样睡前回他。
+
+    上一版睡前那句一看到"还有没说完的"就一直等，等到睡点作废，他那句拖到第二天下午。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="我也是"), ReplyPart(text="睡了")])]
+    )
+    bedtime = await _bedtime(app, EVENING)
+    unfinished = await app.scheduler.schedule(
+        "follow_up", bedtime + timedelta(minutes=20), conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "x"},
+    )
+    await memory.save_job_progress(
+        unfinished,
+        {"plan": ProactivePlan(send=True, parts=[ReplyPart(text="a"), ReplyPart(text="b")])
+         .model_dump(mode="json"), "sent_parts": 1, "counted": True,
+         "spoke_at": (bedtime - timedelta(minutes=40)).isoformat()},
+    )
+    at = bedtime - timedelta(minutes=12)
+    clock.set(at)
+    await send(app, "今天好累", at=at, msg_id=4300)
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.reschedule_job(reply.id or 0, bedtime + timedelta(hours=9))
+    await app.life.maybe_schedule_sign_off(CONVERSATION_ID)
+    sign = [j for j in await memory.pending_jobs() if j.kind == "sign_off"][0]
+    clock.set(max(sign.run_at, at + timedelta(seconds=30)) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    moved = await memory.get_job(reply.id or 0)
+    assert moved.run_at < bedtime, "他那句还是要等到明天"
 
 
 async def test_being_rate_limited_at_login_is_waited_out() -> None:

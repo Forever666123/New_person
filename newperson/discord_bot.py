@@ -1957,14 +1957,6 @@ class App:
             await self._skip(job, "他早就不说话了，她直接睡")
             return
 
-        for other_kind in ("proactive", "follow_up"):
-            if any(j.progress.get("plan") for j in await self.memory.pending_jobs(other_kind, CONVERSATION_ID)):
-                # 她自己主动说到一半、在等续发：等它说完再道晚安，
-                # 不然"我查了"→"我睡了"→第二天醒来冒出后半句
-                await self.scheduler.defer(
-                    job.id or 0, later(now, timedelta(minutes=self.rng.uniform(1, 3)))
-                )
-                return
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
             reply = pending[0]
@@ -1982,6 +1974,16 @@ class App:
             )
             await self._skip(job, "睡前把他那句回了，顺便说一声")
             return
+        # 放在"他那句还没回"后面：有待回复就说明他接过话，续发自己会丢掉后半句；
+        # 放在前面的话，续发排到睡点之后时，他睡前最后那句会被拖到第二天
+        for other_kind in ("proactive", "follow_up"):
+            if any(j.progress.get("plan") for j in await self.memory.pending_jobs(other_kind, CONVERSATION_ID)):
+                # 她自己主动说到一半、在等续发：等它说完再道晚安，
+                # 不然"我查了"→"我睡了"→第二天醒来冒出后半句
+                await self.scheduler.defer(
+                    job.id or 0, later(now, timedelta(minutes=self.rng.uniform(1, 3)))
+                )
+                return
         if await self.memory.unread_messages(CONVERSATION_ID):
             await self._skip(job, "有未读却没排回复，睡前那句先不说")
             return
@@ -2164,12 +2166,16 @@ class PresenceManager:
 
         if (status, text) == self._current:
             return
-        self._current = (status, text)
-        with contextlib.suppress(Exception):
+        try:
             await self.client.change_presence(
                 status=discord.Status(status),
                 activity=discord.CustomActivity(name=text) if text else None,
             )
+        except Exception:  # noqa: BLE001 - 网关断线重连时写旧连接会抛，下一轮一分钟后再试
+            # **设上了才记。** 原来先记后设：睡点那一次正好赶上断线，
+            # 缓存记成了隐身、Discord 那边还是闲置，每一轮都判"没变化"——整夜挂着黄灯
+            return
+        self._current = (status, text)
 
     def forget_last_applied(self) -> None:
         """忘掉"上次设的是什么"，下一轮循环会重新设一次。
@@ -2234,7 +2240,9 @@ class NewPersonClient(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.dm_messages = True
-        super().__init__(intents=intents)
+        # 连上那一刻默认隐身。不设的话 IDENTIFY 不带状态，Discord 默认显示在线：
+        # 启动失败重试期间一直亮绿灯（又不回话），每次重新 IDENTIFY 也要亮到下一轮循环
+        super().__init__(intents=intents, status=discord.Status.invisible)
         self.app = app
         self.presence: PresenceManager | None = None
         self._start_retry: asyncio.Task | None = None
@@ -2303,6 +2311,8 @@ class NewPersonClient(discord.Client):
             # 永远不去纠正。结果就是她半夜三点亮着绿灯，一直到进程重启为止。
             # 清掉缓存，下一轮循环会重新设一次。
             self.presence.forget_last_applied()
+            with contextlib.suppress(Exception):  # 当场纠正，不等下一轮一分钟的循环
+                await self.presence.apply_once()
             await self.app.catch_up()
             return
         self.presence = PresenceManager(
@@ -2400,10 +2410,33 @@ def run(settings: Settings, persona: Persona) -> None:
     async def runner() -> None:
         async with client:
             await login_with_retry(client, settings.discord_bot_token)
-            await client.connect(reconnect=True)
+            await connect_with_retry(client)
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(runner())
+
+
+async def connect_with_retry(
+    client: Any, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+) -> None:
+    """连网关。**第一次**连不上时在进程里退避重试。
+
+    discord.py 2.7.1 连上之后断线会自己重连，可第一次建连接就失败时（网关 5xx、
+    DNS、握手超时），它的重连分支去读 ``self.ws.sequence``，而那时 ws 还是 None：
+    抛 AttributeError，进程退出。登录能过、网关不通的时候每次启动都这样，
+    十来分钟用完二十次启动，systemd 熔断，她彻底消失。
+    """
+    delay, cap = LOGIN_RETRY_SECONDS
+    while True:
+        try:
+            await client.connect(reconnect=True)
+            return
+        except AttributeError:
+            if getattr(client, "ws", None) is not None or client.is_closed():
+                raise
+            log.warning("[discord] 网关连不上，%.0f 秒后再试", delay)
+            await sleep(delay)
+            delay = min(delay * 2, cap)
 
 
 LOGIN_RETRY_SECONDS = (30.0, 600.0)
