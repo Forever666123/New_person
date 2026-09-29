@@ -571,9 +571,9 @@ async def test_a_failed_rewrite_never_lets_a_greeting_through(
 
     got = await brain.generate_proactive(proactive_request(), TODAY)
 
-    assert got is not None
-    assert got.send is False, "寒暄不能因为重写失败就漏出去"
-    assert not got.parts
+    # 重写没调通时返回 None（交给上层重试，答应他的事不因为网络抖一下就作废），
+    # 或者重写回来还是禁语时 send=False——两种都不会把寒暄发出去
+    assert got is None or (got.send is False and not got.parts), "寒暄不能因为重写失败就漏出去"
 
 
 async def test_a_failed_rewrite_still_sends_when_the_problem_is_cosmetic(

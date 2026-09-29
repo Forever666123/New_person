@@ -48,6 +48,7 @@ from .models import (
     Job,
     LedgerEntry,
     PhotoRequest,
+    ProactivePlan,
     ResolvedPhoto,
     RhythmSnapshot,
     TimeOfDay,
@@ -1418,6 +1419,22 @@ class App:
             raise
 
         await self._record_sent(result, now, batch)
+        if (
+            start_index == 0
+            and result.photo_failed is not None
+            and result.photo_failed.photo_id
+            and not result.sent_texts
+            and result.photo_sent is None
+            and not result.reacted
+        ):
+            # 这次只有一张图，图又发不出去：一个字都没说，他那批话却已经标成已读。
+            # 放回未读重想一次——那张图已经进了冷却，会换一张或者改用文字回。
+            # 只管图库里的图：生成的图不进冷却，重想还是同一张，会绕圈
+            log.info("[delivery] 这次只有一张图、图又发不出去，重想一次")
+            await self.memory.save_job_progress(job.id or 0, {}, covers)
+            await self.memory.restore_unread(CONVERSATION_ID, covers)
+            await self._schedule_reply(self.clock.now(), channel_id=channel_id)
+            return
         # 续发时前面几条是上一次发出去的：改错字那几秒里停机，重启续发时
         # 一条都不剩，这一次的 sent_texts 是空的——可话其实已经说出口了
         spoke = bool(result.sent_texts) or start_index > 0
@@ -1605,6 +1622,11 @@ class App:
             await self._skip(job, "她已经说过要睡了")
             return
 
+        if job.progress.get("plan"):
+            # 上次发到一半断了：从断点接着发，不重新生成、不从头重发
+            await self._resume_proactive(job, now, kind)
+            return
+
         if promised and job.created_at:
             # 排的时候已经挡过一次，这里再挡一次：带时间的计划可能是**下一条回复**
             # 才记下的（他先说"明早九点做"，隔一句才说时间），排的时候还看不见。
@@ -1676,7 +1698,8 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         day = self.rhythm.local_date(now)
-        if not await self.life.can_initiate_today(CONVERSATION_ID, day):
+        # 答应他的事不算新开话头，本来就是在回他的话：今天主动过、他没回，照样说
+        if not promised and not await self.life.can_initiate_today(CONVERSATION_ID, day):
             await self._skip(job, "今天已经主动过而且他没回，不追了")
             return
         if away := await owner_cmds.away_state(self.memory, day):
@@ -1760,10 +1783,71 @@ class App:
             await self._skip(job, "要的那张照片没取到")
             return
 
+        await self._deliver_proactive_plan(
+            job, plan, photo, now, kind, ledger_ref[0] if ledger_ref else None
+        )
+
+    async def _resume_proactive(self, job: Job, now: datetime, kind: str) -> None:
+        """主动消息上次发到一半断了，从断点接着发。
+
+        热聊、"今天主动过"、"有未读就不另起话头"这几道闸都不再过：
+        她刚发出的前半句本身就会让这些闸把后半句拦下。
+        """
+        try:
+            plan = ProactivePlan.model_validate(job.progress["plan"])
+        except Exception:  # noqa: BLE001 - 存坏了就算了，前半句已经说出口
+            log.warning("[proactive] 存下来的主动消息读不出来，剩下的不发了")
+            return
+        start_index = int(job.progress.get("sent_parts", 0))
+        raw_photo = job.progress.get("photo")
+        photo = ResolvedPhoto.model_validate(raw_photo) if raw_photo else None
+        ledger_id = job.progress.get("ledger_id")
+        if await self.memory.unread_messages(CONVERSATION_ID):
+            # 他在前半句之后已经接话了：剩下的不硬塞，交给回复。说出口的那半算数
+            log.info("[proactive] 发到一半他已经接话了，剩下的不发了")
+            await self._finish_proactive(plan, now, kind, ledger_id, spoke=True)
+            return
+        await self._deliver_proactive_plan(job, plan, photo, now, kind, ledger_id, start_index)
+
+    async def _deliver_proactive_plan(
+        self,
+        job: Job,
+        plan: ProactivePlan,
+        photo: ResolvedPhoto | None,
+        now: datetime,
+        kind: str,
+        ledger_id: int | None,
+        start_index: int = 0,
+    ) -> None:
+        async def remember(exc: BaseException) -> None:
+            """发到一半断了：说出口的记进库，再记住发到哪了，重试从断点接着发。
+
+            不记进度的话只剩两种坏选择：重新生成、从第一句重发（答应他的事要重试
+            十几个小时，同一件事会换着措辞说十几遍）；或者说出口的就算完
+            （网络抖一下，后半句——往往就是答应他的那件事——永远不发）。
+            """
+            partial = _spoken_part(exc)
+            if partial is None:
+                return
+            await self._record_sent(partial, now)
+            await self.memory.save_job_progress(
+                job.id or 0,
+                {
+                    "plan": plan.model_dump(mode="json"),
+                    "sent_parts": partial.next_index,
+                    "photo": photo.model_dump(mode="json") if photo else None,
+                    "ledger_id": ledger_id,
+                },
+            )
+
         await self._on_phone()
         try:
             result = await self.deliverer.deliver_proactive(
-                await self.resolve_channel(), plan, photo, drop_photo_on_error=job.attempts >= 3
+                await self.resolve_channel(),
+                plan,
+                photo,
+                start_index=start_index,
+                drop_photo_on_error=job.attempts >= 3,
             )
         except DeliveryBlocked as blocked:
             log.error("[delivery] 发不出去：%s", blocked.hint)
@@ -1771,29 +1855,27 @@ class App:
             await self._record_sent(blocked.result, now)
             return
         except asyncio.CancelledError as exc:
-            await self._record_partial(exc, now)
+            await asyncio.shield(remember(exc))
             raise
         except Exception as exc:
-            # 网络断在中间时前几条已经到他手机上了。**说出口的算数，不从头重来**：
-            # 主动消息不像回复那样记进度，重试是重新生成、从第一句重发。
-            # 答应他的事要重试十几个小时，要是第二条（常见的是那张图）一直发不出去，
-            # 同一件事会换着措辞说十几遍。一个字都没发出去的才交给调度器重试。
-            result = _spoken_part(exc)
-            if result is None:
-                raise
-            log.warning("[delivery] 主动消息发到一半断了，说出口的算数：%r", exc)
+            await remember(exc)
+            raise
 
         await self._record_sent(result, now)
+        spoke = bool(result.sent_texts) or start_index > 0
+        if spoke or result.photo_sent:
+            await self._finish_proactive(plan, now, kind, ledger_id, spoke=spoke)
+
+    async def _finish_proactive(
+        self, plan: ProactivePlan, now: datetime, kind: str, ledger_id: int | None, spoke: bool
+    ) -> None:
+        day = self.rhythm.local_date(now)
         # 回访必须真的发出了**文字**才算问过。只发一张没配字的照片
         # 不构成"问了一句"，却会把那条承诺沉到队尾，白白跳过一个周期。
-        asked = bool(result.sent_texts) if ledger_ref is not None else True
-        if result.sent_texts or result.photo_sent:
-            if ledger_ref is not None and asked:
-                await self.memory.mark_ledger_asked(ledger_ref[0], now)
-            await self.life.mark_proactive_sent(kind, day, CONVERSATION_ID)
-            await self.memory.add_diary_note(
-                day, plan.inner_note or f"主动说了句（{kind}）", now
-            )
+        if ledger_id is not None and spoke:
+            await self.memory.mark_ledger_asked(ledger_id, now)
+        await self.life.mark_proactive_sent(kind, day, CONVERSATION_ID)
+        await self.memory.add_diary_note(day, plan.inner_note or f"主动说了句（{kind}）", now)
 
     async def handle_sign_off_job(self, job: Job) -> None:
         """睡前说一声再走。

@@ -652,7 +652,13 @@ class Brain:
             # 与其把一句聊天机器人味的寒暄发出去，不如这次不说话——
             # 她本来就不是每次想说都会说。
             if any(v.kind == "banned_phrase" for v in needs_rewrite):
-                log.info("[brain] 重写没出来，而问题是禁语，这次就不说了")
+                if again is None:
+                    # 重写那次**没调通**（5xx、限流、额度用完）跟"重写回来还是禁语"不一样：
+                    # 当成这会儿没看手机，交给上层重试或顺延。原来也记成"不说了"，
+                    # 她答应他的事（要重试十几个小时的）就因为网络抖一下被作废
+                    log.info("[brain] 重写那次没调通，过一阵再试")
+                    return None
+                log.info("[brain] 重写回来还是不行，这次就不说了")
                 plan.send = False
                 plan.parts = []
                 return plan

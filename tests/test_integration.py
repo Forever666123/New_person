@@ -4116,9 +4116,9 @@ async def test_a_goodnight_fully_sent_before_a_restart_still_counts(
 async def test_a_promise_half_delivered_is_not_repeated_a_dozen_times(
     tmp_path: Path, persona: Persona
 ) -> None:
-    """答应他的事发到一半断了：说出口的算数，任务结束，不从头重新生成、重发第一句。
+    """答应他的事发到一半断了：记住断点，重试只接着发剩下的，不从头重新生成、重发第一句。
 
-    follow_up 要重试十几个小时；第二条（常见的是那张图）一直发不出去的话，
+    follow_up 要重试十几个小时；第二条一直发不出去的话，
     同一件事原来会换着措辞说十几遍。
     """
     app, channel, llm, clock, memory = await build(
@@ -4142,9 +4142,119 @@ async def test_a_promise_half_delivered_is_not_repeated_a_dozen_times(
     await app.scheduler.run_due_once()
     await drain(app, clock, hops=10)
     assert channel.texts == ["我查了"] and len(llm.calls) == 1
-    assert (await memory.get_job(job_id)).status == "done"
+    job = await memory.get_job(job_id)
+    assert job.progress.get("sent_parts") == 1, "没记住发到哪了"
     rows = await memory.db.execute("SELECT content FROM messages WHERE author_kind = 'bot'")
     assert [r[0] for r in await rows.fetchall()] == ["我查了"]
+
+
+async def test_a_promise_interrupted_by_a_blip_is_finished_not_abandoned(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """答应他的事第二条碰上一次 503、之后恢复：接着把后半句发完，模型只调一次。
+
+    上一版把"发出一个字"就当做完：后半句——往往就是答应他的那件事——永远不发。
+    """
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona,
+        [ProactivePlan(send=True, parts=[ReplyPart(text="诶我查了"), ReplyPart(text="那家周末不开")])],
+    )
+    real_send = channel.send
+    blips = {"left": 1}
+
+    async def one_blip(content=None, **kw):
+        if channel.texts and blips["left"]:
+            blips["left"] -= 1
+            raise RuntimeError("503 Service Unavailable")
+        return await real_send(content, **kw)
+
+    channel.send = one_blip
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "follow_up", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": at.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await drain(app, clock, hops=10)
+    assert channel.texts == ["诶我查了", "那家周末不开"] and len(llm.calls) == 1
+    assert (await memory.get_job(job_id)).status == "done"
+
+
+async def test_a_promise_is_kept_even_after_an_unanswered_hello(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """她今天主动说了句闲话、他没回：之后到点的"答应他的事"照样说，不被"今天别再追"作废。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ProactivePlan(send=True, parts=[ReplyPart(text="查了 那家周末开")])]
+    )
+    day = app.rhythm.local_date(EVENING)
+    await memory.update_conversation(
+        CONVERSATION_ID, unanswered_initiations=1, last_initiation_date=day,
+        last_user_message_at=EVENING - timedelta(hours=4),
+    )
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "follow_up", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": at.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == ["查了 那家周末开"]
+    assert (await memory.get_job(job_id)).status == "done"
+
+
+async def test_a_promise_is_not_dropped_when_the_rewrite_call_hiccups(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """答应他的事第一稿带禁语、重写那次接口抖了一下：过一阵再试，不当成"她不想说"作废。"""
+    import anthropic
+    import httpx2 as httpx
+
+    request = httpx.Request("POST", "http://x")
+    hiccup = anthropic.InternalServerError(
+        "overloaded", response=httpx.Response(529, request=request), body=None
+    )
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona,
+        [ProactivePlan(send=True, parts=[ReplyPart(text="查了 那家周末不开 你早点休息")]), hiccup],
+    )
+    at = EVENING + timedelta(hours=1)
+    job_id = await app.scheduler.schedule(
+        "follow_up", at, conversation_id=CONVERSATION_ID,
+        payload={"kind": "follow_up", "note": "告诉他那家店周末开不开", "due": at.isoformat()},
+    )
+    clock.set(at + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == []
+    assert (await memory.get_job(job_id)).status == "pending", "网络抖一下就把答应他的事作废了"
+
+
+async def test_a_picture_only_reply_that_cannot_be_sent_is_rethought(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他说"拍张看看"，她只回一张图，图又发不出去：放回未读重想一次，不已读不回。"""
+    from newperson.models import Photo, PhotoRequest
+
+    picture_only = ReplyPlan(parts=[ReplyPart(text="{photo}")], photo_request=PhotoRequest(photo_id="big"))
+    words = ReplyPlan(parts=[ReplyPart(text="拍不了 在外面")])
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [picture_only, words])
+    app.media.library.photos = [Photo(id="big", file="big.jpg", tags=["sky"])]
+
+    class TooLarge(Exception):
+        status = 413
+
+    real_send = channel.send
+
+    async def too_large(content=None, *, file=None, reference=None):
+        if file:
+            raise TooLarge("413 Payload Too Large")
+        return await real_send(content, reference=reference)
+
+    channel.send = too_large
+    await send(app, "拍张看看？", at=EVENING, msg_id=4100)
+    await drain(app, clock, hops=10)
+    assert channel.texts == ["拍不了 在外面"]
+    assert not await memory.unread_messages(CONVERSATION_ID)
 
 
 async def test_a_rethought_reply_is_stamped_with_when_it_was_thought(
