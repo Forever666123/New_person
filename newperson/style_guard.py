@@ -135,6 +135,34 @@ def _opens_with_greeting(opening: str, phrase: str) -> bool:
     return not rest or rest[0] in GREETING_TAIL
 
 
+EXCUSE_FILLERS = ("不好意思", "对不起", "抱歉", "sorry", "sry", "哈", "啊", "嗯", "哦", "噢", "诶", "唉", "我")
+"""交代行踪前面常垫的那几个字。垫一个"哈哈""抱歉""我"就能绕过去的话，这道闸形同虚设。"""
+
+
+def _clauses(text: str) -> list[str]:
+    return [c for c in re.split(r"[\s，。、！？!?,.~～…；;：:（）()【】「」]+", text) if c]
+
+
+def _starts_with_excuse(text: str, phrase: str) -> bool:
+    """这条消息是不是**一开口**就在交代自己刚才在干嘛。
+
+    看前两个小句：每句先剥掉打头的垫话（哈哈、抱歉、我……），"刚刚"当"刚"，
+    再比前缀。放在后面的是正常说话："我室友在睡觉""你说的那个我还没看到"。
+    """
+    want = phrase.lower().replace("刚刚", "刚")
+    for clause in _clauses(text.lower())[:2]:
+        # 每剥一层都比一次：短语自己可能就带着垫话（"抱歉刚"），剥光了反而对不上
+        rest = clause.replace("刚刚", "刚")
+        while rest:
+            if rest.startswith(want):
+                return True
+            filler = next((f for f in EXCUSE_FILLERS if rest.startswith(f)), None)
+            if filler is None:
+                break
+            rest = rest[len(filler) :]
+    return False
+
+
 def _says(text: str, phrase: str) -> bool:
     """``text`` 里是不是**说了**这句话，而不只是碰巧含着这几个字。
 
@@ -143,6 +171,7 @@ def _says(text: str, phrase: str) -> bool:
     重写还不掉就整条不发。真正的套话后面接的是句末：没了、标点、空格、
     语气词、emoji。后面紧跟着别的字，那就是另一个词的前半截。
     """
+    text, phrase = text.lower(), phrase.lower()
     start = text.find(phrase)
     while start != -1:
         after = text[start + len(phrase) : start + len(phrase) + 1]
@@ -152,8 +181,9 @@ def _says(text: str, phrase: str) -> bool:
     return False
 
 
-PHRASE_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢喔嘛哈诶欸吧啦"
-"""套话后面允许跟的字。跟"的"不行："我相信你的判断"是一句正经话。"""
+PHRASE_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么呢哦噢喔嘛哈诶欸吧啦鸭哇呗叭哟咯"
+"""套话后面允许跟的字。跟"的"不行："我相信你的判断"是一句正经话；
+跟"了"也不行："我去加油了"是去加油站。"""
 
 
 GREETING_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢喔嘛哈诶欸的"
@@ -163,7 +193,7 @@ GREETING_TAIL = " \t\u3000，。、！？~…～!?,.呀啊阿吗么了呢哦噢�
 英文寒暄后面跟的又多半是半角的 `!` `?` `.`。
 """
 
-OPENING_NOISE = " \t\u3000，。、！？~…—-·:：;；\"'“”‘’（）()"
+OPENING_NOISE = " \t\u3000，。、！？~…～—-·:：;；\"'“”‘’（）()【】「」"
 """判断"是不是用寒暄开头"之前先掐掉的东西。"""
 
 
@@ -210,6 +240,16 @@ def check(
     for i, part in enumerate(parts):
         text = part.text
 
+        for phrase in boundaries.never_say_anywhere:
+            if phrase.lower() in text.lower():
+                issues.append(
+                    StyleViolation(
+                        kind="banned_phrase",
+                        detail=f"用了她不会说的话：{phrase}",
+                        part_index=i,
+                        fixable=False,
+                    )
+                )
         for phrase in boundaries.never_say:
             if _says(text, phrase):
                 issues.append(
@@ -225,7 +265,7 @@ def check(
         # 这样"在吗"作为整条消息会被拦下，"我现在吗？在图书馆"不会。
         opening = text.lstrip(OPENING_NOISE)
         for phrase in boundaries.never_start_with:
-            if opening.startswith(phrase):
+            if _starts_with_excuse(text, phrase):
                 issues.append(
                     StyleViolation(
                         kind="banned_phrase",

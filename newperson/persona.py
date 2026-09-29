@@ -283,6 +283,12 @@ class Boundaries(BaseModel):
     裸子串匹配会把这些全判违规，每一次误伤都白花一次重写的模型调用，
     而重写出来的句子往往还不如原来那句。
     """
+    never_say_anywhere: list[str] = Field(default_factory=list)
+    """出现在哪儿都算的套话："抱抱""摸摸头""早点休息"。
+
+    这几句没有歧义，不会是别的词的一部分，照老办法按子串拦——
+    按"说完了才算"的话，"抱抱你""早点休息呗"就溜过去了。
+    """
     never_start_with: list[str] = Field(default_factory=list)
     """拿来**开头**就算违规的交代行踪："刚看到""还在睡""刚醒"。
 
