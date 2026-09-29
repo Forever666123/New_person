@@ -365,3 +365,29 @@ async def test_a_retry_in_the_repeated_hour_is_not_due_immediately(tmp_path) -> 
         assert len(calls) == 1, f"不拨钟连跑三轮，被调了 {len(calls)} 次"
     finally:
         await memory.close()
+
+
+async def test_retry_does_not_fire_stale_messages_right_after_the_command(parts) -> None:
+    """!np retry：过期太久的主动消息作废，其余的打散到几分钟后，不在命令之后一两秒就冒出来。
+
+    原来全部按 run_at=now 放回去：昨晚八点那句"刚吃完饭"第二天下午紧跟着你的命令发出来。
+    """
+    memory, clock, sched = parts
+
+    async def boom(_job: Job) -> None:
+        raise RuntimeError("连不上接口")
+
+    sched.register("proactive", boom)
+    sched.register("reply", boom)
+    stale = await sched.schedule("proactive", NOW, conversation_id="owner", payload={"kind": "own_life"})
+    reply = await sched.schedule("reply", NOW, conversation_id="owner")
+    for job_id in (stale, reply):
+        await memory.set_job_status(job_id, "failed", "连不上接口", at=NOW)
+
+    clock.set(NOW + timedelta(hours=20))
+    revived, dropped = await sched.revive_failed("owner")
+    assert (revived, dropped) == (1, 1)
+    assert (await memory.get_job(stale)).status == "cancelled"
+    back = await memory.get_job(reply)
+    assert back.status == "pending" and back.attempts == 0
+    assert back.run_at - clock.now() >= timedelta(minutes=1)

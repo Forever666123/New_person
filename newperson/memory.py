@@ -1152,22 +1152,14 @@ class Memory:
             )
         return [self._row_to_job(r) for r in rows]
 
-    async def revive_failed_jobs(self, conversation_id: str | None, now: datetime) -> int:
-        """把失败的任务放回队列，重试次数清零。"""
-        if conversation_id is None:
-            cur = await self.db.execute(
-                "UPDATE jobs SET status = 'pending', attempts = 0, lease_until = NULL,"
-                " run_at = ? WHERE status = 'failed'",
-                (now.isoformat(),),
-            )
-        else:
-            cur = await self.db.execute(
-                "UPDATE jobs SET status = 'pending', attempts = 0, lease_until = NULL,"
-                " run_at = ? WHERE status = 'failed' AND conversation_id = ?",
-                (now.isoformat(), conversation_id),
-            )
+    async def revive_job(self, job_id: int, run_at: datetime) -> None:
+        """把一条失败的任务放回队列，重试次数清零。"""
+        await self.db.execute(
+            "UPDATE jobs SET status = 'pending', attempts = 0, lease_until = NULL, run_at = ?"
+            " WHERE id = ? AND status = 'failed'",
+            (run_at.isoformat(), job_id),
+        )
         await self.db.commit()
-        return cur.rowcount or 0
 
     async def release_dedupe_key(self, job_id: int) -> None:
         """把这一行的去重键让出来。

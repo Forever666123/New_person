@@ -45,6 +45,12 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=/opt/New_person/data
+# 库里是全部聊天记录，data/downloads 里是他发的照片：建出来的文件只给自己看
+UMask=0077
+# 1G 内存又没有 swap：真有泄漏或者处理图片冲高时，让 systemd 干净地重启她，
+# 而不是让内核随手挑一个杀——先被杀的可能是 sshd。平时她只用 100M 上下。
+MemoryHigh=300M
+MemoryMax=450M
 
 [Install]
 WantedBy=multi-user.target

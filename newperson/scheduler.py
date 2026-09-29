@@ -200,6 +200,31 @@ class Scheduler:
                 count += 1
         return count
 
+    async def revive_failed(self, conversation_id: str | None) -> tuple[int, int]:
+        """把重试到放弃的任务放回队列（``!np retry``）。返回 (放回去的, 作废的)。
+
+        原来全部按 run_at=now 放回去：昨晚八点那句"刚吃完饭 晚霞好看"第二天下午
+        在你敲完命令三秒后发出来，几条过期的回复也一两秒内连着冒——紧跟在操控命令后面。
+        现在跟开机时一样：过期太久的主动消息作废，其余的打散到几分钟之后。
+        回复放太久的那份 plan 由 handle_reply_job 丢掉重想，不在这里管。
+        """
+        now = self.clock.now()
+        revived = dropped = 0
+        for job in await self.memory.failed_jobs(conversation_id):
+            limit = STALE_AFTER.get(job.kind)
+            if limit and now - (job.original_run_at or job.run_at) > limit:
+                await self.memory.set_job_status(job.id or 0, "cancelled", "放弃太久了，不再发", at=now)
+                if job.dedupe_key:
+                    await self.memory.release_dedupe_key(job.id or 0)
+                    await self.memory.kv_delete(job.dedupe_key)
+                dropped += 1
+                continue
+            spread = self.rng.uniform(60, 300) * max(self.delay_scale, 0.0)
+            await self.memory.revive_job(job.id or 0, later(now, timedelta(seconds=spread)))
+            revived += 1
+        self._wake.set()
+        return revived, dropped
+
     def _lock_for(self, conversation_id: str | None) -> asyncio.Lock:
         key = conversation_id or "__global__"
         if key not in self._locks:

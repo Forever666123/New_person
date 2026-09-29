@@ -3704,6 +3704,41 @@ async def test_a_reply_that_slips_into_her_sleep_waits_until_she_wakes(
     assert moved.status == "pending" and not app.rhythm.is_sleeping(moved.run_at)
 
 
+async def test_a_goodnight_reply_stuck_until_morning_is_rethought_not_sent(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """睡前想好了"好 我先睡了"，Discord 发不出去，拖到了她睡着：早上重新想，不照发那句。"""
+    app, channel, llm, clock, memory = await build(
+        tmp_path,
+        persona,
+        [ReplyPlan(parts=[ReplyPart(text="好 我先睡了")]), ReplyPlan(parts=[ReplyPart(text="早")])],
+    )
+    bedtime = await _bedtime(app, EVENING)
+    at = bedtime - timedelta(minutes=10)
+    clock.set(at)
+    await send(app, "你睡了没", at=at, msg_id=2650)
+    job = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    real_send = channel.send
+
+    async def discord_down(*_a, **_kw):
+        raise RuntimeError("503 Service Unavailable")
+
+    channel.send = discord_down
+    await memory.reschedule_job(job.id or 0, bedtime - timedelta(minutes=5))
+    clock.set(bedtime - timedelta(minutes=5) + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(job.id or 0)).progress.get("goodnight"), "前提：想好的是睡前那句"
+
+    channel.send = real_send
+    await memory.reschedule_job(job.id or 0, bedtime + timedelta(minutes=3))
+    clock.set(bedtime + timedelta(minutes=3, seconds=1))
+    await app.scheduler.run_due_once()
+    assert channel.texts == [], "她睡着了还在发"
+    await drain(app, clock, hops=10)
+    assert channel.texts == ["早"]
+    assert persona.proactive.sign_off.reply_note not in llm.calls[-1]["messages"][0]["content"]
+
+
 async def test_a_reply_planned_long_ago_is_not_sent_as_is(
     tmp_path: Path, persona: Persona
 ) -> None:

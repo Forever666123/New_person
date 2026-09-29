@@ -186,10 +186,13 @@ async def _retry(_args: list[str], ctx: OwnerContext) -> str:
 
     接口挂过一阵子之后，那几条消息就永远躺在未读里了——她不会自己再试。
     """
-    count = await ctx.memory.revive_failed_jobs(ctx.conversation_id, ctx.now)
-    if not count:
+    revived, dropped = await ctx.scheduler.revive_failed(ctx.conversation_id)
+    if not revived and not dropped:
         return "没有失败的任务"
-    return f"{count} 个任务放回队列了，她会重新试一次"
+    reply = f"{revived} 个任务放回队列了，几分钟内她会重新试" if revived else "没有要重试的"
+    if dropped:
+        reply += f"；{dropped} 条过期太久的主动消息作废了"
+    return reply
 
 
 async def _pause(_args: list[str], ctx: OwnerContext) -> str:
