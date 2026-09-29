@@ -890,8 +890,16 @@ class App:
         session = conv.hot_session_started_at
         # 停了一阵再聊（还在 warm 里）也从头算，不然停二三十分钟再接上，
         # 第二段一直按上一段的"聊了多久"放慢、被提示收尾
-        rested = prior is not None and unread[0].created_at - prior > timedelta(
-            minutes=self.persona.timing.fatigue_reset_minutes
+        # 她这一轮正在发（气泡要整条发完才入库）的时候不算"停过"：
+        # 那时 prior 取到的是他自己的上一句，她那十几分钟的慢回复会被当成冷场
+        replying = any(
+            j.kind == "reply" for j in await self.memory.running_jobs(CONVERSATION_ID)
+        )
+        rested = (
+            not replying
+            and prior is not None
+            and unread[0].created_at - prior
+            > timedelta(minutes=self.persona.timing.fatigue_reset_minutes)
         )
         if (heat == "cold" or rested) and session is not None:
             session = None
@@ -1706,9 +1714,14 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, hot_session_started_at=None)
 
         day = self.rhythm.local_date(now)
-        if kind == HOLIDAY and await self._said_happy_today(now):
-            await self._skip(job, "今天已经说过节日快乐了")
-            return
+        if kind == HOLIDAY:
+            if job.payload.get("day") and job.payload["day"] != day.isoformat():
+                # 重试、重启打散把它推过了零点：节日已经过了
+                await self._skip(job, "节日已经过了")
+                return
+            if await self._said_happy_today(now):
+                await self._skip(job, "今天已经说过节日快乐了")
+                return
         # 答应他的事不算新开话头，本来就是在回他的话：今天主动过、他没回，照样说
         if not promised and not await self.life.can_initiate_today(CONVERSATION_ID, day):
             await self._skip(job, "今天已经主动过而且他没回，不追了")
@@ -1805,14 +1818,13 @@ class App:
         words = {"快乐"}
         if holiday is not None:
             words |= {w for w in (holiday.name, holiday.greeting) if w}
-        for message in await self.memory.recent_messages(CONVERSATION_ID, 40):
-            if (
-                message.author_kind == "bot"
-                and self.rhythm.local_date(message.created_at) == day
-                and any(w in message.content for w in words)
-            ):
-                return True
-        return False
+        # 按当地这一天的时刻查，不按最近几条：上午互道过、之后聊了二十来个来回，
+        # 那句早掉出窗口了，晚上排着的这句就会再说一遍
+        midnight = datetime.combine(day, datetime.min.time(), tzinfo=self.rhythm.tz_for(day))
+        return any(
+            any(w in message.content for w in words)
+            for message in await self.memory.bot_messages_since(CONVERSATION_ID, midnight)
+        )
 
     async def _resume_proactive(self, job: Job, now: datetime, kind: str) -> None:
         """主动消息上次发到一半断了，从断点接着发。

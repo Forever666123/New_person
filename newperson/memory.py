@@ -419,6 +419,15 @@ class Memory:
         )
         return [self._row_to_message(r) for r in rows]
 
+    async def bot_messages_since(self, conversation_id: str, since: datetime) -> list[StoredMessage]:
+        """她从 ``since`` 起说过的每一句。按时刻查，不按条数：聊多了也不会漏掉早上那句。"""
+        rows = await self._fetch_all(
+            "SELECT * FROM messages WHERE conversation_id = ? AND author_kind = 'bot'"
+            " AND deleted = 0 AND julianday(created_at) >= julianday(?) ORDER BY id",
+            (conversation_id, utc_text(since)),
+        )
+        return [self._row_to_message(r) for r in rows]
+
     async def messages_after(
         self, conversation_id: str, after_id: int, limit: int
     ) -> list[StoredMessage]:

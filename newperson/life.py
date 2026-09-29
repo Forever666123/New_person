@@ -348,9 +348,18 @@ class LifeEngine:
         if holiday is None or self.rng.random() >= cfg.probability:
             return []
         wake, sleep = self._awake_window(day)
+        # 只排在节日当天：她常常一点多才睡，过了零点就是第二天了——
+        # 那时候再说"今天X，X快乐"，而且查不到昨晚是不是已经说过
+        midnight = datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=self.rhythm.tz_for(day))
+        sleep = min(sleep, midnight, key=lambda t: t.astimezone(UTC))
         kind = ProactiveKind(name=HOLIDAY, weight=0.0)
         moment = self._sample_moment(kind, wake, sleep, day)
-        if moment is None or moment <= self.clock.now() or self.rhythm.is_sleeping(moment):
+        if (
+            moment is None
+            or moment <= self.clock.now()
+            or self.rhythm.is_sleeping(moment)
+            or self.rhythm.local_date(moment) != day
+        ):
             return []
         note = cfg.note.format(name=holiday.name, greeting=holiday.greeting or f"{holiday.name}快乐")
         shareable = [e for e in plan.events if e.shareable]
@@ -534,6 +543,7 @@ class LifeEngine:
                     "photo_tags": kind.photo_tags,
                     "requires_photo": kind.requires_photo,
                     "text_optional": kind.text_optional,
+                    "day": day.isoformat(),
                 },
                 dedupe_key=f"proactive:{day}:{kind.name}",
                 reason=kind.name,

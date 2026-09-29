@@ -395,3 +395,20 @@ async def test_on_a_holiday_she_usually_says_happy_holiday(harness: Harness) -> 
     ordinary = date(2027, 2, 9)
     harness.clock.set(datetime.combine(ordinary, datetime.min.time(), TZ).replace(hour=5))
     assert await life.candidate_moments(PLAN, ordinary, "owner") == []
+
+
+async def test_the_holiday_greeting_never_lands_after_midnight(harness: Harness) -> None:
+    """节日那句只排在节日当天：她常常一点多才睡，过了零点就是第二天了。"""
+    life = harness.life
+    persona = life.persona
+    sure = persona.proactive.model_copy(update={
+        "holiday": persona.proactive.holiday.model_copy(update={"probability": 1.0}),
+    })
+    life.persona = persona.model_copy(update={"proactive": sure})
+    christmas = date(2026, 12, 25)
+    wake = life.rhythm.for_day(christmas).wake
+    for seed in range(200):
+        life.rng = random.Random(seed)
+        harness.clock.set(wake)
+        for moment, _kind, _note in await life._holiday_candidate(PLAN, christmas):
+            assert life.rhythm.local_date(moment) == christmas, moment

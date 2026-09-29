@@ -4738,6 +4738,88 @@ async def test_she_does_not_say_happy_holiday_twice(tmp_path: Path, persona: Per
     assert (await memory.get_job(job_id)).status == "cancelled"
 
 
+async def test_a_morning_greeting_still_counts_after_a_long_chat(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """上午互道过国庆快乐，之后聊了二十多个来回：晚上排着的那句不再说。
+
+    原来只看最近 40 条，早上那句早掉出去了。
+    """
+    morning = datetime(2026, 10, 1, 11, 0, tzinfo=TZ)
+    app, channel, llm, clock, memory = await build(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="国庆快乐呀")])], now=morning
+    )
+    await send(app, "国庆快乐！", at=morning, msg_id=4600)
+    await _deliver_one_reply(app, clock, memory)
+    t = clock.now()
+    for i in range(25):
+        t += timedelta(minutes=2)
+        await memory.add_user_message(
+            IncomingMessage(
+                conversation_id=CONVERSATION_ID, discord_message_id=4700 + i, author_id=42,
+                author_name="Leo", content=f"第 {i} 句", created_at=t,
+            )
+        )
+        await memory.add_bot_message(CONVERSATION_ID, f"嗯 {i}", t + timedelta(seconds=30))
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], t)
+    evening = datetime(2026, 10, 1, 20, 30, tzinfo=TZ)
+    job_id = await app.scheduler.schedule(
+        "proactive", evening, conversation_id=CONVERSATION_ID,
+        payload={"kind": "holiday", "note": "今天国庆。跟他说声国庆快乐", "day": "2026-10-01"},
+    )
+    clock.set(evening + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(job_id)).status == "cancelled"
+    assert len(llm.calls) == 1
+
+
+async def test_a_holiday_greeting_pushed_past_midnight_is_dropped(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """重试、重启把节日那句推过了零点：节日已经过了，不再说"今天X快乐"。"""
+    app, channel, llm, clock, memory = await build(tmp_path, persona, [])
+    after = datetime(2026, 12, 26, 0, 30, tzinfo=TZ)
+    job_id = await app.scheduler.schedule(
+        "proactive", after, conversation_id=CONVERSATION_ID,
+        payload={"kind": "holiday", "note": "今天圣诞", "day": "2026-12-25"},
+    )
+    clock.set(after + timedelta(seconds=1))
+    await app.scheduler.run_due_once()
+    assert (await memory.get_job(job_id)).status == "cancelled" and llm.calls == []
+
+
+async def test_her_own_slow_reply_is_not_mistaken_for_a_pause(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """聊久了她回得慢，他在她还没发完时接话：这不是"停了一阵"，聊了多久不清零。
+
+    她这一轮的气泡要整条发完才入库，那时往前找到的"上一次交流"是他自己的上一句。
+    """
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    started = EVENING - timedelta(minutes=95)
+    await memory.update_conversation(CONVERSATION_ID, hot_session_started_at=started)
+    # 正聊着：他上一句、她回了一句，然后他接"那你呢"
+    before = EVENING - timedelta(minutes=22)
+    await memory.add_user_message(
+        IncomingMessage(
+            conversation_id=CONVERSATION_ID, discord_message_id=4799, author_id=42,
+            author_name="Leo", content="今天好累", created_at=before - timedelta(minutes=1),
+        )
+    )
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], before)
+    await memory.add_bot_message(CONVERSATION_ID, "我也是", before)
+    clock.set(EVENING - timedelta(minutes=20))
+    await send(app, "那你呢", at=EVENING - timedelta(minutes=20), msg_id=4800)
+    assert (await memory.get_conversation(CONVERSATION_ID)).hot_session_started_at is not None
+    reply = (await memory.pending_jobs("reply", CONVERSATION_ID))[0]
+    await memory.set_job_status(reply.id or 0, "running")
+    await memory.mark_read([m.id for m in await memory.unread_messages(CONVERSATION_ID)], EVENING)
+    clock.set(EVENING)
+    await send(app, "好", at=EVENING, msg_id=4801)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.hot_session_started_at is not None, "她还在回，聊了多久就被清零了"
+
+
 def test_every_job_kind_has_a_handler_when_she_starts() -> None:
     """每一种任务，App.start 里都得有人接。
 
