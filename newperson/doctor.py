@@ -283,20 +283,71 @@ def _answered(conn: sqlite3.Connection, batches: list[datetime]) -> int:
     return sum(1 for b in batches if b in done)
 
 
+def _optional_batches(conn: sqlite3.Connection, batches: list[datetime]) -> list[datetime]:
+    """这些批里，哪些是**可回可不回**的：他没问问题、也没聊到哪个话题模式。
+
+    Leo 定过规矩：他问了问题、说了具体的事，她必须回（brain 里 must_reply 会逼一次）。
+    那种批她每次都接是对的，拿它算"有问必答"只会让这条提醒永远亮着。
+
+    认法跟回复任务一样：这一批最后一条消息被哪个回复任务覆盖，看那个任务当时
+    记下的 ``is_question`` 和 ``mode``。**只取这两个标记，不碰任何文字。**
+    找不到任务的批（很老的数据、从备份恢复补回来的）不算进来。
+    """
+    wanted = {b.isoformat() for b in batches}
+    rows = _rows(
+        conn,
+        "SELECT read_at, MAX(id) AS last FROM messages WHERE author_kind = 'user'"
+        " AND read_at IS NOT NULL AND deleted = 0 GROUP BY read_at",
+    )
+    last_of: dict[int, datetime] = {}
+    for row in rows:
+        when = _parse(row["read_at"])
+        if when is not None and when.isoformat() in wanted:
+            last_of[int(row["last"])] = when
+    if not last_of:
+        return []
+    marks = ",".join("?" for _ in last_of)
+    rows = _rows(
+        conn,
+        "SELECT covers_upto_message_id AS covers,"
+        " json_extract(payload_json, '$.is_question') AS question,"
+        " json_extract(payload_json, '$.mode') AS mode"
+        f" FROM jobs WHERE kind = 'reply' AND covers_upto_message_id IN ({marks})",  # noqa: S608
+        tuple(last_of),
+    )
+    optional = []
+    for row in rows:
+        if not row["question"] and not row["mode"]:
+            optional.append(last_of[int(row["covers"])])
+    return sorted(set(optional))
+
+
 def check_silence(report: Report, conn: sqlite3.Connection, since: datetime) -> None:
     """她有多少次看见了但没接话。
 
-    一次都不沉默，说明"有问必答"——那是助手，不是人。
-    但沉默太多也不对，多半是模型在判"这条不用回"。
+    沉默太多不对，多半是模型在判"这条不用回"——这个看全部。
+    "有问必答"只看**可回可不回**的那些（"晚安"、一个表情、"哈哈"）：
+    他问了问题、说了正事，她每次都接是规矩要求的，不算毛病；
+    连这种可接可不接的也一条不落，才像助手不像人。
     """
     batches, _opened, _floor = _batches_and_runs(conn, since)
     if len(batches) < 10:
         return
     ratio = max(0.0, 1 - _answered(conn, batches) / len(batches))
+    optional = _optional_batches(conn, batches)
+    loose = max(0.0, 1 - _answered(conn, optional) / len(optional)) if optional else 0.0
     if ratio > 0.5:
         report.add(WARN, f"她看了却没接话的比例 {ratio:.0%}，偏高", "多半是模型老在判'这条不用回'")
-    elif ratio < 0.05:
-        report.add(WARN, f"她几乎有问必答（沉默 {ratio:.0%}）", "真人会漏掉一些话不接")
+    elif len(optional) >= 10 and loose < 0.05:
+        report.add(
+            WARN,
+            f"她几乎有问必答：可回可不回的话也一条不落（{len(optional)} 批里沉默 {loose:.0%}）",
+            "真人会漏掉一些话不接，比如\"晚安\"、一个表情。该回的正事不算在内。",
+        )
+    elif optional:
+        report.add(
+            OK, f"沉默比例 {ratio:.0%}（可回可不回的 {len(optional)} 批里没接 {loose:.0%}）"
+        )
     else:
         report.add(OK, f"沉默比例 {ratio:.0%}")
 

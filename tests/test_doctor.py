@@ -357,6 +357,7 @@ def test_answering_every_batch_is_flagged_even_when_he_spreads_it_over_hours(
         read_at = spoke[-1] + timedelta(minutes=12)
         for one in spoke:
             say(conn, one, read_at=read_at)
+        _replied_to(conn, question=False)
         she_says(conn, read_at, bubbles=2, batch=read_at)
         at = read_at + timedelta(hours=5)
     conn.commit()
@@ -364,6 +365,39 @@ def test_answering_every_batch_is_flagged_even_when_he_spreads_it_over_hours(
 
     finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
     assert "有问必答" in finding.line, f"她一条没漏却被说成漏了：{finding.line}"
+
+
+def _replied_to(conn: sqlite3.Connection, *, question: bool) -> None:
+    """给刚说完的那一批记一个回复任务，带上当时判出来的"是不是问题"。"""
+    last = conn.execute("SELECT MAX(id) FROM messages WHERE author_kind = 'user'").fetchone()[0]
+    conn.execute(
+        "INSERT INTO jobs (kind, status, run_at, created_at, payload_json, covers_upto_message_id)"
+        " VALUES ('reply','done',?,?,?,?)",
+        (NOW.isoformat(), NOW.isoformat(),
+         '{"is_question": %s, "mode": null}' % ("true" if question else "false"), last),
+    )
+
+
+def test_answering_every_real_question_is_not_a_flaw(tmp_path: Path) -> None:
+    """他问的、说正事的，她每次都接是 Leo 定的规矩，不能因此报"有问必答"。
+
+    原来这条提醒把所有批一起算：他平时说的多半是正事，她照规矩全回，
+    这条就永远亮着。现在只看可回可不回的那些。
+    """
+    path = tmp_path / "questions.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    for _ in range(15):
+        read_at = at + timedelta(minutes=12)
+        say(conn, at, read_at=read_at)
+        _replied_to(conn, question=True)
+        she_says(conn, read_at, bubbles=1, batch=read_at)
+        at = read_at + timedelta(hours=5)
+    conn.commit()
+    conn.close()
+    finding = next(f for f in doctor.run(path, NOW, days=40).findings if "沉默" in f.line)
+    assert finding.level == doctor.OK, finding.line
 
 
 def test_days_of_total_silence_are_not_reported_as_normal(tmp_path: Path) -> None:
