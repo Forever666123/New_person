@@ -147,9 +147,10 @@ academic:
       - {place: 佛蒙特, timezone: America/New_York, note: 你去佛蒙特滑雪。}
       - {place: 华盛顿, timezone: America/New_York, note: 你去 DC 待几天。}
     long_trips:
-      - {place: 苏州, timezone: Asia/Shanghai, note: 你回国了，在苏州家里。}
+      # transit_hours：路上要多久（含转机）。这段时间她不在线，去程回程都算
+      - {place: 苏州, timezone: Asia/Shanghai, note: 你回国了，在苏州家里。, transit_hours: 20}
       - {place: 加州, timezone: America/Los_Angeles, note: 你在加州，跟高中同学玩。}
-      - {place: 东京, timezone: Asia/Tokyo, note: 你在东京玩。}
+      - {place: 东京, timezone: Asia/Tokyo, note: 你在东京玩。, transit_hours: 18}
       - {place: 西雅图, timezone: America/Los_Angeles, note: 你去西雅图待一阵。}
       - {place: 冰岛, timezone: Atlantic/Reykjavik, note: 你跟人去了冰岛。}
 
@@ -164,7 +165,7 @@ rhythm:
        activity_multiplier: 0.6, engage_multiplier: 0.85,
        note: 你最近在赶 deadline，人有点烦，话更少。}
     - {name: 松, weight: 17, min_days: 3, max_days: 7,
-       activity_multiplier: 1.2,
+       activity_multiplier: 1.2, skip_in_finals: true,   # 期末周不会"最近没什么事"
        note: 你最近没什么事。}
 
   sleep:
@@ -177,6 +178,13 @@ rhythm:
 
   # 起床有多跟着昨晚的入睡走。熬到四点不会七点就起，但也不会睡到下午。
   sleep_follow_weight: 0.8
+
+  # 周五周六晚上睡得晚一点，周末早上起得晚一点（0 是周一）
+  weekend:
+    late_nights: [4, 5]
+    sleep_shift_hours: 0.7
+    late_mornings: [5, 6]
+    wake_shift_hours: 0.8
 
   # 一天里"会看手机"的活跃度。晚上最高，凌晨到早上接近零。
   activity:

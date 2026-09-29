@@ -383,8 +383,17 @@ def _minutes(start: datetime, end: datetime, tz):
         t += timedelta(minutes=1)
 
 
-def test_she_stays_asleep_through_the_repeated_hour(rhythm: Rhythm, persona: Persona) -> None:
-    """那一觉从入睡到起床，每一分钟都在睡——包括过第二遍的那一小时。"""
+def test_she_stays_asleep_through_the_repeated_hour(persona: Persona) -> None:
+    """那一觉从入睡到起床，每一分钟都在睡——包括过第二遍的那一小时。
+
+    2026-10-31 是周六，周末晚睡会把那晚的入睡推到回拨之后，前提就不成立了。
+    这条守的是拨钟，不是周末，所以把周末偏移关掉。
+    """
+    from newperson.calendar import AcademicCalendar
+    from newperson.persona import WeekendConfig
+
+    config = persona.rhythm.model_copy(update={"weekend": WeekendConfig()})
+    rhythm = Rhythm(config, persona.tz, persona.seed, AcademicCalendar(persona.academic, persona.seed))
     night = rhythm.for_day(date(2026, 10, 31))
     wake = rhythm.for_day(date(2026, 11, 1)).wake
     assert night.sleep_start.astimezone(UTC) < FALL_BACK + timedelta(hours=1) < wake.astimezone(UTC), (
@@ -470,3 +479,69 @@ def test_finals_week_is_not_a_vacation(persona: Persona) -> None:
     total = sum(counts.values())
     assert total > 200, "样本太少"
     assert counts["赶due"] / total > 0.1, counts
+
+
+def test_she_sleeps_in_on_weekends(persona: Persona) -> None:
+    """周五周六晚上睡得晚，周末早上起得晚。原来周六跟周二一模一样，看起来像按日抽签的机器。"""
+    import statistics
+
+    calendar = AcademicCalendar(persona.academic, persona.seed)
+    rhythm = Rhythm(persona.rhythm, persona.tz, persona.seed, calendar)
+    wake: dict[bool, list[float]] = {True: [], False: []}
+    sleep: dict[bool, list[float]] = {True: [], False: []}
+    for offset in range(364):
+        day = date(2026, 9, 2) + timedelta(days=offset)
+        if calendar.trip_for(day) or calendar.trip_for(day - timedelta(days=1)):
+            continue
+        daily = rhythm.for_day(day)
+        w = daily.wake.astimezone(persona.tz)
+        s = daily.sleep_start.astimezone(persona.tz)
+        wake[day.weekday() in (5, 6)].append(w.hour * 60 + w.minute)
+        minutes = (s - datetime.combine(day, datetime.min.time(), tzinfo=persona.tz)).total_seconds() / 60
+        sleep[day.weekday() in (4, 5)].append(minutes)
+    assert statistics.mean(wake[True]) - statistics.mean(wake[False]) > 20
+    assert statistics.mean(sleep[True]) - statistics.mean(sleep[False]) > 20
+
+
+def test_a_long_flight_is_not_a_teleport(persona: Persona) -> None:
+    """飞回国、飞东京那一晚：从入睡到起床至少是航程，这段时间里她一直不在线。
+
+    原来出发那晚只"睡"六个小时就在上海起床，比十五个小时的航程还短。
+    """
+    checked = 0
+    for seed in range(1, 40):
+        calendar = AcademicCalendar(persona.academic, seed)
+        rhythm = Rhythm(persona.rhythm, persona.tz, seed, calendar)
+        for offset in range(365):
+            day = date(2026, 9, 2) + timedelta(days=offset)
+            trip, before = calendar.trip_for(day), calendar.trip_for(day - timedelta(days=1))
+            flying = (trip and trip != before and trip.transit_hours) or (
+                trip is None and before is not None and before.transit_hours
+            )
+            if not flying:
+                continue
+            hours = trip.transit_hours if trip else before.transit_hours
+            start = rhythm.for_day(day - timedelta(days=1)).sleep_start
+            window = rhythm.sleep_window_containing(start + timedelta(minutes=1))
+            assert window is not None
+            gap = window[1] - window[0]
+            assert gap >= timedelta(hours=hours), f"{day} 路上 {hours} 小时，只空了 {gap}"
+            for step in range(1, 20):
+                t = window[0] + gap * step / 20
+                assert rhythm.is_sleeping(t) and rhythm.activity_at(t) == 0, t
+            end = window[1]
+            assert not rhythm.is_sleeping(end + timedelta(minutes=1)), "落地起床之后还是睡着"
+            assert rhythm.next_wake_after(start + timedelta(hours=1)) == end
+            checked += 1
+    assert checked >= 10
+
+
+def test_finals_week_never_feels_like_nothing_to_do(persona: Persona) -> None:
+    """期末周不会抽到"最近没什么事"：日历已经写着"人很紧"了。"""
+    for seed in range(1, 25):
+        calendar = AcademicCalendar(persona.academic, seed)
+        rhythm = Rhythm(persona.rhythm, persona.tz, seed, calendar)
+        for offset in range(365):
+            day = date(2026, 9, 2) + timedelta(days=offset)
+            if calendar.period_for(day).kind == "finals":
+                assert rhythm.phase_for(day).name != "松", day

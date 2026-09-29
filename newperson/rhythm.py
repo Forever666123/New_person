@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 from .calendar import AcademicCalendar
 from .clock import later
-from .models import ClassInstance, DailyRhythm, RhythmSnapshot
+from .models import ClassInstance, DailyRhythm, RhythmSnapshot, Trip
 from .persona import DayVariant, LifePhase, RhythmConfig, hhmm_to_minutes
 
 _SEARCH_LIMIT = 400
@@ -112,12 +112,13 @@ class Rhythm:
         于是"赶 due"整段被排除、权重分给了"松"，同一天的提示里写着
         "期末周，你在赶 due 和复习，人很紧"和"你最近没什么事"。
         """
-        in_session = (
-            self.calendar.period_for(day).kind in ("in_session", "finals")
-            if self.calendar
-            else True
-        )
-        phases = [p for p in self.config.phases if in_session or not p.only_in_session]
+        kind = self.calendar.period_for(day).kind if self.calendar else "in_session"
+        in_session = kind in ("in_session", "finals")
+        phases = [
+            p
+            for p in self.config.phases
+            if (in_session or not p.only_in_session) and not (kind == "finals" and p.skip_in_finals)
+        ]
         if not phases:
             return LifePhase(name="平常")
         if day < _PHASE_EPOCH:
@@ -188,6 +189,11 @@ class Rhythm:
             + rng.gauss(0, cfg.sleep.start_sigma_minutes)
             + chosen.sleep_start_shift_hours * 60
         )
+        # 周五周六晚上睡得晚，周末早上起得晚。原来周六跟周二一模一样
+        if day.weekday() in cfg.weekend.late_mornings:
+            wake_minutes += cfg.weekend.wake_shift_hours * 60
+        if day.weekday() in cfg.weekend.late_nights:
+            sleep_minutes += cfg.weekend.sleep_shift_hours * 60
         return self._at(day, wake_minutes), self._at(day, sleep_minutes), chosen, phase
 
     def for_day(self, day: date) -> DailyRhythm:
@@ -212,6 +218,8 @@ class Rhythm:
             minutes=(hhmm_to_minutes(cfg.sleep.wake_median) - hhmm_to_minutes(cfg.sleep.start_median))
             % (24 * 60)
         ) + timedelta(hours=period.sleep_bonus_hours if period else 0.0)
+        if day.weekday() in cfg.weekend.late_mornings:
+            target_sleep += timedelta(hours=cfg.weekend.wake_shift_hours)  # 周末睡个懒觉
         follow = prev_sleep_start + target_sleep
         w = cfg.sleep_follow_weight
         wake = follow + (wake - follow) * (1 - w)
@@ -287,6 +295,43 @@ class Rhythm:
         self._cache[day] = daily
         return daily
 
+    def _transit_before(self, day: date, trip: Trip | None) -> float:
+        """``day`` 这天早上之前那一晚在路上的小时数：出发去远处，或者从远处回来。"""
+        if self.calendar is None:
+            return 0.0
+        before = self.calendar.trip_for(day - timedelta(days=1))
+        if trip is not None and trip != before:
+            return trip.transit_hours  # 去程
+        if trip is None and before is not None:
+            return before.transit_hours  # 回程
+        return 0.0
+
+    def _transit_window(self, day: date) -> tuple[datetime, datetime] | None:
+        """``day`` 前一晚开始的那段路（UTC）：从前一晚入睡起，航程加落地后补的一觉。
+
+        **单独算一段，不去改那天的起床时刻。** 往东飞会丢掉一天（出发那天的整个白天
+        都在飞机上），硬把"起床"推后会让那天的起床落到下一个日历日，跟后面的作息搅在一起。
+        原来什么都没有：出发那晚睡六个小时就在上海起床了，比十五个小时的航程还短，
+        而她前一天刚说过"明天回国"。
+        """
+        hours = self._transit_before(day, self.calendar.trip_for(day) if self.calendar else None)
+        if not hours:
+            return None
+        start = self.for_day(day - timedelta(days=1)).sleep_start.astimezone(UTC)
+        rest = timedelta(hours=self.config.sleep.min_hours / 2)
+        return start, start + timedelta(hours=hours) + rest
+
+    def _night_window(self, dt: datetime) -> tuple[datetime, datetime] | None:
+        """只看每天的那一觉，不管路上。"""
+        d = self.local_date(dt)
+        dt = dt.astimezone(UTC)
+        for offset in (-1, 0, 1):
+            start = self.for_day(d + timedelta(days=offset)).sleep_start
+            end = self.for_day(d + timedelta(days=offset + 1)).wake
+            if start <= dt < end:
+                return start, end
+        return None
+
     # -- 查询 ---------------------------------------------------------------
 
     def wake_of(self, day: date) -> datetime:
@@ -309,13 +354,14 @@ class Rhythm:
     def sleep_window_containing(self, dt: datetime) -> tuple[datetime, datetime] | None:
         """若 dt 处于某一觉之中，返回 ``(入睡, 起床)``；否则 None。"""
         d = self.local_date(dt)
-        dt = dt.astimezone(UTC)
-        for offset in (-1, 0, 1):
-            start = self.for_day(d + timedelta(days=offset)).sleep_start
-            end = self.for_day(d + timedelta(days=offset + 1)).wake
-            if start <= dt < end:
-                return start, end
-        return None
+        utc = dt.astimezone(UTC)
+        for offset in (-2, -1, 0, 1):
+            trip = self._transit_window(d + timedelta(days=offset))
+            if trip is not None and trip[0] <= utc < trip[1]:
+                # 落地那一刻要是正赶上当地的睡觉时间，就睡到那一觉醒
+                after = self._night_window(trip[1])
+                return trip[0], after[1] if after is not None else trip[1]
+        return self._night_window(dt)
 
     def is_sleeping(self, dt: datetime) -> bool:
         if self.force_awake:
@@ -372,7 +418,9 @@ class Rhythm:
         for offset in range(0, _SEARCH_LIMIT):
             wake = self.for_day(d + timedelta(days=offset)).wake
             if wake > dt:
-                return wake
+                # 落在路上的"起床"不算：出发那天的白天整个在飞机上
+                window = self.sleep_window_containing(wake)
+                return window[1] if window is not None else wake
         raise RuntimeError("找不到下一次起床时间，检查 rhythm.sleep 配置")
 
     def next_sleep_after(self, dt: datetime) -> datetime:

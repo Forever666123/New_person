@@ -53,6 +53,8 @@ class Trip(BaseModel):
     kind: Literal["short", "long"] = "short"
     activity_multiplier: float = 1.0
     """在外面玩的时候看手机更少。住下来的长途影响小一些。"""
+    transit_hours: float = 0.0
+    """路上要多久。去程那晚和回程那晚，从入睡到起床至少这么久加上落地后的休息。"""
 
     def contains(self, day: date) -> bool:
         return self.start <= day <= self.end

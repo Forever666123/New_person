@@ -134,6 +134,7 @@ class AcademicCalendar:
                     timezone=spot.timezone or self.config.home_timezone,
                     note=spot.note or f"你在{spot.place}。",
                     kind=period.travel,
+                    transit_hours=spot.transit_hours,
                     activity_multiplier=(
                         cfg.long_activity_multiplier
                         if period.travel == "long"

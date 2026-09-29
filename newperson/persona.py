@@ -139,6 +139,19 @@ class LifePhase(BaseModel):
     note: str = ""
     only_in_session: bool = False
     """只在上课期间可能抽到。放假的时候不该有"赶 due"这种阶段。"""
+    skip_in_finals: bool = False
+    """期末周抽不到。期末周的心态日历已经给了（人很紧），不该再叠一个"最近没什么事"。"""
+
+
+class WeekendConfig(BaseModel):
+    """周末的作息。研究生周五周六晚睡、周末晚起，是人本来就有的规律。"""
+
+    late_nights: list[int] = Field(default_factory=lambda: [4, 5])
+    """哪几天晚上睡得晚（0 是周一）。"""
+    sleep_shift_hours: float = 0.0
+    late_mornings: list[int] = Field(default_factory=lambda: [5, 6])
+    """哪几天早上起得晚。"""
+    wake_shift_hours: float = 0.0
 
 
 class DayVariant(BaseModel):
@@ -164,6 +177,7 @@ class RhythmConfig(BaseModel):
     """上课时段的默认活跃度（偷偷回一句的程度）。"""
     classes: list[ClassBlock] = Field(default_factory=list)
     variants: list[DayVariant] = Field(default_factory=list)
+    weekend: WeekendConfig = Field(default_factory=WeekendConfig)
     sleep_follow_weight: float = 0.8
     """起床时刻有多跟着昨晚的入睡走。0 是完全按生物钟，1 是完全跟着昨晚。
 
@@ -195,6 +209,12 @@ class TravelSpot(BaseModel):
     place: str
     timezone: str = ""
     note: str = ""
+    transit_hours: float = 0.0
+    """路上要多久（飞机加转机）。这段时间她不在线，去程和回程都算。
+
+    不写的话，出发那晚睡六个小时就在上海起床了——比十五个小时的航程还短，
+    而她前一天刚说过"明天回国"。
+    """
 
 
 class TravelConfig(BaseModel):
