@@ -397,6 +397,35 @@ async def test_on_a_holiday_she_usually_says_happy_holiday(harness: Harness) -> 
     assert await life.candidate_moments(PLAN, ordinary, "owner") == []
 
 
+async def test_a_chinese_holiday_is_not_a_day_off_for_her_in_america(harness: Harness) -> None:
+    """国庆那天她跟他说"放一天假"。她在波士顿，那天是周四，晚上还有课。
+
+    提示里只有一句"今天是国庆"，模型就顺着节日往下编。国内的节日得说清楚：
+    她人不在国内，这边照常；人在苏州的话才是当地的节日。圣诞、元旦美国也过，不补这句。
+    """
+    life = harness.life
+    persona = life.persona
+    sure = persona.proactive.model_copy(update={
+        "holiday": persona.proactive.holiday.model_copy(update={"probability": 1.0}),
+    })
+    life.persona = persona.model_copy(update={"proactive": sure})
+    national = date(2026, 10, 1)
+    assert life.rhythm.tz_for(national).key == "America/New_York"
+    assert "不放假" in (life.holiday_line(national) or "")
+    harness.clock.set(datetime.combine(national, datetime.min.time(), TZ).replace(hour=5))
+    (_, _, note), = await life._holiday_candidate(PLAN, national)
+    assert "国庆快乐" in note and "不放假" in note
+
+    christmas = date(2026, 12, 25)
+    assert "今天是圣诞" in (life.holiday_line(christmas) or "")
+    assert "不放假" not in (life.holiday_line(christmas) or "")
+
+    at_home = sure.holiday.model_copy(update={"home_timezones": [life.rhythm.tz_for(national).key]})
+    life.persona = persona.model_copy(update={"proactive": sure.model_copy(update={"holiday": at_home})})
+    assert life.holiday_line(national) == "今天是国庆。"
+    assert life.holiday_line(date(2026, 10, 2)) is None
+
+
 async def test_the_holiday_greeting_never_lands_after_midnight(harness: Harness) -> None:
     """节日那句只排在节日当天：她常常一点多才睡，过了零点就是第二天了。"""
     life = harness.life

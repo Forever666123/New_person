@@ -1090,9 +1090,9 @@ class App:
             mood.append("你这几天没什么心思聊天。")
         if heads_up := self.life.trip_heads_up(day):
             mood.append(heads_up)
-        if holiday := self.persona.holiday_on(day):
+        if holiday := self.life.holiday_line(day):
             # 放在易变层。他先来说话的话，她在回复里也知道今天是什么日子
-            mood.append(f"今天是{holiday.name}。")
+            mood.append(holiday)
 
         # 作息只知道有没有课，日程才知道她此刻具体在干什么。
         # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。

@@ -110,6 +110,25 @@ class LifeEngine:
         when = "明天" if days == 1 else f"{days} 天后"
         return f"你{when}（{trip.start.strftime('%m-%d')}）要去{trip.place}。聊到了可以顺口提一句，不用专门说。"
 
+    def holiday_line(self, day: date) -> str | None:
+        """今天是节日的话，她该知道的那一句。"""
+        holiday = self.persona.holiday_on(day)
+        if holiday is None:
+            return None
+        return " ".join(filter(None, (f"今天是{holiday.name}。", self.holiday_abroad(day))))
+
+    def holiday_abroad(self, day: date) -> str:
+        """国内的节日、她人又不在国内时，补一句"这边不放假"。
+
+        只说"今天是国庆"的话，模型会顺着节日往下编，跟他说自己放一天假——
+        她在波士顿，那天是周四，晚上还有课。
+        """
+        holiday = self.persona.holiday_on(day)
+        cfg = self.persona.proactive.holiday
+        if holiday is None or holiday.local or self.rhythm.tz_for(day).key in cfg.home_timezones:
+            return ""
+        return cfg.abroad_note.format(name=holiday.name)
+
     async def ensure_today_plan(self, conversation_id: str) -> DayPlan | None:
         """今天还没有日程就生成一个，顺便把主动消息的候选排上。
 
@@ -362,6 +381,8 @@ class LifeEngine:
         ):
             return []
         note = cfg.note.format(name=holiday.name, greeting=holiday.greeting or f"{holiday.name}快乐")
+        if abroad := self.holiday_abroad(day):
+            note = f"{note.rstrip()}\n{abroad}"
         shareable = [e for e in plan.events if e.shareable]
         return [(moment, kind, self._with_plan_hint(note, HOLIDAY, shareable))]
 

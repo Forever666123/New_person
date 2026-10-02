@@ -483,23 +483,24 @@ proactive:
       今天{name}。跟他说声{greeting}，再顺口说说你今天打算干嘛——照你今天的安排说，
       没什么安排就说没什么安排。说法每次不一样，一两句就够。别客套，别抒情，
       也不用问他怎么过。
+    # local: true 是美国这边也过的。没标的是国内的节日——她人在美国那天照常过，不放假
     days:
       - {date: 2026-10-01, name: 国庆, greeting: 国庆快乐}
-      - {date: 2026-12-25, name: 圣诞, greeting: 圣诞快乐}
-      - {date: 2027-01-01, name: 元旦, greeting: 新年快乐}
+      - {date: 2026-12-25, name: 圣诞, greeting: 圣诞快乐, local: true}
+      - {date: 2027-01-01, name: 元旦, greeting: 新年快乐, local: true}
       - {date: 2027-02-05, name: 除夕, greeting: 新年快乐}
       - {date: 2027-02-20, name: 元宵, greeting: 元宵快乐}
       - {date: 2027-06-09, name: 端午, greeting: 端午安康}
       - {date: 2027-09-15, name: 中秋, greeting: 中秋快乐}
       - {date: 2027-10-01, name: 国庆, greeting: 国庆快乐}
-      - {date: 2027-12-25, name: 圣诞, greeting: 圣诞快乐}
-      - {date: 2028-01-01, name: 元旦, greeting: 新年快乐}
+      - {date: 2027-12-25, name: 圣诞, greeting: 圣诞快乐, local: true}
+      - {date: 2028-01-01, name: 元旦, greeting: 新年快乐, local: true}
       - {date: 2028-01-25, name: 除夕, greeting: 新年快乐}
       - {date: 2028-02-09, name: 元宵, greeting: 元宵快乐}
       - {date: 2028-05-28, name: 端午, greeting: 端午安康}
       - {date: 2028-10-01, name: 国庆, greeting: 国庆快乐}
       - {date: 2028-10-03, name: 中秋, greeting: 中秋快乐}
-      - {date: 2028-12-25, name: 圣诞, greeting: 圣诞快乐}
+      - {date: 2028-12-25, name: 圣诞, greeting: 圣诞快乐, local: true}
 
   sign_off:
     enabled: true

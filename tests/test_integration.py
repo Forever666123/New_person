@@ -2789,6 +2789,21 @@ async def test_leave_notes_are_not_put_in_her_mouth(tmp_path: Path, persona: Per
     assert "没什么心思聊天" in situation
 
 
+async def test_on_national_day_she_knows_it_is_an_ordinary_day_for_her(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他先来说话时，她的上下文里也得知道国庆是国内的节日、这边不放假。
+
+    原来只有一句"今天是国庆"，她在回复里跟他说自己放一天假。
+    """
+    app, _channel, _llm, _clock, _memory = await build(tmp_path, persona, [])
+    national = datetime(2026, 10, 1, 15, 0, tzinfo=TZ)
+    situation = await app._build_situation(national)
+    assert "今天是国庆" in situation and "不放假" in situation
+    christmas = await app._build_situation(datetime(2026, 12, 25, 15, 0, tzinfo=TZ))
+    assert "今天是圣诞" in christmas and "不放假" not in christmas
+
+
 async def test_a_resumed_reply_quotes_the_right_message(tmp_path: Path, persona: Persona) -> None:
     """发到一半断了、重试接着发时，引用的还得是这一批里的那一条。
 

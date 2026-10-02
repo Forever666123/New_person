@@ -477,6 +477,12 @@ class Holiday(BaseModel):
     name: str
     greeting: str = ""
     """那天怎么说，比如"新年快乐"。不写就是"{name}快乐"。"""
+    local: bool = False
+    """美国这边也过的节日（圣诞、元旦）。
+
+    不标的就是国内的节日：她人在美国的话，那天照常上课，不放假。
+    当初只写了一句"今天是国庆"，她就跟他说自己放一天假。
+    """
 
 
 class HolidayConfig(BaseModel):
@@ -491,6 +497,21 @@ class HolidayConfig(BaseModel):
     """给模型的指示。{name} 和 {greeting} 会换成那天的。"""
     days: list[Holiday] = Field(default_factory=list)
     """农历节日每年日子不一样，一年一年写上。"""
+    home_timezones: list[str] = Field(default_factory=lambda: ["Asia/Shanghai"])
+    """国内的时区。她人在这些时区时，国内的节日才是当地的节日。"""
+    abroad_note: str = "{name}是国内的节日，你人不在国内，这边不放假，日子照你平常的过。"
+    """国内的节日、她人不在国内时补的一句。{name} 会换成那天的。"""
+
+    @field_validator("home_timezones")
+    @classmethod
+    def _check_tzs(cls, v: list[str]) -> list[str]:
+        # 写错一个字的话永远对不上，国内的节日她在苏州也会说"这边不放假"
+        for tz in v:
+            try:
+                ZoneInfo(tz)
+            except ZoneInfoNotFoundError as e:
+                raise ValueError(f"未知时区 {tz!r}") from e
+        return v
 
 
 class ProactiveConfig(BaseModel):
@@ -518,8 +539,8 @@ class ProactiveConfig(BaseModel):
     ledger_timed: LedgerTimedConfig = Field(default_factory=lambda: LedgerTimedConfig())
     """他说了时间的事，那之前不问。"""
     sign_off: SignOffConfig = Field(default_factory=lambda: SignOffConfig())
-    holiday: HolidayConfig = Field(default_factory=lambda: HolidayConfig())
     """睡前说一声再走。"""
+    holiday: HolidayConfig = Field(default_factory=lambda: HolidayConfig())
 
 
 # ---------------------------------------------------------------------------
