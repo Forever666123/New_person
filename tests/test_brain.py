@@ -882,7 +882,16 @@ def test_a_dated_model_id_is_priced_like_its_alias() -> None:
 
     assert price_of("claude-haiku-4-5-20251001") == PRICING_PER_MTOK["claude-haiku-4-5"]
     assert price_of("claude-sonnet-5") == PRICING_PER_MTOK["claude-sonnet-5"]
-    assert price_of("claude-sonnet-5-5") == (5.0, 25.0)
+    assert price_of("claude-sonnet-5-preview") == (5.0, 25.0)
+
+
+def test_the_current_models_are_priced_and_get_their_effort() -> None:
+    """换成新型号时，漏在表外不会报错：effort 悄悄没传、花费按高价估。"""
+    from newperson.brain import EFFORT_SUPPORTED, price_of
+
+    assert price_of("claude-sonnet-5-5") == (2.0, 10.0)
+    assert price_of("claude-opus-5-5") == (4.0, 20.0)
+    assert {"claude-sonnet-5-5", "claude-opus-5-5"} <= EFFORT_SUPPORTED
 
 
 async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(

@@ -50,8 +50,10 @@ log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 PRICING_PER_MTOK = {
+    "claude-opus-5-5": (4.0, 20.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-fable-5-1": (10.0, 50.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
@@ -75,7 +77,7 @@ def price_of(model: str) -> tuple[float, float]:
 
     表是按字符串精确查的，写成带日期的那种会落到默认价上，Haiku 被多估五倍，
     `!np status` 的花费和按钱算的判断都跟着偏。只认"别名 + 八位日期"这一种写法：
-    别的后缀（比如 -5-5）可能是另一个型号，价钱不一定一样，宁可按默认的高价算。
+    别的后缀（比如 -preview）可能是另一个型号，价钱不一定一样，宁可按默认的高价算。
     """
     if model in PRICING_PER_MTOK:
         return PRICING_PER_MTOK[model]
@@ -110,11 +112,13 @@ def _money_trouble(exc: Exception) -> str:
 EFFORT_SUPPORTED = {
     "claude-fable-5-1",
     "claude-fable-5",
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-opus-4-5",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
 }
@@ -122,6 +126,7 @@ EFFORT_SUPPORTED = {
 
 Haiku 4.5 和 Sonnet 4.5 不接受，传了会直接 400。
 不认识的模型一律不传，宁可少一个参数也别让她连不上。
+新出的型号要记得加进来：漏了不会报错，只是 effort 没传上去，按接口的默认档走。
 """
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
