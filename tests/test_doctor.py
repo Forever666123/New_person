@@ -268,6 +268,23 @@ def test_an_api_error_carrying_model_output_is_not_printed(tmp_path: Path) -> No
     assert "input_value" not in text
 
 
+def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path) -> None:
+    """整理记忆时被拒、跳过的消息，那几条里的事她记不住，体检要说一声。
+
+    只报窗口里的：半年前跳过的一条不该让每周的体检永远挂着这句。
+    """
+    path = make_db(tmp_path / "skip.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES ('memory_skipped', ?)",
+        ((NOW - timedelta(days=2)).isoformat(timespec="seconds") + "\t3",),
+    )
+    conn.commit()
+    conn.close()
+    assert "3 条消息被模型拒了" in doctor.run(path, NOW, days=14).render()
+    assert "被模型拒了" not in doctor.run(path, NOW + timedelta(days=30), days=14).render()
+
+
 def test_a_short_api_error_still_hides_the_quoted_part(tmp_path: Path) -> None:
     """短的那种更危险：截断根本救不了它。
 

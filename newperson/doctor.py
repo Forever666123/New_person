@@ -622,7 +622,12 @@ def check_deliverable(report: Report, conn: sqlite3.Connection) -> None:
         )
 
 
-def check_memory(report: Report, conn: sqlite3.Connection, summarize_after: int = 60) -> None:
+def check_memory(
+    report: Report,
+    conn: sqlite3.Connection,
+    summarize_after: int = 60,
+    since: datetime | None = None,
+) -> None:
     """记忆和台账的规模，顺便看看有没有只进不出。"""
     rows = _rows(conn, "SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")
     messages = rows[0]["n"] if rows else 0
@@ -647,6 +652,21 @@ def check_memory(report: Report, conn: sqlite3.Connection, summarize_after: int 
         )
     else:
         report.add(OK, line)
+
+    # 整理记忆时两个模型都不肯碰的消息会被跳过：那几条里的事她不会记住。
+    # 只读条数和时间，不读是哪几条
+    rows = _rows(conn, "SELECT value FROM kv WHERE key = 'memory_skipped'")
+    if rows:
+        stamp, _, count = str(rows[0]["value"]).partition("\t")
+        when = _parse(stamp)
+        if when is not None and (since is None or when >= since):
+            report.add(
+                WARN,
+                f"整理记忆时有 {count or '?'} 条消息被模型拒了，跳过了"
+                f"（最近一次 {when.date().isoformat()}）",
+                "那几条里说的事她不会记进长期记忆。偶尔一两条正常；一直涨的话，"
+                "多半是整理用的模型对你们的聊天太敏感，可以把 NEWPERSON_UTILITY_MODEL 换掉。",
+            )
 
     rows = _rows(
         conn,
@@ -714,7 +734,7 @@ def run(
         ("沉默比例", lambda: check_silence(report, conn, since)),
         ("主动开口", lambda: check_proactive(report, conn, since, max_per_day, kinds_known)),
         ("事情挤不挤", lambda: check_bursts(report, conn, since)),
-        ("记忆和台账", lambda: check_memory(report, conn, summarize_after)),
+        ("记忆和台账", lambda: check_memory(report, conn, summarize_after, since)),
     ]
     try:
         for name, check in checks:

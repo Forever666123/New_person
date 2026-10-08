@@ -67,7 +67,8 @@ CACHE_READ_FRACTION = {
 }
 """缓存命中按输入价的几成算，没列的都是一成。
 
-5.5 这一代降了。她的输入大半是缓存命中，一律按一成算的话 Sonnet 5.5 这部分多估一倍。
+5.5 这一代降了。一律按一成算的话，Sonnet 5.5 命中缓存的那部分多估一倍——
+不过她多数回复隔得久、缓存已经过期，付的是写缓存的钱，总数偏得没那么多。
 """
 
 LONG_PROMPT_TIER = {"claude-haiku-5-5": (100_000, 5.0)}
@@ -300,6 +301,8 @@ class Brain:
     ) -> None:
         self._last_status: int | None = None
         """上一次调用接口回的错误码（400、413……）。没出错或者不是这类错误就是 None。"""
+        self.last_refused = False
+        """上一次调用是不是被模型拒了。拒绝跟断网不一样：同样的内容再发，多半还是拒。"""
         self.client = client
         self.settings = settings
         self.persona = persona
@@ -384,6 +387,7 @@ class Brain:
     ) -> T | None:
         """调一次模型。任何失败都返回 None，让上层当作"没看手机"。"""
         self._last_status = None
+        self.last_refused = False
         if await self._over_budget(today):
             return None
 
@@ -442,6 +446,7 @@ class Brain:
         if getattr(response, "stop_reason", None) == "refusal":
             log.warning("[brain] %s 被拒了，这次就当没回", purpose)
             await self._note_error("模型拒绝回答")
+            self.last_refused = True
             return None
 
         parsed = getattr(response, "parsed_output", None)
@@ -715,9 +720,7 @@ class Brain:
             yesterday=req.yesterday,
             summary=req.summary,
         )
-        return await self._call(
-            DayPlan, prompt, purpose="day_plan", today=today, model=self.settings.utility_model
-        )
+        return await self._utility(DayPlan, prompt, purpose="day_plan", today=today)
 
     async def update_memory(self, req: MemoryUpdateRequest, today: date) -> MemoryUpdate | None:
         prompt = build_memory_update_user(
@@ -727,9 +730,24 @@ class Brain:
             existing_owner_facts=req.existing_owner_facts,
             existing_self_facts=req.existing_self_facts,
         )
-        return await self._call(
-            MemoryUpdate, prompt, purpose="memory", today=today, model=self.settings.utility_model
+        return await self._utility(MemoryUpdate, prompt, purpose="memory", today=today)
+
+    async def _utility(
+        self, output_format: type[T], prompt: str, *, purpose: str, today: date
+    ) -> T | None:
+        """打杂的调用。小模型拒了，换主模型再试一次。
+
+        Haiku 5.5 带安全分类器，4.5 没有。整理记忆时喂进去的是你们的聊天，
+        一句亲昵话就可能被它拒掉；两个模型的分类器不一样，换一个多半就过了。
+        只在"拒"的时候换：断网、限流换了模型也一样，白花一次调用。
+        """
+        got = await self._call(
+            output_format, prompt, purpose=purpose, today=today, model=self.settings.utility_model
         )
+        if got is None and self.last_refused and self.settings.utility_model != self.settings.model:
+            log.warning("[brain] %s 被 %s 拒了，换主模型再试", purpose, self.settings.utility_model)
+            got = await self._call(output_format, prompt, purpose=purpose, today=today)
+        return got
 
 
 def build_client(settings: Settings) -> anthropic.AsyncAnthropic:

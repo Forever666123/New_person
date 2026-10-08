@@ -2125,6 +2125,104 @@ async def test_a_failing_memory_update_does_not_burn_the_daily_budget(
     assert len(jobs) <= 2, f"排了 {len(jobs)} 个注定失败的整理任务，每个烧三次调用"
 
 
+class _RefusesSome:
+    """整理记忆时，碰上带某句话的那一批就拒（两个模型都拒），别的照常整理。"""
+
+    def __init__(self, inner, refused_word: str) -> None:
+        self._inner = inner
+        self._word = refused_word
+        self.last_refused = False
+        self.seen: set[int] = set()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def update_memory(self, request, _day):
+        from newperson.models import MemoryUpdate
+
+        self.last_refused = any(self._word in m.content for m in request.messages)
+        if self.last_refused:
+            return None
+        self.seen.update(m.id for m in request.messages)
+        return MemoryUpdate(summary=f"整理过 {len(self.seen)} 条")
+
+    async def over_budget(self, _day):
+        return False
+
+
+async def _say_many(memory: Memory, count: int, bad: set[int], word: str) -> list[int]:
+    ids = []
+    for i in range(count):
+        ids.append(
+            await memory.add_user_message(
+                IncomingMessage(
+                    conversation_id=CONVERSATION_ID,
+                    discord_message_id=8000 + i,
+                    author_id=42,
+                    author_name="Leo",
+                    content=word if i in bad else f"第{i}句",
+                    created_at=EVENING + timedelta(minutes=i),
+                )
+            )
+        )
+    return ids
+
+
+async def test_a_refused_memory_batch_skips_only_the_message_it_refuses(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """Haiku 5.5 带安全分类器。同一批被拒，原来从同一个游标反复重来，游标永远不动：
+
+    从那天起她什么新事都记不住，status 上的"模型拒绝回答"下一次回复成功就被清掉。
+    现在对半切下去，只跳过拒的那一条，前后的照常整理。
+    """
+    from newperson.discord_bot import MEMORY_BATCH_KEY, MEMORY_SKIPPED_KEY
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    brain = _RefusesSome(app.brain, "那句话")
+    app.brain = brain
+    ids = await _say_many(memory, 70, {37}, "那句话")
+
+    await app._maybe_summarize()
+    await drain(app, clock, hops=80)
+
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id >= ids[37]
+    assert ids[37] not in brain.seen
+    assert set(ids[:37]) <= brain.seen
+    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t1")
+    assert await memory.kv_get(MEMORY_BATCH_KEY) is None
+    assert await memory.failed_jobs(CONVERSATION_ID) == []
+
+
+async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, persona: Persona) -> None:
+    """要是条条都拒，挨条切、挨条跳会把每天的调用额度烧光，她白天就不回话了。
+
+    一天只跳一条，第二条照常失败（体检会叫），第二天再接着跳。
+    """
+    from newperson.discord_bot import MEMORY_SKIPPED_KEY
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    brain = _RefusesSome(app.brain, "那句话")
+    app.brain = brain
+    ids = await _say_many(memory, 80, {10, 30}, "那句话")
+
+    await app._maybe_summarize()
+    await drain(app, clock, hops=120)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert ids[10] <= conv.summary_upto_message_id < ids[30]
+    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t1")
+    assert await memory.failed_jobs(CONVERSATION_ID)
+
+    clock.set(clock.now() + timedelta(days=1))
+    await app._maybe_summarize()
+    await drain(app, clock, hops=120)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id >= ids[30]
+    assert ids[30] not in brain.seen and set(ids[11:30]) <= brain.seen
+    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t2")
+
+
 async def test_a_reminder_that_fires_after_he_has_spoken_knows_it_may_be_stale(
     tmp_path: Path, persona: Persona
 ) -> None:

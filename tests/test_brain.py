@@ -303,6 +303,42 @@ async def test_a_refusal_is_treated_as_no_reply(
     assert await brain.generate_reply(reply_request(), TODAY) is None
 
 
+async def test_a_refused_chore_is_retried_once_on_the_main_model(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """Haiku 5.5 带安全分类器，整理记忆时一句亲昵话就可能被拒。拒了换主模型再试一次。
+
+    只在"拒"的时候换：断网、限流换了模型也一样，白花一次调用。
+    """
+    from newperson.brain import MemoryUpdateRequest
+    from newperson.models import MemoryUpdate
+
+    class HaikuRefuses(FakeMessages):
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["model"] == "claude-haiku-5-5":
+                return SimpleNamespace(parsed_output=None, usage=usage(), stop_reason="refusal")
+            return SimpleNamespace(
+                parsed_output=MemoryUpdate(summary="整理好了"), usage=usage(), stop_reason="end_turn"
+            )
+
+    request = MemoryUpdateRequest(
+        previous_summary="", messages=[], existing_owner_facts=[], existing_self_facts=[]
+    )
+    chosen = settings(tmp_path, model="claude-sonnet-5-5", utility_model_override="claude-haiku-5-5")
+    client = SimpleNamespace(messages=HaikuRefuses([]))
+    brain = Brain(client, chosen, persona, memory)
+    got = await brain.update_memory(request, TODAY)
+    assert got is not None and got.summary == "整理好了"
+    assert [c["model"] for c in client.messages.calls] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+
+    error = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
+    flaky = fake_client(error)
+    brain = Brain(flaky, chosen, persona, memory)
+    assert await brain.update_memory(request, TODAY) is None
+    assert len(flaky.messages.calls) == 1 and not brain.last_refused
+
+
 async def test_the_last_error_is_recorded_for_the_owner(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:
@@ -908,6 +944,11 @@ def test_the_cost_follows_each_models_cache_and_length_pricing() -> None:
     assert cost_of("claude-sonnet-5", 0, million, 0, 0) == pytest.approx(0.20)
     assert cost_of("claude-haiku-5-5", 0, 0, 0, million) == pytest.approx(0.50)
     assert cost_of("claude-haiku-5-5", 100_001, 0, 0, million) == pytest.approx(2.50 + 0.05)
+    # 门槛是"超过"十万，正好十万还按低档；缓存读写也算进提示长度
+    assert cost_of("claude-haiku-5-5", 100_000, 0, 0, 0) == pytest.approx(0.01)
+    assert cost_of("claude-haiku-5-5", 50_000, 60_000, 0, 0) == pytest.approx(
+        (50_000 * 0.50 + 60_000 * 0.05) / million
+    )
     assert cost_of("claude-haiku-4-5", 200_000, 0, million, 0) == pytest.approx(0.20 + 1.25)
 
 

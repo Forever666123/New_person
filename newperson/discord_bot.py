@@ -51,6 +51,7 @@ from .models import (
     ProactivePlan,
     ResolvedPhoto,
     RhythmSnapshot,
+    StoredMessage,
     TimeOfDay,
 )
 from .persona import Persona
@@ -97,6 +98,18 @@ def _owner_pushed_just_now(job: Job, now: datetime) -> bool:
 
 MEMORY_RETRY_BACKOFF = timedelta(hours=6)
 """记忆整理失败之后隔这么久才再试。见 _maybe_summarize 为什么不能不退避。"""
+
+MEMORY_BATCH = 200
+"""一趟记忆整理最多看多少条。"""
+
+MEMORY_BATCH_KEY = "memory_batch_limit"
+"""被拒之后缩小了的那一趟有多大。没有这条就是 MEMORY_BATCH。"""
+
+MEMORY_SKIP_DAY_KEY = "memory_skip_day"
+"""上一次因为被拒而跳过消息是她那边的哪一天。一天只跳一条。"""
+
+MEMORY_SKIPPED_KEY = "memory_skipped"
+"""被拒跳过的消息：`时间戳\t累计条数`。体检读它，只有数字，没有内容。"""
 
 CATCHUP_SEEN = "catchup_channels"
 """见过的入口频道 id，逗号分隔。用来在开始翻之前就把每个入口的基线钉住。"""
@@ -1558,6 +1571,58 @@ class App:
             await self.memory.update_conversation(CONVERSATION_ID, unanswered_initiations=0)
         await self._maybe_summarize()
 
+    async def _memory_batch_limit(self) -> int:
+        raw = await self.memory.kv_get(MEMORY_BATCH_KEY)
+        try:
+            return max(1, min(int(raw or MEMORY_BATCH), MEMORY_BATCH))
+        except ValueError:
+            return MEMORY_BATCH
+
+    async def _route_around_refusal(self, messages: list[StoredMessage], now: datetime) -> bool:
+        """这一批整理被模型拒了（换了主模型也拒）：对半切，最后只跳过拒的那一条。
+
+        Haiku 5.5 带安全分类器，4.5 没有。同一批再发多半还是拒，原来抛错、
+        六小时后从同一个游标重来，游标永远不动——从那天起她什么新事都记不住，
+        而 status 上那行"模型拒绝回答"下一次回复成功就被清掉了。
+
+        **一天只跳一条。** 要是每条都拒（多半是摘要或旧事实本身触发的），
+        挨条切、挨条跳会把每天的调用额度烧光，她白天就不回话了。
+        那种情况照常失败，交给体检的"任务重试到放弃了"去叫。
+        返回 True 表示已经安排好了，不用再按失败处理。
+        """
+        today = self.rhythm.local_date(now).isoformat()
+        if await self.memory.kv_get(MEMORY_SKIP_DAY_KEY) == today:
+            return False
+        if len(messages) > 1:
+            half = len(messages) // 2
+            await self.memory.kv_set(MEMORY_BATCH_KEY, str(half))
+            log.warning("[memory] 这 %d 条被拒了，先整理前 %d 条", len(messages), half)
+            await self.scheduler.schedule(
+                "memory_update",
+                later(now, timedelta(seconds=30)),
+                conversation_id=CONVERSATION_ID,
+                reason="被拒了，缩小一半再整理",
+            )
+            return True
+
+        # 只剩一条还被拒：跳过它。摘要不动，这一条不记事实，游标越过去
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        await self.memory.update_conversation(
+            CONVERSATION_ID,
+            summary=conv.summary,
+            summary_upto_message_id=messages[-1].id,
+        )
+        await self.memory.kv_delete(MEMORY_BATCH_KEY)
+        await self.memory.kv_set(MEMORY_SKIP_DAY_KEY, today)
+        _, _, count = (await self.memory.kv_get(MEMORY_SKIPPED_KEY) or "").partition("\t")
+        total = (int(count) if count.isdigit() else 0) + 1
+        await self.memory.kv_set(
+            MEMORY_SKIPPED_KEY, f"{now.isoformat(timespec='seconds')}\t{total}"
+        )
+        log.warning("[memory] 有一条消息两个模型都不肯整理，跳过它（累计 %d 条）", total)
+        await self._maybe_summarize()
+        return True
+
     async def _maybe_summarize(self) -> None:
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         pending = await self.memory.count_messages_after(
@@ -2105,8 +2170,9 @@ class App:
         #
         # 够得着这条路的场景很常规：她几天没能回话（长时间停机、私聊被挡、
         # 请假），重连时补抓一次最多灌进来一千条。
+        limit = await self._memory_batch_limit()
         messages = await self.memory.messages_after(
-            CONVERSATION_ID, conv.summary_upto_message_id, 200
+            CONVERSATION_ID, conv.summary_upto_message_id, limit
         )
         if not messages:
             return
@@ -2126,12 +2192,17 @@ class App:
             ),
             self.rhythm.local_date(now),
         )
+        # 紧跟着取，中间不能有 await：回复任务也在用同一个 brain，
+        # 让出去一下它就可能把这个标记改成它自己那次的结果
+        refused = self.brain.last_refused
         if update is None:
             if await self.brain.over_budget(self.rhythm.local_date(now)):
                 # 和回复那条路对齐：额度用完不是故障，别拿三次重试把它烧掉。
                 # 原来一律 raise，于是额度一紧就三次全废，任务变 failed——
                 # 而下面那道闸看不见 failed，每回一条消息就再排一个、再烧三次。
                 await self._defer_to_tomorrow(job, now, "今天的模型额度用完了")
+                return
+            if refused and await self._route_around_refusal(messages, now):
                 return
             raise RuntimeError("记忆整理失败")
 
@@ -2140,6 +2211,22 @@ class App:
             summary=update.summary,
             summary_upto_message_id=messages[-1].id,
         )
+        if limit < MEMORY_BATCH:
+            # 缩小过的那一趟过了，下一趟放大一倍。不一下子回到两百：
+            # 拒的那一条多半就在后面，一步跳回去又得从头对半切
+            grown = min(limit * 2, MEMORY_BATCH)
+            if grown == MEMORY_BATCH:
+                await self.memory.kv_delete(MEMORY_BATCH_KEY)
+            else:
+                await self.memory.kv_set(MEMORY_BATCH_KEY, str(grown))
+            # 接着找拒的那一条，别等攒够下一个阈值：触发这次整理的那一批还没整理完
+            if await self.memory.count_messages_after(CONVERSATION_ID, messages[-1].id):
+                await self.scheduler.schedule(
+                    "memory_update",
+                    later(now, timedelta(seconds=30)),
+                    conversation_id=CONVERSATION_ID,
+                    reason="被拒的那一批还没整理完",
+                )
         await self.memory.add_facts("owner", update.owner_facts, now)
         await self.memory.add_facts("self", update.self_facts, now)
         log.info(
