@@ -331,12 +331,64 @@ async def test_a_refused_chore_is_retried_once_on_the_main_model(
     got = await brain.update_memory(request, TODAY)
     assert got is not None and got.summary == "整理好了"
     assert [c["model"] for c in client.messages.calls] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+    # 主模型接住之后"模型拒绝回答"被清掉了，另记一笔，体检才看得见打杂模型在拒
+    assert len((await memory.kv_get("utility_refused") or "").split(",")) == 1
 
     error = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
     flaky = fake_client(error)
     brain = Brain(flaky, chosen, persona, memory)
     assert await brain.update_memory(request, TODAY) is None
     assert len(flaky.messages.calls) == 1 and not brain.last_refused
+
+
+async def test_a_refusal_halfway_through_is_still_a_refusal(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """分类器可能在模型写到一半时才拒：内容是半截 JSON，SDK 解析时先抛了校验错误，
+
+    我们看不到 stop_reason。原来这被当成"格式不对"，不换模型、也不缩小那一批，
+    记忆照样卡在原地。半截的按被拒处理；完整但字段不对的才是真的格式错，不换。
+    """
+    import pydantic
+
+    from newperson.brain import MemoryUpdateRequest
+    from newperson.models import MemoryUpdate
+
+    def invalid(text: str) -> pydantic.ValidationError:
+        try:
+            pydantic.TypeAdapter(MemoryUpdate).validate_json(text)
+        except pydantic.ValidationError as exc:
+            return exc
+        raise AssertionError(text)
+
+    class HaikuStops(FakeMessages):
+        def __init__(self, haiku_says: str) -> None:
+            super().__init__([])
+            self.haiku_says = haiku_says
+
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["model"] == "claude-haiku-5-5":
+                raise invalid(self.haiku_says)
+            return SimpleNamespace(
+                parsed_output=MemoryUpdate(summary="整理好了"), usage=usage(), stop_reason="end_turn"
+            )
+
+    request = MemoryUpdateRequest(
+        previous_summary="", messages=[], existing_owner_facts=[], existing_self_facts=[]
+    )
+    chosen = settings(tmp_path, model="claude-sonnet-5-5", utility_model_override="claude-haiku-5-5")
+
+    halfway = HaikuStops('{"summary": "他们昨晚')
+    brain = Brain(SimpleNamespace(messages=halfway), chosen, persona, memory)
+    assert await brain.update_memory(request, TODAY) is not None
+    assert [c["model"] for c in halfway.calls] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+
+    wrong_shape = HaikuStops('{"notes": 1}')
+    brain = Brain(SimpleNamespace(messages=wrong_shape), chosen, persona, memory)
+    assert await brain.update_memory(request, TODAY) is None
+    assert [c["model"] for c in wrong_shape.calls] == ["claude-haiku-5-5"]
+    assert not brain.last_refused
 
 
 async def test_the_last_error_is_recorded_for_the_owner(

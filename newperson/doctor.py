@@ -622,6 +622,15 @@ def check_deliverable(report: Report, conn: sqlite3.Connection) -> None:
         )
 
 
+def _stamps_since(conn: sqlite3.Connection, key: str, since: datetime | None) -> list[datetime]:
+    """kv 里逗号分隔的时间戳，落在窗口里的那些，从早到晚。认不出的跳过。"""
+    rows = _rows(conn, "SELECT value FROM kv WHERE key = ?", (key,))
+    if not rows:
+        return []
+    found = [_parse(x.strip()) for x in str(rows[0]["value"]).split(",")]
+    return sorted(t for t in found if t is not None and (since is None or t >= since))
+
+
 def check_memory(
     report: Report,
     conn: sqlite3.Connection,
@@ -653,20 +662,29 @@ def check_memory(
     else:
         report.add(OK, line)
 
-    # 整理记忆时两个模型都不肯碰的消息会被跳过：那几条里的事她不会记住。
-    # 只读条数和时间，不读是哪几条
-    rows = _rows(conn, "SELECT value FROM kv WHERE key = 'memory_skipped'")
-    if rows:
-        stamp, _, count = str(rows[0]["value"]).partition("\t")
-        when = _parse(stamp)
-        if when is not None and (since is None or when >= since):
-            report.add(
-                WARN,
-                f"整理记忆时有 {count or '?'} 条消息被模型拒了，跳过了"
-                f"（最近一次 {when.date().isoformat()}）",
-                "那几条里说的事她不会记进长期记忆。偶尔一两条正常；一直涨的话，"
-                "多半是整理用的模型对你们的聊天太敏感，可以把 NEWPERSON_UTILITY_MODEL 换掉。",
-            )
+    # 整理记忆时被拒的几种情况。只读次数和时间，不读是哪几条
+    back = "可以先把 .env 里的 NEWPERSON_UTILITY_MODEL 换回 claude-haiku-4-5（它没有这层过滤）再重启。"
+    skipped = _stamps_since(conn, "memory_skipped", since)
+    if skipped:
+        report.add(
+            WARN,
+            f"整理记忆时有 {len(skipped)} 条消息被模型拒了，跳过了（最近一次 {skipped[-1].date().isoformat()}）",
+            "那几条里说的事她不会记进长期记忆。偶尔一两条正常；一直涨的话，" + back,
+        )
+    context = _stamps_since(conn, "memory_context_refused", since)
+    if context:
+        report.add(
+            WARN,
+            f"整理记忆整个被拒（{context[-1].date().isoformat()}）：不带新消息也拒",
+            "拒的是她记着的摘要或某条旧事，不是哪句新话。她暂时记不住新的事。" + back,
+        )
+    fallbacks = _stamps_since(conn, "utility_refused", since)
+    if fallbacks:
+        report.add(
+            WARN,
+            f"打杂的模型被拒了 {len(fallbacks)} 次，都换主模型做成了",
+            "每次多花一次主模型的调用。次数多的话，" + back,
+        )
 
     rows = _rows(
         conn,

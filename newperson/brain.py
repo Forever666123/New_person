@@ -134,6 +134,9 @@ def _money_trouble(exc: Exception) -> str:
     return ""
 
 
+UTILITY_REFUSED_KEY = "utility_refused"
+"""打杂模型被拒、换主模型才做成的那几次的时间。体检数它。"""
+
 EFFORT_SUPPORTED = {
     "claude-fable-5-1",
     "claude-fable-5",
@@ -302,7 +305,10 @@ class Brain:
         self._last_status: int | None = None
         """上一次调用接口回的错误码（400、413……）。没出错或者不是这类错误就是 None。"""
         self.last_refused = False
-        """上一次调用是不是被模型拒了。拒绝跟断网不一样：同样的内容再发，多半还是拒。"""
+        """上一次调用是不是被模型拒了（或者话说到一半断了）。
+
+        跟断网不一样：同样的内容再发，多半还是这样。
+        """
         self.client = client
         self.settings = settings
         self.persona = persona
@@ -427,10 +433,18 @@ class Brain:
         except pydantic.ValidationError as exc:
             # 接口已经回了、也计了费，是 SDK 解析它的输出时不认。
             # 原来落到下面的兜底里，用量一条不记，日限额看不见这几次调用。
+            #
+            # **拒绝也可能发生在说到一半。** 那时内容是半截 JSON，SDK 先解析、先抛了这个，
+            # 我们根本看不到 stop_reason。半截的（json_invalid）就按被拒处理：
+            # 话没说完，同样的内容再发多半还是这样；换个模型、缩小一批也正是对的办法。
+            cut_short = any(e.get("type") == "json_invalid" for e in exc.errors())
             log.warning("[brain] %s 的输出不合格式：%s", purpose, exc)
-            await self._note_error("返回的内容不合格式")
+            await self._note_error(
+                "模型话说到一半停了（多半是被拒）" if cut_short else "返回的内容不合格式"
+            )
             if self.memory is not None:
                 await self.memory.record_usage(today)
+            self.last_refused = cut_short
             return None
         except anthropic.APIConnectionError as exc:
             log.warning("[brain] %s 连不上：%s", purpose, exc)
@@ -457,7 +471,7 @@ class Brain:
         # 走到这里说明接口是通的，把旧的报错清掉——
         # 不清的话三周前的一次抖动会一直挂在 status 上，
         # 和"此刻密钥失效了"长得一模一样。
-        await self._clear_error()
+        await self.clear_error()
         return parsed
 
     async def _note_error(self, detail: str) -> None:
@@ -467,11 +481,14 @@ class Brain:
         你分不出它是三周前的一次网络抖动，还是刚刚密钥失效了。
         """
         if self.memory is not None:
-            now = self.clock.now() if self.clock else datetime.now(UTC)
-            stamp = now.isoformat(timespec="seconds")
+            stamp = self._now().isoformat(timespec="seconds")
             await self.memory.kv_set("last_api_error", f"{stamp}\t{detail}")
 
-    async def _clear_error(self) -> None:
+    def _now(self) -> datetime:
+        return self.clock.now() if self.clock else datetime.now(UTC)
+
+    async def clear_error(self) -> None:
+        """出过的错已经被处理掉了（比如被拒的那条已经跳过），别让它挂在 status 和体检上。"""
         if self.memory is not None:
             await self.memory.kv_delete("last_api_error")
 
@@ -747,6 +764,10 @@ class Brain:
         if got is None and self.last_refused and self.settings.utility_model != self.settings.model:
             log.warning("[brain] %s 被 %s 拒了，换主模型再试", purpose, self.settings.utility_model)
             got = await self._call(output_format, prompt, purpose=purpose, today=today)
+            if got is not None and self.memory is not None:
+                # 主模型接住了，_call 会把"模型拒绝回答"清掉。不另记一笔的话，
+                # 打杂模型天天拒、每次多花一次主模型的钱，哪儿都看不出来
+                await self.memory.kv_push_stamp(UTILITY_REFUSED_KEY, self._now())
         return got
 
 

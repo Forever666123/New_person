@@ -2133,6 +2133,7 @@ class _RefusesSome:
         self._word = refused_word
         self.last_refused = False
         self.seen: set[int] = set()
+        self.sizes: list[int] = []
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -2140,7 +2141,10 @@ class _RefusesSome:
     async def update_memory(self, request, _day):
         from newperson.models import MemoryUpdate
 
-        self.last_refused = any(self._word in m.content for m in request.messages)
+        self.sizes.append(len(request.messages))
+        self.last_refused = any(
+            self._word in m.content for m in request.messages
+        ) or self._word in request.previous_summary
         if self.last_refused:
             return None
         self.seen.update(m.id for m in request.messages)
@@ -2182,6 +2186,7 @@ async def test_a_refused_memory_batch_skips_only_the_message_it_refuses(
     brain = _RefusesSome(app.brain, "那句话")
     app.brain = brain
     ids = await _say_many(memory, 70, {37}, "那句话")
+    await memory.kv_set("last_api_error", "2026-10-08T01:00:00+00:00\t模型拒绝回答")
 
     await app._maybe_summarize()
     await drain(app, clock, hops=80)
@@ -2190,9 +2195,13 @@ async def test_a_refused_memory_batch_skips_only_the_message_it_refuses(
     assert conv.summary_upto_message_id >= ids[37]
     assert ids[37] not in brain.seen
     assert set(ids[:37]) <= brain.seen
-    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t1")
+    # 对半切；过了的那一半之后放大一倍；剩一条时先不带它问一次（那个 0），确认拒的是它
+    assert brain.sizes == [70, 35, 35, 17, 8, 4, 2, 4, 2, 1, 0]
+    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 1
     assert await memory.kv_get(MEMORY_BATCH_KEY) is None
     assert await memory.failed_jobs(CONVERSATION_ID) == []
+    # 拒绝已经处理掉了，别让六小时内的体检当成接口坏了
+    assert await memory.kv_get("last_api_error") is None
 
 
 async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, persona: Persona) -> None:
@@ -2211,7 +2220,7 @@ async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, perso
     await drain(app, clock, hops=120)
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert ids[10] <= conv.summary_upto_message_id < ids[30]
-    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t1")
+    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 1
     assert await memory.failed_jobs(CONVERSATION_ID)
 
     clock.set(clock.now() + timedelta(days=1))
@@ -2220,7 +2229,79 @@ async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, perso
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert conv.summary_upto_message_id >= ids[30]
     assert ids[30] not in brain.seen and set(ids[11:30]) <= brain.seen
-    assert (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").endswith("\t2")
+    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 2
+
+
+async def test_a_refused_summary_does_not_get_an_innocent_message_skipped(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """拒的要是她记着的摘要，不管带几条消息都拒，对半切到底总落在游标前头那条上。
+
+    原来就这样每天冤枉跳掉一条，记忆还是一步不前。现在剩一条时先不带它问一次：
+    这样也拒，就是摘要的事，一条都不跳，一周之内也不再切。
+    """
+    from newperson.discord_bot import (
+        MEMORY_BATCH_KEY,
+        MEMORY_CONTEXT_REFUSED_KEY,
+        MEMORY_SKIPPED_KEY,
+    )
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    brain = _RefusesSome(app.brain, "那句话")
+    app.brain = brain
+    await memory.update_conversation(CONVERSATION_ID, summary="他们聊过那句话")
+    await _say_many(memory, 70, set(), "那句话")
+
+    await app._maybe_summarize()
+    await drain(app, clock, hops=80)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id == 0
+    assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
+    assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
+    assert await memory.kv_get(MEMORY_BATCH_KEY) is None
+
+    # 第二天：认出是摘要的事之后不再对半切，每次都是整批，照常失败
+    clock.set(clock.now() + timedelta(days=1))
+    brain.sizes.clear()
+    await app._maybe_summarize()
+    await drain(app, clock, hops=80)
+    assert brain.sizes and set(brain.sizes) == {70}
+    assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
+
+
+async def test_a_network_failure_never_skips_a_message(tmp_path: Path, persona: Persona) -> None:
+    """只有"被拒"才切、才跳。断网时游标不动，一条都不能丢。
+
+    标记是 brain 上共用的：要是上一次回复被拒留下的 True 没清掉，
+    一次网络抖动就会被当成拒绝，切到最后跳掉一条好好的消息。
+    """
+    import anthropic
+    import httpx2 as httpx
+
+    from newperson.discord_bot import (
+        MEMORY_BATCH_KEY,
+        MEMORY_CONTEXT_REFUSED_KEY,
+        MEMORY_SKIPPED_KEY,
+    )
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+
+    class Offline:
+        async def parse(self, **_kwargs):
+            raise anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
+
+    app.brain.client = SimpleNamespace(messages=Offline())
+    app.brain.last_refused = True  # 上一次回复被拒留下的
+    await _say_many(memory, 70, set(), "那句话")
+
+    await app._maybe_summarize()
+    await drain(app, clock, hops=40)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id == 0
+    assert await memory.kv_get(MEMORY_BATCH_KEY) is None
+    assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
+    assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY) is None
+    assert await memory.failed_jobs(CONVERSATION_ID)
 
 
 async def test_a_reminder_that_fires_after_he_has_spoken_knows_it_may_be_stale(

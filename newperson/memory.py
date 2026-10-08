@@ -1360,6 +1360,16 @@ class Memory:
         await self.db.execute("DELETE FROM kv WHERE key = ?", (key,))
         await self.db.commit()
 
+    async def kv_push_stamp(self, key: str, when: datetime, keep: int = 50) -> None:
+        """在一条 kv 里记一次"这件事发生了"，逗号分隔的时间戳，只留最近 keep 个。
+
+        记的是每一次的时间而不是累计数：体检按窗口数，累计数会把半年前的
+        几次算进"最近两周"。只有时间，没有内容。
+        """
+        stamps = [x for x in (await self.kv_get(key) or "").split(",") if x]
+        stamps.append(when.isoformat(timespec="seconds"))
+        await self.kv_set(key, ",".join(stamps[-keep:]))
+
     # ---- 内部 -------------------------------------------------------------
 
     async def _fetch_one(self, sql: str, args: tuple[Any, ...]) -> aiosqlite.Row | None:

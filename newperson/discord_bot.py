@@ -21,6 +21,7 @@ import logging
 import random
 import signal
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,7 +52,6 @@ from .models import (
     ProactivePlan,
     ResolvedPhoto,
     RhythmSnapshot,
-    StoredMessage,
     TimeOfDay,
 )
 from .persona import Persona
@@ -109,7 +109,13 @@ MEMORY_SKIP_DAY_KEY = "memory_skip_day"
 """上一次因为被拒而跳过消息是她那边的哪一天。一天只跳一条。"""
 
 MEMORY_SKIPPED_KEY = "memory_skipped"
-"""被拒跳过的消息：`时间戳\t累计条数`。体检读它，只有数字，没有内容。"""
+"""每跳过一条被拒的消息记一次时间。体检按窗口数它，没有内容。"""
+
+MEMORY_CONTEXT_REFUSED_KEY = "memory_context_refused"
+"""一条新消息都不带也被拒的那一次的时间：拒的是她记着的摘要或旧事，跳哪条都没用。"""
+
+MEMORY_CONTEXT_PAUSE = timedelta(days=7)
+"""摘要本身被拒之后，这么久之内不再对半切。切了也只会切到游标前头那条无辜的。"""
 
 CATCHUP_SEEN = "catchup_channels"
 """见过的入口频道 id，逗号分隔。用来在开始翻之前就把每个入口的基线钉住。"""
@@ -1578,21 +1584,32 @@ class App:
         except ValueError:
             return MEMORY_BATCH
 
-    async def _route_around_refusal(self, messages: list[StoredMessage], now: datetime) -> bool:
+    async def _route_around_refusal(
+        self, request: MemoryUpdateRequest, now: datetime
+    ) -> bool:
         """这一批整理被模型拒了（换了主模型也拒）：对半切，最后只跳过拒的那一条。
 
         Haiku 5.5 带安全分类器，4.5 没有。同一批再发多半还是拒，原来抛错、
         六小时后从同一个游标重来，游标永远不动——从那天起她什么新事都记不住，
         而 status 上那行"模型拒绝回答"下一次回复成功就被清掉了。
 
-        **一天只跳一条。** 要是每条都拒（多半是摘要或旧事实本身触发的），
-        挨条切、挨条跳会把每天的调用额度烧光，她白天就不回话了。
-        那种情况照常失败，交给体检的"任务重试到放弃了"去叫。
+        **跳之前先确认拒的真是那一条。** 拒的也可能是她记着的摘要或某条旧事：
+        那样不管带几条消息都拒，对半切到底总落在游标前头那条无辜的上。
+        所以切到只剩一条时，先不带任何新消息再问一次——这样也拒，就不是消息的事，
+        一条都不跳，照常失败（体检会叫），一周之内也不再切。
+
+        **一天只跳一条。** 条条都拒的话挨条切、挨条跳会把每天的调用额度烧光，
+        她白天就不回话了。
         返回 True 表示已经安排好了，不用再按失败处理。
         """
-        today = self.rhythm.local_date(now).isoformat()
-        if await self.memory.kv_get(MEMORY_SKIP_DAY_KEY) == today:
+        messages = request.messages
+        day = self.rhythm.local_date(now)
+        if await self.memory.kv_get(MEMORY_SKIP_DAY_KEY) == day.isoformat():
             return False
+        marked = await self.memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
+        with contextlib.suppress(ValueError):
+            if marked and now - datetime.fromisoformat(marked) < MEMORY_CONTEXT_PAUSE:
+                return False
         if len(messages) > 1:
             half = len(messages) // 2
             await self.memory.kv_set(MEMORY_BATCH_KEY, str(half))
@@ -1605,7 +1622,18 @@ class App:
             )
             return True
 
-        # 只剩一条还被拒：跳过它。摘要不动，这一条不记事实，游标越过去
+        # 只剩一条还被拒。先不带它问一次，分清拒的是它还是摘要
+        control = await self.brain.update_memory(replace(request, messages=[]), day)
+        if control is None:
+            if self.brain.last_refused:
+                await self.memory.kv_set(
+                    MEMORY_CONTEXT_REFUSED_KEY, now.isoformat(timespec="seconds")
+                )
+                await self.memory.kv_delete(MEMORY_BATCH_KEY)
+                log.error("[memory] 不带新消息也被拒：拒的是摘要或旧事，一条都不跳")
+            return False
+
+        # 真是这一条。摘要不动，这一条不记事实，游标越过去
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         await self.memory.update_conversation(
             CONVERSATION_ID,
@@ -1613,13 +1641,12 @@ class App:
             summary_upto_message_id=messages[-1].id,
         )
         await self.memory.kv_delete(MEMORY_BATCH_KEY)
-        await self.memory.kv_set(MEMORY_SKIP_DAY_KEY, today)
-        _, _, count = (await self.memory.kv_get(MEMORY_SKIPPED_KEY) or "").partition("\t")
-        total = (int(count) if count.isdigit() else 0) + 1
-        await self.memory.kv_set(
-            MEMORY_SKIPPED_KEY, f"{now.isoformat(timespec='seconds')}\t{total}"
-        )
-        log.warning("[memory] 有一条消息两个模型都不肯整理，跳过它（累计 %d 条）", total)
+        await self.memory.kv_set(MEMORY_SKIP_DAY_KEY, day.isoformat())
+        await self.memory.kv_push_stamp(MEMORY_SKIPPED_KEY, now)
+        # 这次拒绝已经处理掉了。留着的话，她睡着、没有别的调用把它清掉，
+        # 六小时内跑的体检会当成接口坏了，半夜发一条告警
+        await self.brain.clear_error()
+        log.warning("[memory] 有一条消息两个模型都不肯整理，跳过它")
         await self._maybe_summarize()
         return True
 
@@ -2183,15 +2210,13 @@ class App:
         # 最新记下的几条反而被截掉，换个说法又记一遍。
         # 现在淡忘的不在名单上，他再提起就会重新记下——记不清就问，问完记回来。
         owner_facts, self_facts = await self._recall(now)
-        update = await self.brain.update_memory(
-            MemoryUpdateRequest(
-                previous_summary=conv.summary,
-                messages=messages,
-                existing_owner_facts=owner_facts,
-                existing_self_facts=self_facts,
-            ),
-            self.rhythm.local_date(now),
+        request = MemoryUpdateRequest(
+            previous_summary=conv.summary,
+            messages=messages,
+            existing_owner_facts=owner_facts,
+            existing_self_facts=self_facts,
         )
+        update = await self.brain.update_memory(request, self.rhythm.local_date(now))
         # 紧跟着取，中间不能有 await：回复任务也在用同一个 brain，
         # 让出去一下它就可能把这个标记改成它自己那次的结果
         refused = self.brain.last_refused
@@ -2202,7 +2227,7 @@ class App:
                 # 而下面那道闸看不见 failed，每回一条消息就再排一个、再烧三次。
                 await self._defer_to_tomorrow(job, now, "今天的模型额度用完了")
                 return
-            if refused and await self._route_around_refusal(messages, now):
+            if refused and await self._route_around_refusal(request, now):
                 return
             raise RuntimeError("记忆整理失败")
 

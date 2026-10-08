@@ -271,18 +271,27 @@ def test_an_api_error_carrying_model_output_is_not_printed(tmp_path: Path) -> No
 def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path) -> None:
     """整理记忆时被拒、跳过的消息，那几条里的事她记不住，体检要说一声。
 
-    只报窗口里的：半年前跳过的一条不该让每周的体检永远挂着这句。
+    只数窗口里的：半年前跳过的几条不该算进"最近两周"，也不该让体检永远挂着这句。
+    打杂模型被拒、主模型接住的那几次也要数：接住之后报错就被清掉了，哪儿都看不出来。
     """
+    old = [NOW - timedelta(days=d) for d in (200, 190)]
+    recent = [NOW - timedelta(days=d) for d in (5, 3, 2)]
     path = make_db(tmp_path / "skip.db", [5, 20, 60])
     conn = sqlite3.connect(path)
-    conn.execute(
-        "INSERT INTO kv (key, value) VALUES ('memory_skipped', ?)",
-        ((NOW - timedelta(days=2)).isoformat(timespec="seconds") + "\t3",),
+    conn.executemany(
+        "INSERT INTO kv (key, value) VALUES (?, ?)",
+        [
+            ("memory_skipped", ",".join(t.isoformat(timespec="seconds") for t in old + recent)),
+            ("utility_refused", "坏的时间戳," + recent[0].isoformat()),
+        ],
     )
     conn.commit()
     conn.close()
-    assert "3 条消息被模型拒了" in doctor.run(path, NOW, days=14).render()
-    assert "被模型拒了" not in doctor.run(path, NOW + timedelta(days=30), days=14).render()
+    text = doctor.run(path, NOW, days=14).render()
+    assert "  ! 整理记忆时有 3 条消息被模型拒了" in text
+    assert "  ! 打杂的模型被拒了 1 次" in text
+    later = doctor.run(path, NOW + timedelta(days=30), days=14).render()
+    assert "被模型拒了" not in later and "打杂的模型" not in later
 
 
 def test_a_short_api_error_still_hides_the_quoted_part(tmp_path: Path) -> None:
