@@ -1606,10 +1606,8 @@ class App:
         day = self.rhythm.local_date(now)
         if await self.memory.kv_get(MEMORY_SKIP_DAY_KEY) == day.isoformat():
             return False
-        marked = await self.memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
-        with contextlib.suppress(ValueError):
-            if marked and now - datetime.fromisoformat(marked) < MEMORY_CONTEXT_PAUSE:
-                return False
+        if await self._memory_paused(now):
+            return False
         if len(messages) > 1:
             half = len(messages) // 2
             await self.memory.kv_set(MEMORY_BATCH_KEY, str(half))
@@ -1650,7 +1648,19 @@ class App:
         await self._maybe_summarize()
         return True
 
+    async def _memory_paused(self, now: datetime) -> bool:
+        """摘要本身被拒之后的一周里，记忆整理先停着。"""
+        marked = await self.memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
+        try:
+            return bool(marked) and now - datetime.fromisoformat(marked) < MEMORY_CONTEXT_PAUSE
+        except ValueError:
+            return False
+
     async def _maybe_summarize(self) -> None:
+        # 摘要本身被拒、停着的这一周里不排：排了也是整批送两个模型、注定被拒，
+        # 一次任务三次重试，一半花在主模型上。体检会一直叫，等你处理
+        if await self._memory_paused(self.clock.now()):
+            return
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         pending = await self.memory.count_messages_after(
             CONVERSATION_ID, conv.summary_upto_message_id
@@ -2236,6 +2246,9 @@ class App:
             summary=update.summary,
             summary_upto_message_id=messages[-1].id,
         )
+        # 整理成了，说明摘要已经不是问题（拒绝也可能只是那一次）。留着标记的话，
+        # 一周内再来一条真被拒的消息就不会被切出来，记忆又冻住，体检还怪到摘要头上
+        await self.memory.kv_delete(MEMORY_CONTEXT_REFUSED_KEY)
         if limit < MEMORY_BATCH:
             # 缩小过的那一趟过了，下一趟放大一倍。不一下子回到两百：
             # 拒的那一条多半就在后面，一步跳回去又得从头对半切

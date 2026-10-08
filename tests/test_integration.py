@@ -2260,13 +2260,22 @@ async def test_a_refused_summary_does_not_get_an_innocent_message_skipped(
     assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
     assert await memory.kv_get(MEMORY_BATCH_KEY) is None
 
-    # 第二天：认出是摘要的事之后不再对半切，每次都是整批，照常失败
+    # 第二天：认出是摘要的事之后这一周先停着。排了也是整批送两个模型、注定被拒
     clock.set(clock.now() + timedelta(days=1))
     brain.sizes.clear()
     await app._maybe_summarize()
     await drain(app, clock, hops=80)
-    assert brain.sizes and set(brain.sizes) == {70}
+    assert brain.sizes == []
     assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
+
+    # 一周过后再试；摘要已经不惹事了（比如换了打杂模型），整理成了，标记随之清掉
+    await memory.update_conversation(CONVERSATION_ID, summary="他们聊过天")
+    clock.set(clock.now() + timedelta(days=7))
+    await app._maybe_summarize()
+    await drain(app, clock, hops=80)
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id > 0
+    assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY) is None
 
 
 async def test_a_network_failure_never_skips_a_message(tmp_path: Path, persona: Persona) -> None:

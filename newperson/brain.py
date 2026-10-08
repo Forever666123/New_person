@@ -137,6 +137,9 @@ def _money_trouble(exc: Exception) -> str:
 UTILITY_REFUSED_KEY = "utility_refused"
 """打杂模型被拒、换主模型才做成的那几次的时间。体检数它。"""
 
+CHORE_REFUSED_KEY = "chore_refused"
+"""打杂的活（日程、记忆整理）连主模型也拒了的那几次的时间。"""
+
 EFFORT_SUPPORTED = {
     "claude-fable-5-1",
     "claude-fable-5",
@@ -437,10 +440,11 @@ class Brain:
             # **拒绝也可能发生在说到一半。** 那时内容是半截 JSON，SDK 先解析、先抛了这个，
             # 我们根本看不到 stop_reason。半截的（json_invalid）就按被拒处理：
             # 话没说完，同样的内容再发多半还是这样；换个模型、缩小一批也正是对的办法。
+            # 撞上 max_tokens 的截断长得一模一样、分不出来，所以报错的措辞两种都说。
             cut_short = any(e.get("type") == "json_invalid" for e in exc.errors())
             log.warning("[brain] %s 的输出不合格式：%s", purpose, exc)
             await self._note_error(
-                "模型话说到一半停了（多半是被拒）" if cut_short else "返回的内容不合格式"
+                "模型话说到一半停了（被拒，或者输出太长被截断）" if cut_short else "返回的内容不合格式"
             )
             if self.memory is not None:
                 await self.memory.record_usage(today)
@@ -768,6 +772,10 @@ class Brain:
                 # 主模型接住了，_call 会把"模型拒绝回答"清掉。不另记一笔的话，
                 # 打杂模型天天拒、每次多花一次主模型的钱，哪儿都看不出来
                 await self.memory.kv_push_stamp(UTILITY_REFUSED_KEY, self._now())
+        if got is None and self.last_refused and self.memory is not None:
+            # 两个都拒。记忆整理那边自己会切、会跳；日程没人管：生成不出来她那天就
+            # 不主动开口，不抛错、不留失败的任务，下一次回复成功连报错也清了
+            await self.memory.kv_push_stamp(CHORE_REFUSED_KEY, self._now())
         return got
 
 

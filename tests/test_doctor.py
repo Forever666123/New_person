@@ -294,6 +294,27 @@ def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path)
     assert "被模型拒了" not in later and "打杂的模型" not in later
 
 
+def test_a_paused_memory_is_an_alert_until_it_recovers(tmp_path: Path) -> None:
+    """摘要本身被拒、记忆整理停着的那一周，她记不住新的事。
+
+    每周的告警只看 ✗，所以这条得是 BAD；整理成功一次标记就清掉，这条随之消失。
+    """
+    path = make_db(tmp_path / "paused.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO kv (key, value) VALUES (?, ?)",
+        [
+            ("memory_context_refused", (NOW - timedelta(days=20)).isoformat()),
+            ("chore_refused", (NOW - timedelta(days=1)).isoformat()),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    text = doctor.run(path, NOW, days=14).render()
+    assert "  ✗ 记忆整理停了" in text
+    assert "  ! 打杂的活被两个模型都拒了 1 次" in text
+
+
 def test_a_short_api_error_still_hides_the_quoted_part(tmp_path: Path) -> None:
     """短的那种更危险：截断根本救不了它。
 

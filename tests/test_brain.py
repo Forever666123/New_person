@@ -333,6 +333,17 @@ async def test_a_refused_chore_is_retried_once_on_the_main_model(
     assert [c["model"] for c in client.messages.calls] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
     # 主模型接住之后"模型拒绝回答"被清掉了，另记一笔，体检才看得见打杂模型在拒
     assert len((await memory.kv_get("utility_refused") or "").split(",")) == 1
+    assert await memory.kv_get("chore_refused") is None
+
+    # 两个都拒：日程排不出来，她那天就不主动开口，不抛错也不留失败的任务。记一笔
+    class BothRefuse(FakeMessages):
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(parsed_output=None, usage=usage(), stop_reason="refusal")
+
+    brain = Brain(SimpleNamespace(messages=BothRefuse([])), chosen, persona, memory)
+    assert await brain.update_memory(request, TODAY) is None
+    assert len((await memory.kv_get("chore_refused") or "").split(",")) == 1
 
     error = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
     flaky = fake_client(error)

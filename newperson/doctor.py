@@ -671,19 +671,30 @@ def check_memory(
             f"整理记忆时有 {len(skipped)} 条消息被模型拒了，跳过了（最近一次 {skipped[-1].date().isoformat()}）",
             "那几条里说的事她不会记进长期记忆。偶尔一两条正常；一直涨的话，" + back,
         )
-    context = _stamps_since(conn, "memory_context_refused", since)
+    # 这一条还在就说明还没恢复：整理成功一次就会被清掉。
+    # 是 BAD 不是 WARN——她这一周记不住新的事，而每周的告警只看 ✗
+    context = _stamps_since(conn, "memory_context_refused", None)
     if context:
         report.add(
+            BAD,
+            f"记忆整理停了（{context[-1].date().isoformat()} 起）：不带新消息也被拒",
+            "拒的是她记着的摘要或某条旧事，不是哪句新话；也可能是摘要太长、输出被截断。"
+            "这一周她记不住新的事，到时候会自己再试。" + back
+            + "如果是太长，在 .env 里把 NEWPERSON_MAX_TOKENS 调大（比如 16000）。",
+        )
+    chores = _stamps_since(conn, "chore_refused", since)
+    if chores:
+        report.add(
             WARN,
-            f"整理记忆整个被拒（{context[-1].date().isoformat()}）：不带新消息也拒",
-            "拒的是她记着的摘要或某条旧事，不是哪句新话。她暂时记不住新的事。" + back,
+            f"打杂的活被两个模型都拒了 {len(chores)} 次（排日程或整理记忆）",
+            "日程排不出来的那天她不会主动找你。偶尔一两次不用管；常有的话，" + back,
         )
     fallbacks = _stamps_since(conn, "utility_refused", since)
     if fallbacks:
         report.add(
             WARN,
             f"打杂的模型被拒了 {len(fallbacks)} 次，都换主模型做成了",
-            "每次多花一次主模型的调用。次数多的话，" + back,
+            "每次多花一次主模型的调用，事情都办成了。偶尔几次不用管。",
         )
 
     rows = _rows(
