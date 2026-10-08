@@ -117,6 +117,9 @@ MEMORY_CONTEXT_REFUSED_KEY = "memory_context_refused"
 MEMORY_CONTEXT_PAUSE = timedelta(days=7)
 """摘要本身被拒之后，这么久之内不再对半切。切了也只会切到游标前头那条无辜的。"""
 
+MEMORY_CONTEXT_CONFIG_KEY = "memory_context_refused_with"
+"""被拒时用的是哪套配置。换了模型或输出上限再重启，暂停就不算数了。"""
+
 CATCHUP_SEEN = "catchup_channels"
 """见过的入口频道 id，逗号分隔。用来在开始翻之前就把每个入口的基线钉住。"""
 
@@ -1627,11 +1630,15 @@ class App:
                 await self.memory.kv_set(
                     MEMORY_CONTEXT_REFUSED_KEY, now.isoformat(timespec="seconds")
                 )
+                await self.memory.kv_set(MEMORY_CONTEXT_CONFIG_KEY, self._memory_config())
                 await self.memory.kv_delete(MEMORY_BATCH_KEY)
                 log.error("[memory] 不带新消息也被拒：拒的是摘要或旧事，一条都不跳")
             return False
 
-        # 真是这一条。摘要不动，这一条不记事实，游标越过去
+        # 真是这一条。不带它就过了，也就证明摘要没事：之前留下的暂停标记一并清掉，
+        # 不然体检还会把接下来普通的被拒怪到摘要头上
+        await self.memory.kv_delete(MEMORY_CONTEXT_REFUSED_KEY)
+        # 摘要不动，这一条不记事实，游标越过去
         conv = await self.memory.get_conversation(CONVERSATION_ID)
         await self.memory.update_conversation(
             CONVERSATION_ID,
@@ -1648,11 +1655,23 @@ class App:
         await self._maybe_summarize()
         return True
 
+    def _memory_config(self) -> str:
+        s = self.settings
+        return f"{s.model}|{s.utility_model}|{s.max_tokens}|{s.effort}"
+
     async def _memory_paused(self, now: datetime) -> bool:
-        """摘要本身被拒之后的一周里，记忆整理先停着。"""
+        """摘要本身被拒之后的一周里，记忆整理先停着。
+
+        **只对当时那套配置停。** 体检的建议是换打杂模型或调大输出上限再重启；
+        照做之后还要干等一周的话，修好了也没用，告警还一直响。
+        """
         marked = await self.memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
+        if not marked:
+            return False
+        if await self.memory.kv_get(MEMORY_CONTEXT_CONFIG_KEY) != self._memory_config():
+            return False
         try:
-            return bool(marked) and now - datetime.fromisoformat(marked) < MEMORY_CONTEXT_PAUSE
+            return now - datetime.fromisoformat(marked) < MEMORY_CONTEXT_PAUSE
         except ValueError:
             return False
 

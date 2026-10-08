@@ -305,14 +305,14 @@ def test_a_paused_memory_is_an_alert_until_it_recovers(tmp_path: Path) -> None:
         "INSERT INTO kv (key, value) VALUES (?, ?)",
         [
             ("memory_context_refused", (NOW - timedelta(days=20)).isoformat()),
-            ("chore_refused", (NOW - timedelta(days=1)).isoformat()),
+            ("day_plan_refused", (NOW - timedelta(days=1)).isoformat()),
         ],
     )
     conn.commit()
     conn.close()
     text = doctor.run(path, NOW, days=14).render()
     assert "  ✗ 记忆整理停了" in text
-    assert "  ! 打杂的活被两个模型都拒了 1 次" in text
+    assert "  ! 排日程被两个模型都拒了 1 次" in text
 
 
 def test_a_short_api_error_still_hides_the_quoted_part(tmp_path: Path) -> None:

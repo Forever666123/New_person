@@ -137,8 +137,8 @@ def _money_trouble(exc: Exception) -> str:
 UTILITY_REFUSED_KEY = "utility_refused"
 """打杂模型被拒、换主模型才做成的那几次的时间。体检数它。"""
 
-CHORE_REFUSED_KEY = "chore_refused"
-"""打杂的活（日程、记忆整理）连主模型也拒了的那几次的时间。"""
+DAY_PLAN_REFUSED_KEY = "day_plan_refused"
+"""排日程连主模型也拒了的那几次的时间。"""
 
 EFFORT_SUPPORTED = {
     "claude-fable-5-1",
@@ -772,10 +772,11 @@ class Brain:
                 # 主模型接住了，_call 会把"模型拒绝回答"清掉。不另记一笔的话，
                 # 打杂模型天天拒、每次多花一次主模型的钱，哪儿都看不出来
                 await self.memory.kv_push_stamp(UTILITY_REFUSED_KEY, self._now())
-        if got is None and self.last_refused and self.memory is not None:
-            # 两个都拒。记忆整理那边自己会切、会跳；日程没人管：生成不出来她那天就
+        if got is None and self.last_refused and purpose == "day_plan" and self.memory is not None:
+            # 两个都拒。记忆整理那边自己会切、会跳、会记，这里再记一笔会把一次
+            # 对半切的七八步全数成"被拒了八次"；日程没人管：生成不出来她那天就
             # 不主动开口，不抛错、不留失败的任务，下一次回复成功连报错也清了
-            await self.memory.kv_push_stamp(CHORE_REFUSED_KEY, self._now())
+            await self.memory.kv_push_stamp(DAY_PLAN_REFUSED_KEY, self._now())
         return got
 
 

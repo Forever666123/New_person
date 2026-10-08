@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -14,7 +14,7 @@ import anthropic
 import httpx2 as httpx
 import pytest
 
-from newperson.brain import Brain, ProactiveRequest, ReplyRequest
+from newperson.brain import Brain, DayPlanRequest, ProactiveRequest, ReplyRequest
 from newperson.config import Settings
 from newperson.memory import Memory
 from newperson.models import ProactivePlan, ReplyPart, ReplyPlan, StoredMessage
@@ -332,10 +332,11 @@ async def test_a_refused_chore_is_retried_once_on_the_main_model(
     assert got is not None and got.summary == "整理好了"
     assert [c["model"] for c in client.messages.calls] == ["claude-haiku-5-5", "claude-sonnet-5-5"]
     # 主模型接住之后"模型拒绝回答"被清掉了，另记一笔，体检才看得见打杂模型在拒
-    assert len((await memory.kv_get("utility_refused") or "").split(",")) == 1
-    assert await memory.kv_get("chore_refused") is None
+    assert len([x for x in (await memory.kv_get("utility_refused") or "").split(",") if x]) == 1
+    assert await memory.kv_get("day_plan_refused") is None
 
-    # 两个都拒：日程排不出来，她那天就不主动开口，不抛错也不留失败的任务。记一笔
+    # 两个都拒：日程排不出来，她那天就不主动开口，不抛错也不留失败的任务。记一笔。
+    # 记忆整理那边自己会记，这里不记，不然一次对半切的七八步全数成"被拒了八次"
     class BothRefuse(FakeMessages):
         async def parse(self, **kwargs):
             self.calls.append(kwargs)
@@ -343,7 +344,19 @@ async def test_a_refused_chore_is_retried_once_on_the_main_model(
 
     brain = Brain(SimpleNamespace(messages=BothRefuse([])), chosen, persona, memory)
     assert await brain.update_memory(request, TODAY) is None
-    assert len((await memory.kv_get("chore_refused") or "").split(",")) == 1
+    assert await memory.kv_get("day_plan_refused") is None
+    plan_request = DayPlanRequest(
+        now=datetime(2026, 10, 8, 9, 0, tzinfo=UTC),
+        state_line="",
+        mood_notes=[],
+        wake_at=datetime(2026, 10, 8, 9, 0, tzinfo=UTC),
+        sleep_at=datetime(2026, 10, 9, 1, 0, tzinfo=UTC),
+        classes=[],
+        yesterday=None,
+        summary="",
+    )
+    assert await brain.generate_day_plan(plan_request, TODAY) is None
+    assert len([x for x in (await memory.kv_get("day_plan_refused") or "").split(",") if x]) == 1
 
     error = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
     flaky = fake_client(error)

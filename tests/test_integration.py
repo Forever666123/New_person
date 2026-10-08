@@ -2197,7 +2197,7 @@ async def test_a_refused_memory_batch_skips_only_the_message_it_refuses(
     assert set(ids[:37]) <= brain.seen
     # 对半切；过了的那一半之后放大一倍；剩一条时先不带它问一次（那个 0），确认拒的是它
     assert brain.sizes == [70, 35, 35, 17, 8, 4, 2, 4, 2, 1, 0]
-    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 1
+    assert len([x for x in (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",") if x]) == 1
     assert await memory.kv_get(MEMORY_BATCH_KEY) is None
     assert await memory.failed_jobs(CONVERSATION_ID) == []
     # 拒绝已经处理掉了，别让六小时内的体检当成接口坏了
@@ -2220,7 +2220,7 @@ async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, perso
     await drain(app, clock, hops=120)
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert ids[10] <= conv.summary_upto_message_id < ids[30]
-    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 1
+    assert len([x for x in (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",") if x]) == 1
     assert await memory.failed_jobs(CONVERSATION_ID)
 
     clock.set(clock.now() + timedelta(days=1))
@@ -2229,7 +2229,7 @@ async def test_she_skips_at_most_one_refused_message_a_day(tmp_path: Path, perso
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert conv.summary_upto_message_id >= ids[30]
     assert ids[30] not in brain.seen and set(ids[11:30]) <= brain.seen
-    assert len((await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",")) == 2
+    assert len([x for x in (await memory.kv_get(MEMORY_SKIPPED_KEY) or "").split(",") if x]) == 2
 
 
 async def test_a_refused_summary_does_not_get_an_innocent_message_skipped(
@@ -2268,14 +2268,39 @@ async def test_a_refused_summary_does_not_get_an_innocent_message_skipped(
     assert brain.sizes == []
     assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
 
-    # 一周过后再试；摘要已经不惹事了（比如换了打杂模型），整理成了，标记随之清掉
-    await memory.update_conversation(CONVERSATION_ID, summary="他们聊过天")
-    clock.set(clock.now() + timedelta(days=7))
+    # 照体检说的换了配置、重启：不用再干等一周，马上再试；这回过了，标记随之清掉
+    app.settings = app.settings.model_copy(update={"max_tokens": 16000})
+    brain._word = "换了模型就不拒了"
     await app._maybe_summarize()
     await drain(app, clock, hops=80)
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert conv.summary_upto_message_id > 0
     assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY) is None
+
+
+async def test_proving_the_summary_fine_clears_an_old_pause(tmp_path: Path, persona: Persona) -> None:
+    """不带那条消息再问一次过了，就证明摘要没事。之前留下的"摘要被拒"标记要一并清掉，
+
+    不然体检一直挂着那个 ✗，把接下来普通的被拒怪到摘要头上。
+    """
+    from newperson.brain import MemoryUpdateRequest
+    from newperson.discord_bot import MEMORY_CONTEXT_REFUSED_KEY, MEMORY_SKIPPED_KEY
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app.brain = _RefusesSome(app.brain, "那句话")
+    ids = await _say_many(memory, 1, {0}, "那句话")
+    await memory.kv_set(MEMORY_CONTEXT_REFUSED_KEY, (clock.now() - timedelta(days=9)).isoformat())
+    request = MemoryUpdateRequest(
+        previous_summary="",
+        messages=await memory.messages_after(CONVERSATION_ID, 0, 10),
+        existing_owner_facts=[],
+        existing_self_facts=[],
+    )
+    assert await app._route_around_refusal(request, clock.now())
+    conv = await memory.get_conversation(CONVERSATION_ID)
+    assert conv.summary_upto_message_id == ids[0]
+    assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY) is None
+    assert await memory.kv_get(MEMORY_SKIPPED_KEY)
 
 
 async def test_a_network_failure_never_skips_a_message(tmp_path: Path, persona: Persona) -> None:
