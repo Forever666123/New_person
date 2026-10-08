@@ -679,7 +679,7 @@ def check_memory(
             BAD,
             f"记忆整理停了（{context[-1].date().isoformat()} 起）：不带新消息也被拒",
             "拒的是她记着的摘要或某条旧事，不是哪句新话；也可能是摘要太长、输出被截断。"
-            "她记不住新的事，一周后会自己再试；改了配置重启之后会马上再试。" + back
+            "她记不住新的事，一周后会自己再试；改了配置重启之后，你下一次跟她说话、她回完就会再试。" + back
             + "如果是太长，在 .env 里把 NEWPERSON_MAX_TOKENS 调大（比如 16000）。",
         )
     plans = _stamps_since(conn, "day_plan_refused", since)

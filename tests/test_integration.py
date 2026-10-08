@@ -2268,14 +2268,75 @@ async def test_a_refused_summary_does_not_get_an_innocent_message_skipped(
     assert brain.sizes == []
     assert await memory.kv_get(MEMORY_SKIPPED_KEY) is None
 
-    # 照体检说的换了配置、重启：不用再干等一周，马上再试；这回过了，标记随之清掉
-    app.settings = app.settings.model_copy(update={"max_tokens": 16000})
-    brain._word = "换了模型就不拒了"
+
+
+async def test_changing_the_config_retries_a_paused_memory_right_away(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """体检说"换打杂模型或调大输出上限再重启"。照做之后不能干等一周，也不能被六小时的退避挡住：
+
+    下一次说话就试。但只绕过一次——这一次要是因为断网又失败，就回到停着，
+    不会每回一条消息都绕过退避再烧一遍调用。
+    """
+    from newperson.discord_bot import MEMORY_CONTEXT_REFUSED_KEY
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    brain = _RefusesSome(app.brain, "那句话")
+    app.brain = brain
+    await memory.update_conversation(CONVERSATION_ID, summary="他们聊过那句话")
+    await _say_many(memory, 70, set(), "那句话")
     await app._maybe_summarize()
     await drain(app, clock, hops=80)
+    assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY)
+    assert await memory.failed_jobs(CONVERSATION_ID)
+
+    # 一小时后：还在六小时退避里。改了配置、重启，下一次说话就试，这回过了
+    clock.set(clock.now() + timedelta(hours=1))
+    app.settings = app.settings.model_copy(update={"max_tokens": 16000})
+    brain._word = "换了配置就不拒了"
+    brain.sizes.clear()
+    await app._maybe_summarize()
+    await drain(app, clock, hops=80)
+    assert brain.sizes and brain.sizes[0] == 70
     conv = await memory.get_conversation(CONVERSATION_ID)
     assert conv.summary_upto_message_id > 0
     assert await memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY) is None
+
+
+async def test_a_config_change_only_buys_one_early_retry(tmp_path: Path, persona: Persona) -> None:
+    """换了配置之后那一次要是因为别的又失败，不能每回一条消息都绕过退避再试。"""
+    from newperson.discord_bot import MEMORY_CONTEXT_REFUSED_KEY
+
+    app, _channel, _llm, clock, memory = await build(tmp_path, persona, [])
+
+    class Fails:
+        last_refused = False
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def update_memory(self, _request, _day):
+            self.calls += 1
+            return None
+
+        async def over_budget(self, _day):
+            return False
+
+    brain = Fails(app.brain)
+    app.brain = brain
+    await _say_many(memory, 70, set(), "那句话")
+    await memory.kv_set(MEMORY_CONTEXT_REFUSED_KEY, clock.now().isoformat())
+    await memory.kv_set("memory_context_refused_with", "旧的那套配置")
+
+    for _ in range(5):
+        await app._maybe_summarize()
+        await drain(app, clock, hops=20)
+        clock.advance(600)
+    assert brain.calls == 3  # 一个任务、三次重试，之后就停着了
 
 
 async def test_proving_the_summary_fine_clears_an_old_pause(tmp_path: Path, persona: Persona) -> None:

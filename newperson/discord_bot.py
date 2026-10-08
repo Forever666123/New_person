@@ -1693,15 +1693,26 @@ class App:
         # 落后条数永远压着阈值——于是每回一条消息就新建一个任务、再烧三次调用。
         # 实测 45 轮来回烧掉 93 次模型调用（该是 48），撞上日限额之后
         # 她在当天中途毫无征兆地不说话了：频道里看不出任何原因。
-        failed_at = await self.memory.last_failed_at("memory_update", CONVERSATION_ID)
-        if failed_at is not None and self.clock.now() - failed_at < MEMORY_RETRY_BACKOFF:
-            return
+        if await self._config_changed_since_refusal():
+            # 摘要被拒之后换了配置、重启了：不等退避，马上试一次——体检就是这么说的。
+            # 试之前把新配置记上：这一次要是因为别的（断网）又失败，就回到停着的状态，
+            # 不会每回一条消息都绕过退避再试一遍
+            await self.memory.kv_set(MEMORY_CONTEXT_CONFIG_KEY, self._memory_config())
+        else:
+            failed_at = await self.memory.last_failed_at("memory_update", CONVERSATION_ID)
+            if failed_at is not None and self.clock.now() - failed_at < MEMORY_RETRY_BACKOFF:
+                return
         await self.scheduler.schedule(
             "memory_update",
             later(self.clock.now(), timedelta(seconds=30)),
             conversation_id=CONVERSATION_ID,
             reason="对话攒够了，整理一下",
         )
+
+    async def _config_changed_since_refusal(self) -> bool:
+        if not await self.memory.kv_get(MEMORY_CONTEXT_REFUSED_KEY):
+            return False
+        return await self.memory.kv_get(MEMORY_CONTEXT_CONFIG_KEY) != self._memory_config()
 
     # -- 主动消息 -----------------------------------------------------------
 
