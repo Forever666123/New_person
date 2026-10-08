@@ -489,8 +489,11 @@ def build_memory_update_user(
         blocks.append(
             _section("你自己说过的（别重复）", "\n".join(f"- {f}" for f in existing_self_facts[:40]))
         )
+    limit = persona.memory.summary_max_chars
     blocks.append(
         "更新摘要，把新的对话并进去。摘要要保留没聊完的话题和约好的事。\n"
+        f"摘要控制在 {limit} 字以内。快超了就把越早的事压得越短，"
+        "没聊完的话题和约好的事优先留着；已经了结的、一次性的可以只剩一句甚至删掉。\n"
         "只抽**新的、稳定的**事实。一次性的闲聊不用记，"
         "记那些下个月还成立、而且会影响你怎么跟他说话的。"
     )

@@ -636,6 +636,7 @@ def check_memory(
     conn: sqlite3.Connection,
     summarize_after: int = 60,
     since: datetime | None = None,
+    summary_max_chars: int = 0,
 ) -> None:
     """记忆和台账的规模，顺便看看有没有只进不出。"""
     rows = _rows(conn, "SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")
@@ -661,6 +662,18 @@ def check_memory(
         )
     else:
         report.add(OK, line)
+
+    # 摘要只量长度，不读内容。整理时会压回上限以内；远超过上限还压不下来，
+    # 多半是整理没在跑，或者模型没照着压
+    if summary_max_chars > 0:
+        rows = _rows(conn, "SELECT MAX(LENGTH(summary)) AS n FROM conversations")
+        length = (rows[0]["n"] or 0) if rows else 0
+        if length > summary_max_chars * 2:
+            report.add(
+                WARN,
+                f"她记着的聊天摘要有 {length} 字，上限是 {summary_max_chars} 字",
+                "下一次整理记忆时会压短，一般不用管。一直这么长的话，看看记忆整理是不是没在跑。",
+            )
 
     # 整理记忆时被拒的几种情况。只读次数和时间，不读是哪几条
     back = "可以先把 .env 里的 NEWPERSON_UTILITY_MODEL 换回 claude-haiku-4-5（它没有这层过滤）再重启。"
@@ -717,10 +730,11 @@ def run(
     max_per_day: float = 2.0,
     kinds_known: frozenset[str] = frozenset(),
     summarize_after: int = 60,
+    summary_max_chars: int = 0,
 ) -> Report:
     """跑一遍体检。**全程只读，不改任何东西。**
 
-    ``max_per_day``、``kinds_known``、``summarize_after`` 从人设里来：
+    ``max_per_day``、``kinds_known``、``summarize_after``、``summary_max_chars`` 从人设里来：
     判据和种类名都不该写死在代码里。
     """
     report = Report(days=days)
@@ -763,7 +777,10 @@ def run(
         ("沉默比例", lambda: check_silence(report, conn, since)),
         ("主动开口", lambda: check_proactive(report, conn, since, max_per_day, kinds_known)),
         ("事情挤不挤", lambda: check_bursts(report, conn, since)),
-        ("记忆和台账", lambda: check_memory(report, conn, summarize_after, since)),
+        (
+            "记忆和台账",
+            lambda: check_memory(report, conn, summarize_after, since, summary_max_chars),
+        ),
     ]
     try:
         for name, check in checks:

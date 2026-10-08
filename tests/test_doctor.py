@@ -294,6 +294,23 @@ def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path)
     assert "被模型拒了" not in later and "打杂的模型" not in later
 
 
+def test_a_summary_far_over_its_cap_is_reported_by_length_only(tmp_path: Path) -> None:
+    """摘要远超过上限，体检说一声有多长。只量长度，内容一个字都不印。"""
+    secret = "他说他下周要去医院复查"
+    path = make_db(tmp_path / "long.db", [5, 20, 60])
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO conversations (id, kind, summary) VALUES ('owner', 'dm', ?)",
+        (secret * 200,),
+    )
+    conn.commit()
+    conn.close()
+    text = doctor.run(path, NOW, days=14, summary_max_chars=800).render()
+    assert f"摘要有 {len(secret) * 200} 字" in text
+    assert secret not in text
+    assert "摘要有" not in doctor.run(path, NOW, days=14, summary_max_chars=5000).render()
+
+
 def test_a_paused_memory_is_an_alert_until_it_recovers(tmp_path: Path) -> None:
     """摘要本身被拒、记忆整理停着的那一周，她记不住新的事。
 

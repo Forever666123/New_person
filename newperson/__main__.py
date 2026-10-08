@@ -650,6 +650,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         max_per_day=persona.proactive.max_per_day if persona else 2.0,
         kinds_known=frozenset(k.name for k in persona.proactive.kinds) if persona else frozenset(),
         summarize_after=persona.memory.summarize_after if persona else 60,
+        summary_max_chars=persona.memory.summary_max_chars if persona else 0,
     )
     if persona is None:
         # **不能不吭声。** 读不到人设就退回 UTC，而窗口的两端会整体挪一个时区偏移

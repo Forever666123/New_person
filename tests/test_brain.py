@@ -415,6 +415,27 @@ async def test_a_refusal_halfway_through_is_still_a_refusal(
     assert not brain.last_refused
 
 
+async def test_the_memory_summary_is_asked_to_stay_under_its_cap(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """摘要原来没有上限，每次整理都把新的并进去，越滚越长：每次回复都带着它，越来越贵，
+
+    长到整理时一口气写不完就被截断，记忆卡住。上限从人设里来，整理时照着压。
+    """
+    from newperson.brain import MemoryUpdateRequest
+    from newperson.models import MemoryUpdate
+
+    client = fake_client(MemoryUpdate(summary="短的"))
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    request = MemoryUpdateRequest(
+        previous_summary="很长的旧摘要", messages=[], existing_owner_facts=[], existing_self_facts=[]
+    )
+    await brain.update_memory(request, TODAY)
+    sent = client.messages.calls[0]["messages"][0]["content"]
+    assert f"{persona.memory.summary_max_chars} 字以内" in sent
+    assert persona.memory.summary_max_chars <= 1000
+
+
 async def test_the_last_error_is_recorded_for_the_owner(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:

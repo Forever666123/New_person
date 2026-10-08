@@ -606,6 +606,8 @@ timing:
 memory:
   recent_messages: 40
   summarize_after: 60
+  # 她记着的聊天摘要最多多少字。超了整理时会把早的事压短，没聊完的话题和约好的事优先留着
+  summary_max_chars: 800
   # 记忆会淡。太久没提起的事她会记混或者忘掉，记不清就直接问。
   # 这是故意的：一个什么都记得的人，聊天就没意思了。
   fact_half_life_days: 45

@@ -581,6 +581,13 @@ class TimingConfig(BaseModel):
 class MemoryConfig(BaseModel):
     recent_messages: int = 40
     summarize_after: int = 60
+    summary_max_chars: int = 800
+    """她记着的那段聊天摘要最多多长。
+
+    摘要每次整理都把新的并进去，原来没有上限：一个月下来越滚越长，
+    每一次回复都带着它，越来越贵；长到整理时一口气写不完，输出被截断，
+    记忆就卡住了。超了就让整理的时候把早的事压短，没聊完的和约好的优先留着。
+    """
     fact_half_life_days: float = 45.0
     """一条事实多久淡一半。提起来会重新变清晰。"""
     fact_recall_threshold: float = 0.25
