@@ -891,7 +891,24 @@ def test_the_current_models_are_priced_and_get_their_effort() -> None:
 
     assert price_of("claude-sonnet-5-5") == (2.0, 10.0)
     assert price_of("claude-opus-5-5") == (4.0, 20.0)
-    assert {"claude-sonnet-5-5", "claude-opus-5-5"} <= EFFORT_SUPPORTED
+    assert price_of("claude-haiku-5-5") == (0.10, 0.50)
+    assert {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"} <= EFFORT_SUPPORTED
+    assert "claude-haiku-4-5" not in EFFORT_SUPPORTED
+
+
+def test_the_cost_follows_each_models_cache_and_length_pricing() -> None:
+    """5.5 这代缓存命中只收半成；Haiku 5.5 提示超过十万 token 整个请求贵五倍。
+
+    一律按一成算的话，Sonnet 5.5 的花费在 `!np status` 里多估一倍。
+    """
+    from newperson.brain import cost_of
+
+    million = 1_000_000
+    assert cost_of("claude-sonnet-5-5", 0, million, 0, 0) == pytest.approx(0.10)
+    assert cost_of("claude-sonnet-5", 0, million, 0, 0) == pytest.approx(0.20)
+    assert cost_of("claude-haiku-5-5", 0, 0, 0, million) == pytest.approx(0.50)
+    assert cost_of("claude-haiku-5-5", 100_001, 0, 0, million) == pytest.approx(2.50 + 0.05)
+    assert cost_of("claude-haiku-4-5", 200_000, 0, million, 0) == pytest.approx(0.20 + 1.25)
 
 
 async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(

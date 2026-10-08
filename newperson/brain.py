@@ -55,9 +55,23 @@ PRICING_PER_MTOK = {
     "claude-fable-5-1": (10.0, 50.0),
     "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-5-5": (0.10, 0.50),
     "claude-haiku-4-5": (1.0, 5.0),
 }
-"""(输入, 输出) 美元每百万 token。缓存命中按输入的十分之一算，写入按 1.25 倍。"""
+"""(输入, 输出) 美元每百万 token。缓存写入按输入的 1.25 倍，命中见 CACHE_READ_FRACTION。"""
+
+CACHE_READ_FRACTION = {
+    "claude-fable-5-1": 0.025,
+    "claude-opus-5-5": 0.05,
+    "claude-sonnet-5-5": 0.05,
+}
+"""缓存命中按输入价的几成算，没列的都是一成。
+
+5.5 这一代降了。她的输入大半是缓存命中，一律按一成算的话 Sonnet 5.5 这部分多估一倍。
+"""
+
+LONG_PROMPT_TIER = {"claude-haiku-5-5": (100_000, 5.0)}
+"""按提示长度分档的型号：(门槛, 倍数)。提示超过门槛，整个请求所有单价乘这个倍数。"""
 
 def _keep_one_typo(plan: ReplyPlan, *, allowed: bool) -> None:
     """打错字多久一次由代码定，不由模型定：没让她手滑，写了也不用；让了，也只留一条。
@@ -85,6 +99,16 @@ def price_of(model: str) -> tuple[float, float]:
     if base in PRICING_PER_MTOK and len(tail) == 8 and tail.isdigit():
         return PRICING_PER_MTOK[base]
     return (5.0, 25.0)
+
+
+def cost_of(model: str, inp: int, cached: int, written: int, out: int) -> float:
+    """一次调用大概花了多少美元。只给 `!np status` 和日志看，不拿来做决定。"""
+    in_price, out_price = price_of(model)
+    threshold, factor = LONG_PROMPT_TIER.get(model, (0, 1.0))
+    if threshold and inp + cached + written > threshold:
+        in_price, out_price = in_price * factor, out_price * factor
+    read = CACHE_READ_FRACTION.get(model, 0.1)
+    return (inp * in_price + cached * in_price * read + written * in_price * 1.25 + out * out_price) / 1_000_000
 
 
 def _money_trouble(exc: Exception) -> str:
@@ -121,6 +145,7 @@ EFFORT_SUPPORTED = {
     "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
+    "claude-haiku-5-5",
 }
 """接受 ``output_config.effort`` 的模型。
 
@@ -327,10 +352,7 @@ class Brain:
         written = getattr(usage, "cache_creation_input_tokens", 0) or 0
         out = getattr(usage, "output_tokens", 0) or 0
 
-        in_price, out_price = price_of(model_used or self.settings.model)
-        cost = (
-            inp * in_price + cached * in_price * 0.1 + written * in_price * 1.25 + out * out_price
-        ) / 1_000_000
+        cost = cost_of(model_used or self.settings.model, inp, cached, written, out)
 
         log.info(
             "[brain] %s in=%d cached=%d 写缓存=%d out=%d 约 $%.4f",
@@ -373,7 +395,7 @@ class Brain:
             "messages": [{"role": "user", "content": user_content}],
             "output_format": output_format,
         }
-        # Haiku 4.5 之类不接受 effort，传了直接 400。
+        # Haiku 4.5 之类不接受 effort，传了直接 400（Haiku 5.5 接受）。
         if chosen in EFFORT_SUPPORTED:
             kwargs["output_config"] = {"effort": self.settings.effort}
 
