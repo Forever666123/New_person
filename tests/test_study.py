@@ -800,9 +800,81 @@ async def test_a_failed_first_fetch_after_restart_keeps_what_was_scheduled(
 
     job = min(await memory2.pending_jobs("study_check"), key=lambda j: j.run_at)
     clock2.set(job.run_at)
-    source.fail = False  # 网络回来了：到点时自己再读一次
+    calls = source.calls
+    await app2.scheduler.run_due_once()
+    assert source.calls == calls, "到点的任务自己不联网，在会话锁里联网会把回复卡住"
+    assert channel.texts == []
+    deferred = await memory2.get_job(job.id or 0)
+    assert deferred is not None and deferred.status == "pending", "还没读成过日历：等一等，不作废"
+
+    source.fail = False  # 网络回来了：后台那条同步读到
+    await app2.study.sync_once()
+    clock2.set(deferred.run_at)
     await app2.scheduler.run_due_once()
     assert channel.texts == ["开始了没"]
+
+
+async def test_an_unreachable_calendar_never_slows_her_replies(tmp_path: Path, persona: Persona) -> None:
+    """日历连不上（一直挂着不返回）：到点的催学和回复都不等它，会话锁里绝不联网。"""
+    import asyncio as aio
+
+    from newperson.models import ReplyPlan
+    from tests.test_integration import send
+
+    class Hanging:
+        calls = 0
+
+        async def fetch(self) -> str:
+            Hanging.calls += 1
+            await aio.Event().wait()
+            return ""
+
+    probe, *_ = await make(tmp_path / "p", persona, [], datetime(2026, 11, 17, 12, 0, tzinfo=NY))
+    start, end = day_block(probe.rhythm, DAY)
+    text = calendar(vevent("blk", start, end))
+    app, channel, _llm, clock, memory, _src = await make(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])], start - timedelta(hours=1), text,
+    )
+    await app.study.sync_once()
+    await memory.close()
+    _OPEN.remove(memory)
+    # 重启：新进程还没读成过日历，来源一连就挂住
+    app2, channel2, _l, clock2, memory2, _s = await make(
+        tmp_path, persona, [ReplyPlan(parts=[ReplyPart(text="嗯")])], clock.now(), text,
+    )
+    app2.study.source = Hanging()
+    job = min(await memory2.pending_jobs("study_check"), key=lambda j: j.run_at)
+    clock2.set(job.run_at)
+    await aio.wait_for(app2.scheduler.run_due_once(), timeout=2)
+    await send(app2, "在吗", at=clock2.now(), msg_id=77)
+    for _ in range(4):
+        nxt = await memory2.next_job_run_at()
+        if nxt is not None and nxt > clock2.now():
+            clock2.set(nxt)
+        await aio.wait_for(app2.scheduler.run_due_once(), timeout=2)
+    assert "嗯" in channel2.texts
+    assert Hanging.calls == 0
+
+
+async def test_after_he_says_he_is_down_his_study_plan_leaves_her_context(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """他说过难受之后，回复的上下文里不再摆着"他今天排的学习"，那句 knows 也不带。
+
+    摆着的话，就算催学闭嘴了，她回复时也可能自己把学习提出来。
+    """
+    start = datetime(2026, 11, 18, 14, 0, tzinfo=SYD)
+    now = (start - timedelta(hours=3)).astimezone(NY)
+    app, *_rest = await make(
+        tmp_path, persona, [], now, calendar(vevent("blk", start, start + timedelta(hours=2), title="COMP 复习"))
+    )
+    await app.study.sync_once()
+    assert "COMP 复习" in await app._build_situation(now)
+    await app.study.note_low_mood(now - timedelta(hours=1))
+    situation = await app._build_situation(now)
+    assert "COMP 复习" not in situation and persona.study_watch.knows not in situation
+    later_on = now + timedelta(hours=persona.study_watch.low_mood_hours)
+    assert persona.study_watch.knows in await app._build_situation(later_on), "静默期过了就回来"
 
 
 async def test_a_broken_database_during_sync_never_raises(tmp_path: Path, persona: Persona, caplog) -> None:

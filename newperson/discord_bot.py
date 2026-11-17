@@ -2281,7 +2281,10 @@ class App:
         unread = await self.memory.unread_messages(CONVERSATION_ID)
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         busy = bool(unread or pending)
-        if busy and (retry := study.busy_retry_at(job, now)) is not None:
+        # **这里不联网。** 这条路在会话锁里，日历连不上会把回复也卡住。
+        # 重启后还没读成过日历，就等后台那条同步读到再说；等不到就过期作废
+        waiting = study.waiting_for_calendar
+        if (busy or waiting) and (retry := study.busy_retry_at(job, now)) is not None:
             # 他有话还没回完：她只有一部手机，先回他，过几分钟再看
             await self.scheduler.defer(job.id or 0, retry)
             return

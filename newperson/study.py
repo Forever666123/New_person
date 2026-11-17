@@ -60,6 +60,8 @@ STEPS_NIGHT = ("evening", "morning")
 
 FETCH_TIMEOUT = 20.0
 MAX_ICS_BYTES = 5 * 1024 * 1024
+FIRST_RETRY_MINUTES = 2.0
+"""重启后还没读成过日历时，后台多久再读一次。"""
 BUSY_RETRY_MINUTES = (3.0, 8.0)
 """到点时他还有话没回完：等这么久再看。"""
 
@@ -468,10 +470,17 @@ class StudyWatch:
         await self.apply_plan(now)
         return ok
 
+    @property
+    def waiting_for_calendar(self) -> bool:
+        """这个进程还没读成过日历。重启前排下的催学先等等，别拿"没有"去判它。"""
+        return self.configured and self._calendar is None
+
     async def run_forever(self) -> None:
         while True:
             try:
-                await self.clock.sleep(max(self.cfg.poll_minutes, 1.0) * 60)
+                # 还没读成过就隔两分钟再试：到点的催学在等它（它们自己不联网，见 prepare）
+                minutes = FIRST_RETRY_MINUTES if self._calendar is None else self.cfg.poll_minutes
+                await self.clock.sleep(max(minutes, 1.0) * 60)
                 await self.sync_once()
             except asyncio.CancelledError:
                 raise
@@ -489,6 +498,10 @@ class StudyWatch:
         而且放进去就有易变内容，缓存永远不命中。
         """
         if not await self.in_use(now) or self.his_tz is None:
+            return []
+        until = await self.low_mood_until()
+        if until is not None and now < until:
+            # 他说过难受：这段时间一个字都不提学习，连"他今天排了什么"也别摆在她眼前
             return []
         lines = [self.cfg.knows.strip()] if self.cfg.knows.strip() else []
         today = now.astimezone(self.his_tz).date()
@@ -730,9 +743,6 @@ class StudyWatch:
         ``gates`` 是外面才知道的几道闸（暂停、请假、她刚说过要睡了……），
         按顺序，第一道拦住的就是原因。
         """
-        if self.configured and self._calendar is None:
-            # 重启后这个进程还没读成过日历：到点了再试一次，读不成下面按 calendar_stale 跳过
-            await self.sync_once()
         comps = [(str(c[0]), str(c[1])) for c in job.payload.get("components", [])]
         raw_planned = job.payload.get("planned")
         planned = datetime.fromisoformat(raw_planned) if raw_planned else job.run_at
