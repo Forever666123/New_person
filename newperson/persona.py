@@ -526,6 +526,12 @@ class ProactiveConfig(BaseModel):
     max_per_day: int = 2
     unanswered_decay: float = 0.35
     """每有一次主动开场没被回应，下次概率乘这个数。"""
+    unanswered_recover_days: float = 7.0
+    """被晾着之后，每过这么多天她没再开口，就原谅一次。0 表示只有他回了才算数。
+
+    原来只有他回了才清零：被晾两次之后每天只剩 5%，再晾一次不到 2%，
+    她就此从他生活里消失了。真人会识趣地退开几天，过一两个星期还是会再试一次。
+    """
     max_unanswered_per_day: int = 1
     quiet_days_before_callback: float = 3.0
     """多久没说话之后允许提一句旧事。"""

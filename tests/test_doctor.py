@@ -283,6 +283,7 @@ def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path)
         [
             ("memory_skipped", ",".join(t.isoformat(timespec="seconds") for t in old + recent)),
             ("utility_refused", "坏的时间戳," + recent[0].isoformat()),
+            ("reply_refused", recent[1].isoformat()),
         ],
     )
     conn.commit()
@@ -290,6 +291,7 @@ def test_refused_memory_skips_are_reported_while_they_are_recent(tmp_path: Path)
     text = doctor.run(path, NOW, days=14).render()
     assert "  ! 整理记忆时有 3 条消息被模型拒了" in text
     assert "  ! 打杂的模型被拒了 1 次" in text
+    assert "  ! 有 1 批消息两个模型都不肯回" in text
     later = doctor.run(path, NOW + timedelta(days=30), days=14).render()
     assert "被模型拒了" not in later and "打杂的模型" not in later
 

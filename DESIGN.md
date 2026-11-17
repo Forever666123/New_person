@@ -235,7 +235,7 @@ datetime 一律存 ISO8601 含时区偏移的字符串。
 
 ### 2.8 大脑（brain / prompts）
 
-- `anthropic.AsyncAnthropic`；模型默认 `claude-opus-5`；`output_config={"effort": settings.effort}`；不传 `thinking`。
+- `anthropic.AsyncAnthropic`；模型默认 `claude-opus-5-5`，回复被安全过滤拒了换 `NEWPERSON_FALLBACK_MODEL` 再试一次；`output_config={"effort": settings.effort}`；不传 `thinking`。
 - 结构化输出：`client.messages.parse(output_format=<pydantic>)`。
 - **提示词缓存**：system 列表 = [稳定块（人物设定 + 说话规范 + 输出规范），`cache_control: ephemeral`]。易变内容全部放 user 消息。稳定块里**不能**有时间/日期/随机数。
 - 对方发的图片（image/*，≤ 5 MB）下载后作为 image block 传入。

@@ -96,6 +96,9 @@ def _owner_pushed_just_now(job: Job, now: datetime) -> bool:
     except ValueError:
         return False
 
+REPLY_REFUSED_KEY = "reply_refused"
+"""两个模型都不肯回、只好当作没回的那几批的时间。体检数它，没有内容。"""
+
 MEMORY_RETRY_BACKOFF = timedelta(hours=6)
 """记忆整理失败之后隔这么久才再试。见 _maybe_summarize 为什么不能不退避。"""
 
@@ -1276,6 +1279,14 @@ class App:
 
         hints, goodnight = await self._reply_hints(job, now, unread[-1].created_at)
         reply_plan = await self._generate_reply(job, unread, now, hints)
+        if reply_plan is None and self.brain.last_reply_refused:
+            # 主模型、备用模型都拒了这一批。**这不是故障**：同样的消息再发还是拒，
+            # 留在未读里的话，之后每一次回复都带着它、每一次都被拒，一条消息就让她
+            # 从此不说话。当作她看到了、没回——跟她自己决定这条不接是同一条路。
+            # 这批消息照样在库里、在最近的对话里，只是这一次没有回音
+            await self.memory.kv_push_stamp(REPLY_REFUSED_KEY, now)
+            log.warning("[reply] 这 %d 条两个模型都不肯回，当作看到了没回", len(unread))
+            reply_plan = ReplyPlan()
         if reply_plan is None:
             # 模型没给出结果。**这里绝不能提前把消息标成已读**，
             # 否则重试的时候未读是空的，这批消息就永远回不出去了。

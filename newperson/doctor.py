@@ -695,6 +695,14 @@ def check_memory(
             "她记不住新的事，一周后会自己再试；改了配置重启之后，你下一次跟她说话、她回完就会再试。" + back
             + "如果是太长，在 .env 里把 NEWPERSON_MAX_TOKENS 调大（比如 16000）。",
         )
+    replies = _stamps_since(conn, "reply_refused", since)
+    if replies:
+        report.add(
+            WARN,
+            f"有 {len(replies)} 批消息两个模型都不肯回，她当作看到了没回",
+            "主模型和备用模型（NEWPERSON_FALLBACK_MODEL）的安全过滤都拒了。偶尔一次不用管；"
+            "常有的话，把 .env 里的 NEWPERSON_MODEL 换成 claude-opus-5-5 再重启，它的过滤类别少一些。",
+        )
     plans = _stamps_since(conn, "day_plan_refused", since)
     if plans:
         report.add(

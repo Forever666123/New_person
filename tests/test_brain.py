@@ -436,6 +436,52 @@ async def test_the_memory_summary_is_asked_to_stay_under_its_cap(
     assert persona.memory.summary_max_chars <= 1000
 
 
+async def test_a_refused_reply_gets_one_more_try_on_the_fallback_model(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """主模型的安全分类器拒了这一批，换备用模型再试一次；后面的重写也用它。
+
+    拒了不换的话，那批消息一直挂在未读里，之后每次回复都带着它、每次都被拒。
+    只在"拒"的时候换：断网换了模型也一样。
+    """
+    plan = ReplyPlan(parts=[ReplyPart(text="嗯 在呢")])
+
+    class SonnetRefuses(FakeMessages):
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["model"] == "claude-sonnet-5-5":
+                return SimpleNamespace(parsed_output=None, usage=usage(), stop_reason="refusal")
+            return SimpleNamespace(parsed_output=plan, usage=usage(), stop_reason="end_turn")
+
+    picky = SonnetRefuses([])
+    brain = Brain(
+        SimpleNamespace(messages=picky), settings(tmp_path, model="claude-sonnet-5-5"), persona, memory
+    )
+    got = await brain.generate_reply(reply_request(), TODAY)
+    assert got is not None and [p.text for p in got.parts] == ["嗯 在呢"]
+    assert [c["model"] for c in picky.calls] == ["claude-sonnet-5-5", "claude-opus-5-5"]
+    assert not brain.last_reply_refused
+
+    # 关掉备用模型：拒了就是拒了，告诉上面这一批再发也没用
+    alone = SonnetRefuses([])
+    brain = Brain(
+        SimpleNamespace(messages=alone),
+        settings(tmp_path, model="claude-sonnet-5-5", fallback_model="none"),
+        persona,
+        memory,
+    )
+    assert await brain.generate_reply(reply_request(), TODAY) is None
+    assert [c["model"] for c in alone.calls] == ["claude-sonnet-5-5"]
+    assert brain.last_reply_refused
+
+    # 断网不是拒绝：不换模型，也不能让上面把消息当成看过了
+    error = anthropic.APIConnectionError(request=httpx.Request("POST", "http://x"))
+    offline = fake_client(error)
+    brain = Brain(offline, settings(tmp_path, model="claude-sonnet-5-5"), persona, memory)
+    assert await brain.generate_reply(reply_request(), TODAY) is None
+    assert len(offline.messages.calls) == 1 and not brain.last_reply_refused
+
+
 async def test_the_last_error_is_recorded_for_the_owner(
     persona: Persona, tmp_path: Path, memory: Memory
 ) -> None:

@@ -307,6 +307,8 @@ class Brain:
     ) -> None:
         self._last_status: int | None = None
         """上一次调用接口回的错误码（400、413……）。没出错或者不是这类错误就是 None。"""
+        self.last_reply_refused = False
+        """上一次 generate_reply 是不是主模型、备用模型都拒了。拒的那批消息再发也是拒。"""
         self.last_refused = False
         """上一次调用是不是被模型拒了（或者话说到一半断了）。
 
@@ -561,8 +563,10 @@ class Brain:
             hints=req.hints,
             photos=req.photos,
         )
+        self.last_reply_refused = False
         images = req.images
         content = self._with_images(prompt, images)
+        model = self.settings.model
         plan = await self._call(ReplyPlan, content, purpose="reply", today=today)
         if plan is None and not isinstance(content, str) and self._last_status in (400, 413):
             # 带着图被接口拒了（预检没认出来的毛病）。图每次都会被拒，重试十几个小时
@@ -570,7 +574,17 @@ class Brain:
             log.warning("[brain] 带图被接口拒了（%s），不带图再试一次", self._last_status)
             images = []
             plan = await self._call(ReplyPlan, prompt, purpose="reply", today=today)
+        if plan is None and self.last_refused and self.settings.reply_fallback:
+            # 安全分类器拒了这一批。各家分类器不一样（Sonnet 5.5 多一类 general_harms，
+            # 亲昵的话也可能撞上），换一个多半就过了。后面的追问、重写也用它，
+            # 不然重写那一下又撞回同一个分类器
+            model = self.settings.reply_fallback
+            log.warning("[brain] 回复被 %s 拒了，交给 %s 再试一次", self.settings.model, model)
+            plan = await self._call(
+                ReplyPlan, self._with_images(prompt, images), purpose="reply", today=today, model=model
+            )
         if plan is None:
+            self.last_reply_refused = self.last_refused
             return None
 
         # 他问了问题、或者在说一件具体的事，模型却给了空。
@@ -587,11 +601,12 @@ class Brain:
                 self._with_images(nudge, images),
                 purpose="reply-nudge",
                 today=today,
+                model=model,
             )
             if second is not None and (second.parts or second.reaction):
                 plan = second
 
-        polished = await self._polish(plan, prompt, images, today)
+        polished = await self._polish(plan, prompt, images, today, model=model)
         if polished is not None:
             _keep_one_typo(polished, allowed=req.typo)
         return polished
@@ -602,6 +617,7 @@ class Brain:
         prompt: str,
         images: list[tuple[str, bytes]],
         today: date,
+        model: str | None = None,
     ) -> ReplyPlan | None:
         """过 style_guard。能机械修的直接修，修不了的让它重写一次。
 
@@ -629,7 +645,11 @@ class Brain:
         log.info("[brain] 风格不过关，重写一次：%s", [v.kind for v in needs_rewrite])
         retry_prompt = f"{prompt}\n\n{style_guard.describe_for_rewrite(needs_rewrite)}"
         second = await self._call(
-            ReplyPlan, self._with_images(retry_prompt, images), purpose="reply-rewrite", today=today
+            ReplyPlan,
+            self._with_images(retry_prompt, images),
+            purpose="reply-rewrite",
+            today=today,
+            model=model,
         )
         if second is not None:
             refixed, still_bad = style_guard.enforce(

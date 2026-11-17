@@ -3078,6 +3078,52 @@ async def test_on_national_day_she_knows_it_is_an_ordinary_day_for_her(
     assert "今天是圣诞" in christmas and "不放假" not in christmas
 
 
+async def test_a_message_both_models_refuse_does_not_silence_her_for_good(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """主模型、备用模型都拒了这一批。原来它一直挂在未读里，之后每次回复都带着它、
+
+    每次都被拒，一条消息就让她从此不说话。现在当作她看到了没回：不发错误、不发东西，
+    下一句照常回。
+    """
+    from newperson.discord_bot import REPLY_REFUSED_KEY
+
+    plan = ReplyPlan(parts=[ReplyPart(text="在呢")])
+    app, channel, _llm, clock, memory = await build(tmp_path, persona, [])
+    app.brain.settings = app.brain.settings.model_copy(update={"model": "claude-sonnet-5-5"})
+
+    class Picky:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.refuse = True
+
+        async def parse(self, **kwargs):
+            self.calls.append(kwargs)
+            spent = SimpleNamespace(
+                input_tokens=100, cache_read_input_tokens=0,
+                cache_creation_input_tokens=0, output_tokens=0,
+            )
+            if self.refuse:
+                return SimpleNamespace(parsed_output=None, usage=spent, stop_reason="refusal")
+            return SimpleNamespace(parsed_output=plan, usage=spent, stop_reason="end_turn")
+
+    picky = Picky()
+    app.brain.client = SimpleNamespace(messages=picky)
+    await send(app, "那句话", at=EVENING)
+    await drain(app, clock)
+    assert channel.texts == []
+    assert [c["model"] for c in picky.calls] == ["claude-sonnet-5-5", "claude-opus-5-5"]
+    assert await memory.unread_messages(CONVERSATION_ID) == []
+    assert await memory.kv_get(REPLY_REFUSED_KEY)
+    assert await memory.failed_jobs(CONVERSATION_ID) == []
+
+    picky.refuse = False
+    clock.advance(600)
+    await send(app, "在吗", at=clock.now(), msg_id=2)
+    await drain(app, clock)
+    assert channel.texts == ["在呢"]
+
+
 async def test_a_resumed_reply_quotes_the_right_message(tmp_path: Path, persona: Persona) -> None:
     """发到一半断了、重试接着发时，引用的还得是这一批里的那一条。
 

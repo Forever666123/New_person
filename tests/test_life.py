@@ -108,6 +108,34 @@ async def test_being_ignored_makes_her_back_off(harness: Harness) -> None:
     assert sum(after) < sum(baseline) * 0.4
 
 
+async def test_being_ignored_fades_with_time_instead_of_forever(harness: Harness) -> None:
+    """被晾两次之后每天只剩 5%，原来只有他回了才清零——她就此从他生活里消失了。
+
+    真人会识趣地退开，过一两个星期还是会再轻轻试一次。每过一周她没再开口，就原谅一次。
+    """
+    life = harness.life
+    last = TERM_START.date()
+    await harness.memory.update_conversation(
+        "owner", unanswered_initiations=2, last_initiation_date=last
+    )
+    conv = await harness.memory.get_conversation("owner")
+    assert life.ignored_count(conv, last + timedelta(days=3)) == 2
+    assert life.ignored_count(conv, last + timedelta(days=7)) == 1
+    assert life.ignored_count(conv, last + timedelta(days=14)) == 0
+
+    # 隔了三周又开口一次：从原谅过的次数往上加，不是一下子算成"被晾了三次"
+    await life.mark_proactive_sent("own_life", last + timedelta(days=21), "owner")
+    assert (await harness.memory.get_conversation("owner")).unanswered_initiations == 1
+
+    # 一个月没开过口之后，她主动的频率回到跟没被晾过差不多
+    baseline, _k, _ = await harness.sweep(120, TERM_START)
+    await harness.memory.update_conversation(
+        "owner", unanswered_initiations=2, last_initiation_date=last - timedelta(days=30)
+    )
+    after, _k2, _ = await harness.sweep(120, TERM_START)
+    assert sum(after) > sum(baseline) * 0.7
+
+
 async def test_travel_talk_only_happens_while_away(harness: Harness) -> None:
     """没出门的时候不该冒出"这边怎么样"。"""
     _counts, kinds, away = await harness.sweep(25, WINTER_START)

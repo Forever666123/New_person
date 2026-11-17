@@ -56,7 +56,10 @@ python -m newperson check                # 检查配置和人设
    → `test_any_failure_becomes_silence`
 2. **消息不能凭空消失。** `mark_read` 必须在模型成功返回**之后**。
    放在前面的话，失败重试时未读是空的，整批消息就永远回不出去。
-   → `test_a_model_failure_does_not_swallow_the_message`
+   唯一的例外是主模型、备用模型都**拒**了这一批：再发还是拒，留在未读里她就从此不说话，
+   所以当作看到了没回。断网、限流、解析失败都不算，照常重试。
+   → `test_a_model_failure_does_not_swallow_the_message`、
+   `test_a_message_both_models_refuse_does_not_silence_her_for_good`
 3. **system prompt 字节级固定。** 里面出现时间、日期、随机内容，
    prompt cache 就永远不命中，成本翻好几倍。易变内容全部放 user 消息。
    → `test_the_system_prompt_is_the_same_bytes_in_a_fresh_process`

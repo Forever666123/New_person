@@ -24,7 +24,7 @@ from .brain import Brain, DayPlanRequest
 from .calendar import AcademicCalendar
 from .clock import Clock, later
 from .memory import Memory
-from .models import DayPlan, Job, LedgerEntry, LedgerTiming, PlanEvent
+from .models import ConversationState, DayPlan, Job, LedgerEntry, LedgerTiming, PlanEvent
 from .persona import OpenerConfig, Persona, ProactiveKind, parse_hhmm
 from .rhythm import Rhythm
 from .scheduler import Scheduler
@@ -398,7 +398,8 @@ class LifeEngine:
             return []
 
         conv = await self.memory.get_conversation(conversation_id)
-        decay = cfg.unanswered_decay**conv.unanswered_initiations
+        ignored = self.ignored_count(conv, day)
+        decay = cfg.unanswered_decay**ignored
         try:
             chattiness = float(await self.memory.kv_get("chattiness") or 1.0)
         except ValueError:
@@ -410,10 +411,11 @@ class LifeEngine:
         if self.rng.random() > threshold:
             log.info(
                 '[life] 今天不打算主动开口。命中概率 %.0f%%（基准 %.0f%%，'
-                '他没回过 %d 次，chattiness %.1f）',
+                '他没回过 %d 次、按时间原谅后算 %d 次，chattiness %.1f）',
                 threshold * 100,
                 cfg.day_probability * 100,
                 conv.unanswered_initiations,
+                ignored,
                 chattiness,
             )
             return []
@@ -724,13 +726,28 @@ class LifeEngine:
             reason="sign_off",
         )
 
+    def ignored_count(self, conv: ConversationState, day: date) -> int:
+        """被晾着的次数，按时间原谅过之后的。
+
+        每过 unanswered_recover_days 天她没再开口，就少算一次。只有他回了才清零的话，
+        被晾两三次她就再也不会主动了，那不是识趣，是消失。
+        """
+        recover = self.persona.proactive.unanswered_recover_days
+        n = conv.unanswered_initiations
+        if n <= 0 or recover <= 0 or conv.last_initiation_date is None:
+            return n
+        quiet = (day - conv.last_initiation_date).days
+        return max(0, n - int(quiet // recover))
+
     async def mark_proactive_sent(self, kind_name: str, day: date, conversation_id: str) -> None:
         """记下这次主动，用于同类间隔和"没被回应"的衰减。"""
         await self.memory.kv_set(f"last_proactive:{kind_name}", day.isoformat())
         conv = await self.memory.get_conversation(conversation_id)
         await self.memory.update_conversation(
             conversation_id,
-            unanswered_initiations=conv.unanswered_initiations + 1,
+            # 从原谅过之后的次数往上加：隔了三周才又开口一次，不该一下子
+            # 回到"被晾了三次"，那样她下一次又要等上好几周
+            unanswered_initiations=self.ignored_count(conv, day) + 1,
             last_initiation_date=day,
         )
 

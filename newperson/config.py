@@ -26,8 +26,14 @@ class Settings(BaseModel):
     proactive_channel_id: int | None = None
     """主动消息发到哪个频道；None 表示私聊 owner。"""
 
-    model: str = "claude-opus-5"
+    model: str = "claude-opus-5-5"
     """回复和主动消息用的模型。这两件事直接决定她像不像人。"""
+    fallback_model: str = "claude-opus-5-5"
+    """回复被主模型的安全分类器拒了，交给它再试一次。写 none 关掉。
+
+    拒了不换的话，那批消息一直挂在未读里，之后每一次回复都带着它、每一次都被拒——
+    一条消息就能让她从此不说话。跟主模型一样时等于没有。
+    """
     utility_model_override: str = ""
     """日程生成和记忆整理用的模型。留空就跟主模型一样。
 
@@ -75,6 +81,14 @@ class Settings(BaseModel):
         return v
 
     @property
+    def reply_fallback(self) -> str:
+        """真正会用的备用模型。关掉了或者跟主模型一样就是空串。"""
+        chosen = self.fallback_model.strip()
+        if chosen.lower() in {"", "none", "off"} or chosen == self.model:
+            return ""
+        return chosen
+
+    @property
     def utility_model(self) -> str:
         return self.utility_model_override or self.model
 
@@ -107,7 +121,8 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         owner_user_id=int(env.get("OWNER_DISCORD_USER_ID") or 0),
         allowed_user_ids=_split_ids(env.get("ALLOWED_USER_IDS")),
         proactive_channel_id=int(env["PROACTIVE_CHANNEL_ID"]) if env.get("PROACTIVE_CHANNEL_ID") else None,
-        model=env.get("NEWPERSON_MODEL", "claude-opus-5"),
+        model=env.get("NEWPERSON_MODEL", "claude-opus-5-5"),
+        fallback_model=env.get("NEWPERSON_FALLBACK_MODEL", "claude-opus-5-5"),
         utility_model_override=env.get("NEWPERSON_UTILITY_MODEL", ""),
         effort=env.get("NEWPERSON_EFFORT", "medium"),
         max_tokens=int(env.get("NEWPERSON_MAX_TOKENS", "8000")),

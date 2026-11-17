@@ -463,6 +463,9 @@ proactive:
   second_message_probability: 0.3
   max_per_day: 2
   unanswered_decay: 0.35
+  # 被晾着之后，每过 7 天她没再开口就原谅一次：先退开，过一两个星期再轻轻试一次，
+  # 不会就此消失。他一回，立刻清零
+  unanswered_recover_days: 7
   max_unanswered_per_day: 1
 
   # quiet_days_before_callback: 3
