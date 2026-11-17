@@ -332,7 +332,7 @@ python -m pytest -q && ruff check newperson tests
 |---|---|
 | 供应商 / 地区 | Vultr，悉尼 |
 | 配置 | 1 vCPU / 1 GB 内存，磁盘约 23 GB（她实际只用 70–80 MB 内存） |
-| 系统 | Ubuntu 24.04.5 LTS。11-17 登录时提示 *System restart required*、有 22 个更新没装，还提示有 26.04 可升。**别 `do-release-upgrade`**：Python 大版本会变，`.venv` 得重建，24.04 本来就支持到 2029 年 |
+| 系统 | Ubuntu 24.04 LTS。11-18 装完更新并重启过，内核 6.8.0-149；剩 `distro-info`、`python3-distro-info`、`snapd` 三个是分批推送还没轮到，不用管。登录时会提示有 26.04 可升。**别 `do-release-upgrade`**：Python 大版本会变，`.venv` 得重建，24.04 本来就支持到 2029 年 |
 | 主机名 | `chloe` |
 | 登录 | root，用 SSH 密钥。当时按步骤关了密码登录，要确认就跑 `sshd -T \| grep passwordauthentication`。Leo 的 Windows 电脑上 `~/.ssh/config` 里配了别名 `chloe`，所以 `ssh chloe` 直接进。IP 在那个 config 里，这里不写 |
 | 代码 | `/opt/New_person`（跟着 `claude/discord-virtual-character-qzc8a1` 分支） |
@@ -458,9 +458,18 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 ### 8.2 做到一半 / 等着做
 
 1. ~~服务器部署最新代码~~、~~回复换成 Opus 5.5~~：11-17 都做完了，服务器在 `64bab55`。
-2. **服务器系统更新和重启**：登录提示 *System restart required*，有 22 个更新。挑她睡着的时候跑
-   `apt update && apt upgrade -y && reboot`。她的服务是 enable 的，开机会自己起来，停机那一两分钟的消息启动时会补抓。
-   **别升 26.04**，见 5.1。
+2. ~~服务器系统更新和重启~~：**11-18 做完了**（Leo 当场同意）。25 个包装上，重启用了大约 30 秒，
+   她的服务自己起来、连上了，体检全过。下次再做照这个来，先 `ssh chloe` 进去：
+
+   ```bash
+   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
+   apt-get update -q && apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
+   systemctl reboot
+   ```
+
+   - 两个 `Dpkg::Options` 是让它保留现有的配置文件、不停下来问；`NEEDRESTART_SUSPEND` 是不让它中途逐个重启服务，反正马上整机重启。
+   - 她的服务是 enable 的，开机会自己起来，停机那一会儿的消息启动时会补抓。时间不讲究，Leo 没在跟她聊就行。
+   - **别升 26.04**，见 5.1。
 3. **照片库**：现在是空的，所以 `window_photo` 永远抽不到，回复里也发不了图。计划是：
    - 在 Leo 本地用 Claude in Chrome 打开他已登录的 Gemini 网页版，批量生成"她手机里的照片"；
    - 自己审、下载、写 `index.yaml`，传到服务器 `persona/photos/`，然后重启。
@@ -481,7 +490,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 1. ~~确认 `NEWPERSON_EFFORT` 的值和服务器上 anthropic SDK 的版本~~：11-18 查过，`NEWPERSON_EFFORT=medium`，SDK 是 1.4.0。
    `DELAY_SCALE=1`、`DEBUG_FORCE_AWAKE=0` 也是正式值。
    查法：`grep -E '^NEWPERSON_' /opt/New_person/.env` 和 `/opt/New_person/.venv/bin/pip show anthropic`，这两行都不会打出密钥。
-2. 服务器系统更新和重启（见 8.2）。
+2. ~~服务器系统更新和重启~~：11-18 做完了（见 8.2）。
 3. 照片库（附录 A）。做完确认 `python -m newperson check` 里照片那一项不再说空，`window_photo` 能抽到。
 4. 每周看一眼体检，尤其是主动消息的组成、被拒的计数、`办事型` 占比。
 5. 想把服务器的 SDK 升到 2.x 的话，先真调一次。
@@ -543,7 +552,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 ## 11. 还没解决、要问 Leo 的问题
 
 1. ~~服务器跑过 `update.sh` 没有~~、~~要不要换 Opus 5.5~~：11-17 都做了。~~`NEWPERSON_EFFORT` 是不是 `medium`~~：11-18 确认是。
-2. 什么时候方便做服务器的系统更新和重启（见 8.2）？
+2. ~~什么时候方便做服务器的系统更新和重启~~：11-18 做完了。
 3. 每月 $100 的 API 额度，是不是加在 bot 那把 API key 所在的 Console 组织上？去 platform.claude.com 的 Billing 页能看到。
 4. 照片库：本地有没有 Claude 桌面版和 Claude in Chrome 扩展？要不要现在按附录 A 做？他说过不想看这些图，全程交给 Claude。
 5. 主动消息里"追问做没做"占比偏高（73%）：要不要调，还是继续观察？
