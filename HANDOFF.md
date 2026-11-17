@@ -7,6 +7,10 @@
 
 **这份文件里没有任何密钥的值**，只有变量名和它们放在哪。也不要往仓库里加任何聊天内容。
 
+**2026-11-18 本地接手后更新过。** 本地仓库在 Leo 的 Windows 电脑 `%USERPROFILE%\New_person`。
+云端那边不再往这个分支提交，**只有本地这边推代码**，开工前先 `git pull --ff-only`。
+下面标了「11-18」的，是接手后登上服务器实际查到的。
+
 ---
 
 ## 0. 一分钟看懂现状
@@ -16,7 +20,8 @@
 - 跑在 Vultr 悉尼的一台小服务器上（systemd 服务名 `chloe`），从 9 月底一直在线。
 - 回复用 `claude-opus-5-5`（11-17 从 Sonnet 5.5 换过来），排日程、整理记忆用 `claude-haiku-5-5`。
 - 740 个测试全过，`ruff` 干净。
-- 服务器 11-17 已经用 `update.sh` 更新到 `64bab55`（交接文档那次提交），`check` 和体检都过了，之后的提交只改文档。
+- 服务器 11-17 已经用 `update.sh` 更新到 `64bab55`（交接文档那次提交），`check` 和体检都过了。之后的提交只改文档和 Windows 开发用的两处
+  （`.gitattributes`、只在 Windows 上装的 `tzdata`），对服务器没有实际影响，不用专门去更新。
 - 11-03 到 11-17 两周里几乎没有聊天（消息总数 527，比 10-08 只多 2 条），所以体检里回复间隔样本是 0、她也没主动开过口。
   这不是坏了：之前两次主动没被回，她的主动概率掉到了 5%。`6e71788` 部署后按时间原谅，应该从 11-17 她醒来排日程起回到每天 40% 左右。
 - 从 10-08 到 11-17，日志里模型拒答（"被拒了"）一共 0 次。
@@ -253,6 +258,18 @@
 - Python ≥ 3.11，**建议 3.11 或 3.12**。服务器是 Ubuntu 24.04 自带的 3.12。
   - discord.py 用到标准库的 `audioop`，3.11 上就有弃用警告，3.13 起标准库里没有它了，没必要去踩。
 - **用 macOS、Linux 或 WSL**。`tests/test_alert.py`、`tests/test_backup.py` 会直接跑 `scripts/` 里的 bash 脚本，原生 Windows 上会挂。
+- **Leo 的 Windows 电脑上（11-18 实测）**：
+  - 原生 Windows：`.venv` 在仓库里，Python 3.12。先 `$env:PYTHONUTF8 = "1"` 再跑 pytest，
+    不然子进程输出的中文按 GBK 解码，`test_doctor` 有一个会挂。
+    结果是 727 过、8 个失败、5 个跳过：失败的是 `test_alert`、`test_backup`、`test_media` 里要 bash 和 Linux 命令的，
+    跳过的是因为没有 gpg。**这 8 个不是坏了，别去改测试。**
+  - 740 个全过要在 WSL 里跑。WSL 的 Ubuntu 里有一份克隆 `~/np-test`（从 Windows 这份克隆的，自带 `.venv`）。
+    流程是：本地先提交 → 跑下面这行 → 全过再推送。
+
+    ```powershell
+    wsl -d Ubuntu -u root -- bash -c "cd ~/np-test && git pull -q && .venv/bin/python -m pytest -q && .venv/bin/ruff check newperson tests"
+    ```
+  - 提交身份在这个仓库里单独设成了 GitHub 的 noreply 地址（`git config --local`），别用全局那个带真名的。
 - 依赖见 `pyproject.toml`：discord.py、anthropic、pydantic、pyyaml、python-dotenv、aiosqlite。开发额外要 pytest、pytest-asyncio、ruff。
 
 ```bash
@@ -360,8 +377,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 第三条的完整写法见 DEPLOY.md 的"体检"一节，里面的 `%` 要转义成 `\%`。
 
-- 10-08 的体检显示"上次备份 3 小时前"，说明每天的备份在跑。
-- 演练和每周体检的 cron 是按 DEPLOY.md 配的，**没逐条核对过**，要确认就跑 `crontab -l`。
+- **11-18 用 `crontab -l` 核对过**：前两条（每天备份、每周日演练）在，上次备份是 11-17 04:00 UTC。
+  **第三条每周体检没装**，装不装等 Leo 定。
 
 日志：服务本身看 `journalctl -u chloe`；备份、演练、体检分别在 `/var/log/chloe-backup.log`、`chloe-drill.log`、`chloe-doctor.log`；体检发现 ✗ 时另存 `/var/log/chloe-doctor.BAD-日期.log`。
 
@@ -378,7 +395,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 | 回复、主动消息 | `NEWPERSON_MODEL` | `claude-opus-5-5`（11-17 确认） | `claude-opus-5-5` |
 | 回复被拒时的备用 | `NEWPERSON_FALLBACK_MODEL` | 没设。默认值跟现在的主模型一样，所以等于没有备用（Opus 5.5 的过滤类别本来就少）。写 `none` 关掉 | `claude-opus-5-5` |
 | 日程、记忆整理 | `NEWPERSON_UTILITY_MODEL` | `claude-haiku-5-5`（11-17 确认） | 留空 = 跟主模型一样 |
-| 思考强度 | `NEWPERSON_EFFORT` | 没确认。换 Opus 时给的命令会把它改成 `medium`（`.env.example` 里原来是 `low`） | `medium` |
+| 思考强度 | `NEWPERSON_EFFORT` | `medium`（11-18 确认） | `medium` |
 | 输出上限 | `NEWPERSON_MAX_TOKENS` | 应该没设（模板里没有这行），用默认 | `8000` |
 | 每天最多调几次 | `MAX_CALLS_PER_DAY` | 模板里是 `200` | `200`，超了就当今天没怎么看手机，任务顺延 |
 
@@ -461,7 +478,9 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ### 8.4 下一步（按优先级）
 
-1. 确认 `NEWPERSON_EFFORT` 的值和服务器上 anthropic SDK 的版本：`grep -E '^NEWPERSON_' /opt/New_person/.env` 和 `/opt/New_person/.venv/bin/pip show anthropic`。这两行都不会打出密钥。
+1. ~~确认 `NEWPERSON_EFFORT` 的值和服务器上 anthropic SDK 的版本~~：11-18 查过，`NEWPERSON_EFFORT=medium`，SDK 是 1.4.0。
+   `DELAY_SCALE=1`、`DEBUG_FORCE_AWAKE=0` 也是正式值。
+   查法：`grep -E '^NEWPERSON_' /opt/New_person/.env` 和 `/opt/New_person/.venv/bin/pip show anthropic`，这两行都不会打出密钥。
 2. 服务器系统更新和重启（见 8.2）。
 3. 照片库（附录 A）。做完确认 `python -m newperson check` 里照片那一项不再说空，`window_photo` 能抽到。
 4. 每周看一眼体检，尤其是主动消息的组成、被拒的计数、`办事型` 占比。
@@ -491,7 +510,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 - **Haiku 5.5 被拒的兜底**做成：换主模型 → 对半切 → 先不带那条消息问一次，确认拒的是它 → 只跳过那一条、一天最多一条 → 拒的是摘要就停一周，体检报 ✗。每一步都是审查挑出来的真问题，见第 10 节。
 - **不给 Gemini 用非官方的"网页版当 API"那种工具**：违反 Google 条款，可能封他的账号，三天两头失效。官方 API 生图在 2026 年 11 月已经没有免费额度（最便宜每张约 $0.03–0.04；Google Cloud 那 $300 赠金 2026 年 3 月后开的账号不能用在 Gemini API 上）。所以改成在 Gemini 网页版里正常使用，由本地的 Claude in Chrome 代劳。
 - **照片不生成她的脸**：每张都会长得不一样，一发就穿帮；真人平时发的也多是吃的、窗外、街景。
-- **服务器命令一直由 Leo 自己跑**：云端会话拿不到他的 SSH 私钥，也不该拿。本地 Claude Code 能不能直接 `ssh chloe` 去操作服务器，**先问 Leo**。
+- **服务器命令在云端那段时间一直由 Leo 自己跑**：云端会话拿不到他的 SSH 私钥，也不该拿。
+  **11-18 Leo 同意本地 Claude Code 直接 `ssh chloe`**：只读的检查直接跑；会改东西的（重启、装更新、改 cron、改 `.env`）先问他。
 - **改她的行为要 Leo 同意**：bug 修复、可靠性可以直接做，但要说清楚改了什么。
 
 ---
@@ -507,6 +527,11 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 - **SQLite 是 WAL 模式，不能直接 `cp`**：刚说的话还在 `-wal` 里。备份一律走在线备份接口，也就是 `backup.sh` 那套。
 - **crontab 里的 `%` 要写成 `\%`**。
 - **Windows PowerShell 转义坑**：一行 `ssh chloe "...带 $ 和引号的命令..."` 在 PowerShell 里会被搞坏。让 Leo 先 `ssh chloe` 进去，再粘贴 bash 命令。
+  本地 Claude Code 自己跑的时候，用 Bash 工具（Git Bash）把命令从标准输入喂进去，引号和 `$` 都不会被动：
+  `/c/Windows/System32/OpenSSH/ssh.exe -o BatchMode=yes chloe bash -s <<'EOF'` … `EOF`。
+- **Windows 的 git 默认把文本检出成 CRLF**（`core.autocrlf=true`）：`.sh` 已经用 `.gitattributes` 钉成 LF。
+  别的文件（`.service`、`.env.example`、yaml）在 Windows 工作区里还是 CRLF，要上服务器就走 git，别从这份 scp。
+  照片库的 `index.yaml` 是例外，yaml 带 CRLF 能正常读。
 - **`.env` 里可能没有某一行**：`sed -i 's/^X=.*/.../'` 对不存在的行什么都不做。要么先 `grep` 看有没有，要么写"有就改、没有就追加"的循环。
 - **云端容器会被重置**：`.venv` 会没，要重新 `pip install -e ".[dev]"`。本地没这个问题。
 - **云端提交用过一个特殊的签名程序**（`git -c gpg.ssh.program=...`）：那是云端容器专用的，本地正常提交就行。
@@ -517,14 +542,14 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ## 11. 还没解决、要问 Leo 的问题
 
-1. ~~服务器跑过 `update.sh` 没有~~、~~要不要换 Opus 5.5~~：11-17 都做了。还没确认的是 `NEWPERSON_EFFORT` 现在是不是 `medium`。
+1. ~~服务器跑过 `update.sh` 没有~~、~~要不要换 Opus 5.5~~：11-17 都做了。~~`NEWPERSON_EFFORT` 是不是 `medium`~~：11-18 确认是。
 2. 什么时候方便做服务器的系统更新和重启（见 8.2）？
 3. 每月 $100 的 API 额度，是不是加在 bot 那把 API key 所在的 Console 组织上？去 platform.claude.com 的 Billing 页能看到。
 4. 照片库：本地有没有 Claude 桌面版和 Claude in Chrome 扩展？要不要现在按附录 A 做？他说过不想看这些图，全程交给 Claude。
 5. 主动消息里"追问做没做"占比偏高（73%）：要不要调，还是继续观察？
 6. 打杂模型继续用 Haiku 5.5（便宜、有过滤但有兜底），还是换回 Haiku 4.5（没过滤、贵十倍、但也就每月几毛钱）？
-7. 本地 Claude Code 可以直接 `ssh chloe` 操作服务器吗？还是继续由他自己跑命令？
-8. 每周体检的 cron 和恢复演练的 cron 真的装了吗？可以请他跑一下 `crontab -l`。
+7. ~~本地 Claude Code 可以直接 `ssh chloe` 操作服务器吗~~：11-18 他说可以。只读的直接跑，会改东西的先问。
+8. ~~每周体检的 cron 和恢复演练的 cron 真的装了吗~~：11-18 查过，演练装了，**每周体检没装**。要不要装，等他定。
 9. 2027 年 9 月以后的学期日历：到时候按 Northeastern 新校历续，还是让她毕业？
 
 ---
