@@ -655,6 +655,9 @@ class StudyWatchConfig(BaseModel):
     low_mood_hours: float = 18.0
     """那之后多久不提任何学习的事。"""
     notes: StudyNotes = Field(default_factory=StudyNotes)
+    knows: str = ""
+    """功能在用时她知道的那句（"他把学习安排共享给你了"）。只进 user 消息，不进 system prompt：
+    没配地址、过了截止日的时候，她不该以为自己看得到他的日历。"""
 
     @field_validator("morning_after")
     @classmethod

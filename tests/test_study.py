@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import statistics
 from datetime import UTC, date, datetime, timedelta
@@ -21,7 +22,7 @@ from newperson import doctor, owner
 from newperson.config import Settings
 from newperson.discord_bot import CONVERSATION_ID, App
 from newperson.models import IncomingMessage, ProactivePlan, ReplyPart
-from newperson.persona import Persona, load_persona
+from newperson.persona import Persona
 from newperson.prompts import build_system
 from newperson.study import (
     LOW_MOOD_KEY,
@@ -593,20 +594,110 @@ async def test_a_failed_fetch_is_silent_and_keeps_the_last_calendar(
     assert any("没读成功" in f.line for f in report.findings), report.render()
 
 
-async def test_the_calendar_address_never_appears_in_logs_or_errors(caplog) -> None:
-    """地址是密钥：连不上的时候，异常文本、日志、配置的打印里都不能有它。"""
-    secret = "http://127.0.0.1:9/calendar/ical/leo%40example.com/private-SECRETTOKEN123/basic.ics"
-    source = HttpIcsSource(SecretStr(secret), timeout=2)
+SECRET = "https://calendar.google.com/calendar/ical/leo%40example.com/private-SECRETTOKEN123/basic.ics"
+
+
+class FakeResponse:
+    def __init__(self, status: int, chunks: list[bytes]) -> None:
+        self.status = status
+        self._chunks = chunks
+        self.content = self
+
+    async def iter_chunked(self, _n: int):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeSession:
+    """假的 aiohttp 会话。``error`` 给了就在 get 时抛出一条**带完整地址**的异常。"""
+
+    def __init__(self, response: FakeResponse | None = None, error: bool = False) -> None:
+        self.response = response
+        self.error = error
+
+    def __call__(self, **_kw):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url: str, **_kw):
+        if self.error:
+            raise OSError(f"Cannot connect to host for {url}")
+        return self.response
+
+
+def _chain(exc: BaseException | None) -> str:
+    """异常连同整条 __context__ / __cause__ 链的文字。"""
+    out = []
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        out += [str(exc), repr(exc)]
+        exc = exc.__cause__ or exc.__context__
+    return "\n".join(out)
+
+
+async def test_a_chunked_calendar_is_read_to_the_end(monkeypatch) -> None:
+    """分几块传过来的日历要读完整：只读到前半截的话，后面的块会被当成"日历上没有了"作废。"""
+    start = datetime(2026, 11, 18, 10, 0, tzinfo=SYD)
+    text = calendar(*(vevent(f"u{i}", start + timedelta(days=i), start + timedelta(days=i, hours=1))
+                      for i in range(30))).encode("utf-8")
+    pieces = [text[i:i + 97] for i in range(0, len(text), 97)]
+    monkeypatch.setattr(HttpIcsSource, "session_factory", staticmethod(FakeSession(FakeResponse(200, pieces))))
+    got = await HttpIcsSource(SecretStr(SECRET)).fetch()
+    assert len(parse_ics(got, SYD).blocks) == 30
+
+    big = [b"x" * (3 * 1024 * 1024)] * 2
+    monkeypatch.setattr(HttpIcsSource, "session_factory", staticmethod(FakeSession(FakeResponse(200, big))))
+    with pytest.raises(CalendarFetchError):
+        await HttpIcsSource(SecretStr(SECRET)).fetch()
+
+
+async def test_the_calendar_address_never_appears_anywhere(
+    tmp_path: Path, persona: Persona, monkeypatch, caplog, capsys
+) -> None:
+    """地址是密钥：连不上、而且底层异常文本里带着完整地址的时候，
+    往外抛的异常（整条链）、日志、check、体检、status 里都不能有它。"""
+    from newperson.__main__ import _check_study
+
+    monkeypatch.setattr(HttpIcsSource, "session_factory", staticmethod(FakeSession(error=True)))
+    source = HttpIcsSource(SecretStr(SECRET))
     with caplog.at_level(logging.DEBUG), pytest.raises(CalendarFetchError) as info:
         await source.fetch()
-    err = info.value
-    assert "SECRETTOKEN123" not in str(err) and "SECRETTOKEN123" not in repr(err)
-    assert err.__cause__ is None and err.__suppress_context__
+    assert "SECRETTOKEN123" not in _chain(info.value)
+    assert info.value.__context__ is None and info.value.__cause__ is None
     assert "SECRETTOKEN123" not in repr(source)
-    assert "SECRETTOKEN123" not in caplog.text
 
-    settings = Settings(study_calendar_ics_url=SecretStr(secret))
+    settings = Settings(study_calendar_ics_url=SecretStr(SECRET))
     assert "SECRETTOKEN123" not in repr(settings) and "SECRETTOKEN123" not in str(settings)
+    await asyncio.to_thread(_check_study, settings, persona, True)  # check 是同步的，自己开事件循环
+    printed = capsys.readouterr().out
+    assert "日历读不了（OSError）" in printed and "SECRETTOKEN123" not in printed
+
+    now = datetime(2026, 11, 17, 12, 0, tzinfo=NY)
+    app, *_rest = await make(tmp_path, persona, [], now)
+    app.study.source = HttpIcsSource(SecretStr(SECRET))
+    with caplog.at_level(logging.DEBUG):
+        assert not await app.study.sync_once()
+    ctx = owner.OwnerContext(
+        memory=app.memory, rhythm=app.rhythm, scheduler=app.scheduler, life=app.life,
+        conversation_id=CONVERSATION_ID, now=now, study=app.study,
+    )
+    status = await owner.handle("!np status", ctx)
+    report = doctor.run(app.settings.db_path, now + timedelta(minutes=1), days=7).render()
+    for text in (caplog.text, status, report):
+        assert "SECRETTOKEN123" not in text
+    assert "OSError" in report
 
 
 async def test_sync_failure_logs_only_the_kind_of_error(tmp_path: Path, persona: Persona, caplog) -> None:
@@ -682,6 +773,54 @@ async def test_a_restart_never_asks_the_same_step_twice(tmp_path: Path, persona:
     assert len(channel2.texts) == int(nudged), channel2.texts
 
 
+async def test_a_failed_first_fetch_after_restart_keeps_what_was_scheduled(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """重启后第一次读日历就失败：手里什么都没有，不能拿"没有"去作废重启前排好的催学。
+
+    原来会全部作废，半小时后再排又因为晚了二十分钟记成 missed——一次网络抖动丢掉一整块。
+    到点时它自己再读一次日历、自己过闸。
+    """
+    probe, *_ = await make(tmp_path / "p", persona, [], datetime(2026, 11, 17, 12, 0, tzinfo=NY))
+    start, end = day_block(probe.rhythm, DAY)
+    text = calendar(vevent("blk", start, end))
+    app, _ch, _llm, clock, memory, _src = await make(tmp_path, persona, [], start - timedelta(hours=1), text)
+    await app.study.sync_once()
+    before = {j.id for j in await memory.pending_jobs("study_check")}
+    assert len(before) == 2
+    await memory.close()
+    _OPEN.remove(memory)
+
+    app2, channel, _l, clock2, memory2, source = await make(
+        tmp_path, persona, [said("开始了没")], clock.now(), text,
+    )
+    source.fail = True
+    assert not await app2.study.sync_once()
+    assert {j.id for j in await memory2.pending_jobs("study_check")} == before, "一个都不能作废"
+
+    job = min(await memory2.pending_jobs("study_check"), key=lambda j: j.run_at)
+    clock2.set(job.run_at)
+    source.fail = False  # 网络回来了：到点时自己再读一次
+    await app2.scheduler.run_due_once()
+    assert channel.texts == ["开始了没"]
+
+
+async def test_a_broken_database_during_sync_never_raises(tmp_path: Path, persona: Persona, caplog) -> None:
+    """同步时库出错（忙、锁住）：只记一行类名，不往外抛——不能拖垮调度和收发消息。"""
+    app, *_rest = await make(
+        tmp_path, persona, [], datetime(2026, 11, 17, 12, 0, tzinfo=NY),
+        calendar(vevent("blk", datetime(2026, 11, 18, 10, tzinfo=SYD), datetime(2026, 11, 18, 12, tzinfo=SYD))),
+    )
+
+    async def locked(*_a, **_kw):
+        raise RuntimeError("database is locked")
+
+    app.memory.kv_set = locked  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        assert await app.study.sync_once() is False
+    assert "RuntimeError" in caplog.text
+
+
 async def test_she_waits_for_her_reply_to_go_out_before_asking(tmp_path: Path, persona: Persona) -> None:
     """到点时他有话还没回：先等几分钟，不另起一句；等太久就算了。"""
     probe, *_ = await make(tmp_path / "p", persona, [], datetime(2026, 11, 17, 12, 0, tzinfo=NY))
@@ -744,12 +883,68 @@ async def test_she_follows_her_own_timezone_not_a_fixed_offset(tmp_path: Path, p
     assert {p.components[0][0] for p in plan} == {"start", "end"}
 
 
-def test_the_system_prompt_does_not_carry_any_study_block() -> None:
-    """催学的易变内容（哪块、几点）只进 user 消息；system 里只有 owner.knows 那句固定的话。"""
-    persona = load_persona(ROOT / "persona" / "persona.yaml")
-    system = build_system(persona)
-    assert "学习安排共享给你" in system
-    assert persona.study_watch.notes.start.strip()[:10] not in system
+def test_adding_study_watch_does_not_change_one_byte_of_the_system_prompt() -> None:
+    """催学加进人设前后，system prompt 字节级相同（不变量 3）。
+
+    "他把学习安排共享给你了"那句和哪块、几点只进 user 消息。放进 system 的话，
+    没配地址、考完以后她还以为看得到他的日历，而且缓存会因此冷一次。
+    """
+    import yaml
+
+    raw = yaml.safe_load((ROOT / "persona" / "persona.yaml").read_text(encoding="utf-8"))
+    assert "study_watch" in raw
+    before = dict(raw)
+    del before["study_watch"]
+    with_it = build_system(Persona.model_validate(raw)).encode("utf-8")
+    without = build_system(Persona.model_validate(before)).encode("utf-8")
+    assert with_it == without
+    knows = raw["study_watch"]["knows"]
+    assert knows and knows not in with_it.decode("utf-8")
+    assert "学习安排" not in raw["owner"]["knows"], "这句要在 study_watch.knows，不在 owner.knows"
+
+
+async def test_without_an_address_she_behaves_and_stores_exactly_as_before(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """人设开着、但没配地址：不联网、不排任务、不写 kv、提示词里没有这件事。
+
+    合并前后她的行为和落库要完全一样——没配地址的时候，这个功能就当不存在。
+    """
+    from tests.test_integration import send
+
+    assert persona.study_watch.enabled
+    now = datetime(2026, 11, 18, 20, 0, tzinfo=NY)
+    app, _channel, _llm, _clock, memory = await build(tmp_path, persona, [], now=now)
+    assert app.study.source is None and not app.study.configured
+    assert not await app.study.sync_once()
+    await send(app, "好累 有点想哭", at=now, msg_id=11)  # 低气压：没配的时候连时间戳都不记
+    situation = await app._build_situation(now)
+    assert persona.study_watch.knows not in situation
+    rows = await memory._fetch_all("SELECT key FROM kv WHERE key LIKE 'study%'", ())
+    assert rows == []
+    assert await memory._fetch_all("SELECT * FROM study_log", ()) == []
+    assert await memory.pending_jobs("study_check") == []
+
+
+async def test_she_only_knows_about_his_schedule_while_the_feature_is_in_use(
+    tmp_path: Path, persona: Persona
+) -> None:
+    """在用的时候，易变层里有那句话和他今天排的块（他那边的时间）；过了截止日就没有了。"""
+    start = datetime(2026, 11, 18, 14, 0, tzinfo=SYD)
+    now = (start - timedelta(hours=3)).astimezone(NY)
+    app, *_rest, source = await make(
+        tmp_path, persona, [], now, calendar(vevent("blk", start, start + timedelta(hours=2), title="COMP 复习"))
+    )
+    await app.study.sync_once()
+    situation = await app._build_situation(now)
+    assert persona.study_watch.knows in situation
+    assert "他那边 11-18 14:00–16:00　COMP 复习" in situation
+
+    past = persona.model_copy(deep=True)
+    past.study_watch.until = date(2026, 11, 1)
+    app.study.persona = past
+    assert persona.study_watch.knows not in await app._build_situation(now)
+    assert source.calls == 1
 
 
 # ---------------------------------------------------------------------------

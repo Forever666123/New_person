@@ -175,12 +175,12 @@ F=/opt/New_person/.env
   { grep -v '^STUDY_CALENDAR_ICS_URL=' "$F"; printf 'STUDY_CALENDAR_ICS_URL=%s\n' "$ICS"; } > "$F.tmp" \
     && cat "$F.tmp" > "$F" && rm -f "$F.tmp" ) && echo "写好了"
 unset ICS
-cd /opt/New_person && .venv/bin/python -m newperson check | sed -n '/^催学/,/^$/p'
+cd /opt/New_person && .venv/bin/python -m newperson check --online | sed -n '/^催学/,/^$/p'
 systemctl restart chloe
 ```
 
 - `printf` 是 bash 内建命令，地址不会出现在进程列表里；临时文件在 `umask 077` 下建，别人读不了；`cat > "$F"` 是写回原文件，`.env` 的 600 权限和属主不变。
-- `check` 只会说地址"有 / 没有"，再真读一次日历，告诉你之后 7 天有几个学习块、有没有被跳过的重复事件。
+- `check --online` 只会说地址"有 / 没有"，再真读一次日历（不加 `--online` 不联网），告诉你之后 7 天有几个学习块、有没有被跳过的重复事件。
 - 关掉：把那一行删了重启，或者在私聊里 `!np study off`（不用重启）。
 - 换地址（在 Google 日历里重置过私密地址）：再跑一遍上面那段。
 

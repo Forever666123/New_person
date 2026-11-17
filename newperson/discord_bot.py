@@ -264,12 +264,11 @@ class App:
         # 她永远不回你，而重连时 _started 已经是真，直接早返回，永远修不好。
         # 唯一的症状就是她不说话，而那正是她的正常状态。
         self._started = True
-        if self.study.configured:
-            # 先读一次再起调度：重启前排下的催学到点要拿最新的日历核对，
-            # 没读过的话会被当成"日历上没有了"。读不成也不拦着启动
-            await self.study.sync_once()
-            self.spawn(self.study.run_forever(), "study")
         self.spawn(self.scheduler.run_forever(), "scheduler")
+        if self.study.configured:
+            # **调度先起，催学后读。** 读日历要联网、要写库，任何一步出事都不能拦住
+            # 她正常收发消息。重启前排下的催学到点时自己会再读一次日历
+            self.spawn(self._study_loop(), "study")
 
         now = self.clock.now()
         snapshot = self.rhythm.state_at(now)
@@ -304,6 +303,11 @@ class App:
                 self.settings.delay_scale,
                 1 / self.settings.delay_scale,
             )
+
+    async def _study_loop(self) -> None:
+        """催学：先读一次，之后每隔一段读一次。sync_once 自己不抛异常。"""
+        await self.study.sync_once()
+        await self.study.run_forever()
 
     def spawn(self, coro, name: str = "") -> asyncio.Task:
         """起一个后台循环，留住引用，并且死了要有日志。
@@ -907,8 +911,12 @@ class App:
         )
         low_mood = self.persona.study_watch.low_mood_mode
         if low_mood and features.mode == low_mood:
-            # 他说了自己难受：接下来一段时间她不提任何学习的事。只记时间
-            await self.study.note_low_mood(unread[-1].created_at)
+            # 他说了自己难受：接下来一段时间她不提任何学习的事。只记时间。
+            # 记不上无所谓，不能因此连回复都排不上
+            try:
+                await self.study.note_low_mood(unread[-1].created_at)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[study] 没记上（%s）", type(exc).__name__)
 
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
@@ -1143,6 +1151,11 @@ class App:
         if holiday := self.life.holiday_line(day):
             # 放在易变层。他先来说话的话，她在回复里也知道今天是什么日子
             mood.append(holiday)
+        # 催学在用的时候她才知道他把学习安排共享给她了。也是易变层：system prompt 一个字节都不动
+        try:
+            mood += await self.study.context_lines(now)
+        except Exception as exc:  # noqa: BLE001 - 催学出事不能连累回复
+            log.warning("[study] 上下文没取到（%s）", type(exc).__name__)
 
         # 作息只知道有没有课，日程才知道她此刻具体在干什么。
         # 不接上的话会出现"你现在有空"和"19:00-22:00 在图书馆"同时摆在她面前。

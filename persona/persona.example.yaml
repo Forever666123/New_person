@@ -174,8 +174,8 @@ proactive:
 
 # ---- 催学（可选，默认关着）----
 # 对方把学习安排放进一个单独的日历，到点她问一句。日历的私密 iCal 地址放 .env 的
-# STUDY_CALENDAR_ICS_URL（是密钥，别写在这里）。开之前在 owner.knows 里写一句
-# "他把学习安排共享给你了"，不然她会凭空知道他的安排。
+# STUDY_CALENDAR_ICS_URL（是密钥，别写在这里）。knows 是功能在用时她知道的那句，
+# 只进 user 消息，不进 system prompt；别写进 owner.knows。
 study_watch:
   enabled: false
   until: 2026-12-10
@@ -193,6 +193,7 @@ study_watch:
   his_quiet_hours: "23:30-08:00"
   low_mood_mode: ""
   low_mood_hours: 18
+  knows: 他把学习安排共享给你了，让你到点问他一句。
   notes:
     start: 他排的学习刚开始。问一句开始了没。只问，不催。
     nudge: 你刚才问他开始了没，他没回。再问一次，更短。

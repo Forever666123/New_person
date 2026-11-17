@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import random
@@ -278,6 +279,9 @@ class CalendarSource(Protocol):
 class HttpIcsSource:
     """用 discord.py 自带的 aiohttp 取私密 iCal 地址。"""
 
+    session_factory: Callable[..., Any] | None = None
+    """测试用：换成假的会话。None 就用 aiohttp.ClientSession。"""
+
     def __init__(self, url: SecretStr, timeout: float = FETCH_TIMEOUT) -> None:
         self._url = url
         self._timeout = timeout
@@ -286,26 +290,40 @@ class HttpIcsSource:
         return "HttpIcsSource(***)"
 
     async def fetch(self) -> str:
+        """读到底再返回。读不成抛 :class:`CalendarFetchError`，里面只有状态码或异常类名。
+
+        **新异常在 except 块外面抛**：在里面抛的话，带地址的原异常会挂在
+        ``__context__`` 上（``from None`` 只是不打印它，引用还在），
+        谁把整条链打进日志就漏了。
+        """
         import aiohttp
 
+        failure: str | None = None
+        chunks: list[bytes] = []
         try:
+            factory = self.session_factory or aiohttp.ClientSession
             timeout = aiohttp.ClientTimeout(total=self._timeout)
             async with (
-                aiohttp.ClientSession(timeout=timeout) as session,
+                factory(timeout=timeout) as session,
                 session.get(self._url.get_secret_value(), allow_redirects=True) as resp,
             ):
                 if resp.status != 200:
-                    raise CalendarFetchError(f"HTTP {resp.status}")
-                raw = await resp.content.read(MAX_ICS_BYTES + 1)
-        except CalendarFetchError:
-            raise
+                    failure = f"HTTP {resp.status}"
+                else:
+                    # read(n) 只给当下缓冲里已有的那部分；分块传输时只解析到前半截，
+                    # 后面的块会被当成"日历上没有了"作废。一直读到底
+                    size = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if size > MAX_ICS_BYTES:
+                            failure = "日历太大"
+                            break
+                        chunks.append(chunk)
         except Exception as exc:  # noqa: BLE001 - aiohttp 的异常文本里常带着地址
-            # from None：连锁的那个异常（带地址）不挂在 __context__ 上，
-            # 谁把它打进 traceback 都看不到
-            raise CalendarFetchError(type(exc).__name__) from None
-        if len(raw) > MAX_ICS_BYTES:
-            raise CalendarFetchError("日历太大")
-        return raw.decode("utf-8", errors="replace")
+            failure = type(exc).__name__
+        if failure is not None:
+            raise CalendarFetchError(failure)
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -401,20 +419,37 @@ class StudyWatch:
         return self._ok_at
 
     async def sync_once(self) -> bool:
-        """读一次日历、重排。**不抛异常，不出声**：读失败沿用上一次的。"""
+        """读一次日历、重排。**不抛异常，不出声**：读失败沿用上一次的。
+
+        整个包起来：库忙、排期出错，任何失败都只记一行不带内容的日志——
+        催学坏了不能连累她正常收发消息。
+        """
+        try:
+            return await self._sync()
+        except Exception as exc:  # noqa: BLE001 - 见上
+            log.warning("[study] 这一轮没同步成（%s），下一轮再来", type(exc).__name__)
+            return False
+
+    async def _sync(self) -> bool:
         if not self.configured or self.source is None or self.his_tz is None:
             return False
         now = self.clock.now()
         ok = False
+        failure: str | None = None
         try:
             text = await self.source.fetch()
             parsed = parse_ics(text, self.his_tz)
         except Exception as exc:  # noqa: BLE001 - 读不成就是这会儿没看日历
-            kind = str(exc) if isinstance(exc, CalendarFetchError) else type(exc).__name__
-            log.warning("[study] 日历没读成（%s），沿用上一次读到的", kind)
+            failure = str(exc) if isinstance(exc, CalendarFetchError) else type(exc).__name__
+        if failure is not None:
+            log.warning("[study] 日历没读成（%s），沿用上一次读到的", failure[:40])
             if not await self.memory.kv_get(FAIL_SINCE_KEY):
                 await self.memory.kv_set(FAIL_SINCE_KEY, now.isoformat())
-            await self.memory.kv_set(FAIL_KIND_KEY, kind[:40])
+            await self.memory.kv_set(FAIL_KIND_KEY, failure[:40])
+            if self._calendar is None:
+                # 这个进程还没读成过：手里什么都没有，不能拿"没有"去作废重启前排好的任务。
+                # 它们到点时自己再读一次、自己过闸
+                return False
         else:
             ok = True
             self._calendar = parsed
@@ -430,16 +465,37 @@ class StudyWatch:
                 len(parsed.blocks),
                 f"，{parsed.recurring_skipped} 个重复事件跳过了" if parsed.recurring_skipped else "",
             )
-        try:
-            await self.apply_plan(now)
-        except Exception:  # noqa: BLE001 - 排不上就等下一轮，不连累别的
-            log.warning("[study] 排期出错，下一轮再排", exc_info=True)
+        await self.apply_plan(now)
         return ok
 
     async def run_forever(self) -> None:
         while True:
-            await self.clock.sleep(max(self.cfg.poll_minutes, 1.0) * 60)
-            await self.sync_once()
+            try:
+                await self.clock.sleep(max(self.cfg.poll_minutes, 1.0) * 60)
+                await self.sync_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 循环本身不能死
+                log.warning("[study] 同步循环出意外（%s），接着跑", type(exc).__name__)
+
+    async def in_use(self, now: datetime) -> bool:
+        """此刻她该"知道"这件事：在用、没过截止日、他没关。"""
+        return self.configured and not self.past_deadline(now) and not await self.is_owner_off()
+
+    async def context_lines(self, now: datetime) -> list[str]:
+        """给易变层（user 消息）的那几句：他把安排共享给她了，加上他今天排的块。
+
+        不放 system prompt：没配地址、过了截止日的时候，她不该以为自己看得到他的日历；
+        而且放进去就有易变内容，缓存永远不命中。
+        """
+        if not await self.in_use(now) or self.his_tz is None:
+            return []
+        lines = [self.cfg.knows.strip()] if self.cfg.knows.strip() else []
+        today = now.astimezone(self.his_tz).date()
+        todays = [b for b in self.blocks(now) if b.start.astimezone(self.his_tz).date() == today]
+        if todays:
+            lines.append("他今天排的学习：" + "；".join(self._when(b) for b in todays))
+        return lines
 
     # -- 算时刻 -----------------------------------------------------------
 
@@ -617,7 +673,12 @@ class StudyWatch:
         return bool(await self.memory.kv_get(OFF_KEY))
 
     async def note_low_mood(self, at: datetime) -> None:
-        """他说了自己难受。只记时间，取最晚的。"""
+        """他说了自己难受。只记时间，取最晚的。
+
+        功能没在用（没配地址、过了截止日）就什么都不写：没配的时候库里不该多出任何东西。
+        """
+        if not self.configured or self.past_deadline(at):
+            return
         raw = await self.memory.kv_get(LOW_MOOD_KEY)
         try:
             prev = datetime.fromisoformat(raw) if raw else None
@@ -669,6 +730,9 @@ class StudyWatch:
         ``gates`` 是外面才知道的几道闸（暂停、请假、她刚说过要睡了……），
         按顺序，第一道拦住的就是原因。
         """
+        if self.configured and self._calendar is None:
+            # 重启后这个进程还没读成过日历：到点了再试一次，读不成下面按 calendar_stale 跳过
+            await self.sync_once()
         comps = [(str(c[0]), str(c[1])) for c in job.payload.get("components", [])]
         raw_planned = job.payload.get("planned")
         planned = datetime.fromisoformat(raw_planned) if raw_planned else job.run_at

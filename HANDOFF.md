@@ -322,7 +322,7 @@ python -m pytest -q && ruff check newperson tests
 | `test_backup.py` | 19 | 备份和恢复脚本：一致快照、加密、空备份不顶掉旧的、保留策略（需要 bash，部分要 gpg） |
 | `test_calendar.py` | 13 | 学期日历、假期、出行跨时区 |
 | `test_opener.py` | 11 | 第一次上线那一句 |
-| `test_study.py` | 28 | 催学：iCal 解析、时刻在区间里且不成周期、该闭嘴时闭嘴、不重复问、地址不外泄、不占主动额度、体检计数跟真实一致 |
+| `test_study.py` | 33 | 催学：iCal 解析、时刻在区间里且不成周期、该闭嘴时闭嘴、不重复问、地址不外泄、不占主动额度、体检计数跟真实一致 |
 | `test_alert.py` | 3 | `scripts/alert.sh`：没配 URL 不出声也不失败、只发一条不 @ 任何人、systemd 放弃她时会报警 |
 
 有些测试是参数化的，所以上表加起来少于 740。`CLAUDE.md` 列了每条不变量对应的测试名，改相关代码前先看它们的 docstring。
@@ -494,7 +494,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
      - 计划是纯函数（`StudyWatch.plan`），每次读日历重算；排着的任务对不上新计划就作废、让出去重键。追问（`dynamic`）不在计划里，到点自己判断。
      - 日历只放内存，重启后 `App.start` 先读一次再起调度；读不成就当没有块，排着的到点会以 `calendar_stale` 跳过。
      - 带 RRULE 的重复事件不展开，只计数（体检和 `check` 提醒）。真要支持得自己展开规则，别引第三方库。
-     - `persona.yaml` 的 `owner.knows` 加了一句"他把学习安排共享给你了"，system prompt 因此变了一次（缓存会冷一次，正常）。12/10 之后可以删掉这句、把 `study_watch.enabled` 关掉。
+     - "他把学习安排共享给你了"那句在 `study_watch.knows`，只在功能在用时进 user 消息；`owner.knows` 和 system prompt 没动。没配地址时她的行为和落库跟没这个功能一样（有测试守着）。
+     - 调度先起、催学后读，同步整个包在 try 里；`check` 加 `--online` 才读日历。
 
 ### 8.3 已知的问题和限制
 

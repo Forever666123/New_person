@@ -160,7 +160,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         print(f"  {WARN} 照片库是空的，她不会发照片（往 {settings.photos_index.parent} 放图再跑 photos）")
 
-    _check_study(settings, persona)
+    _check_study(settings, persona, online=args.online)
 
     if args.online:
         problems += _check_online(settings)
@@ -174,10 +174,10 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def _check_study(settings: Settings, persona: Persona) -> None:
+def _check_study(settings: Settings, persona: Persona, online: bool = False) -> None:
     """催学的配置。**地址只说有没有**，绝不打出来。
 
-    配了就真读一次：刚把地址写进 .env 的时候，这是唯一能确认它能用的地方。
+    加了 ``--online`` 才真读一次日历（跟连 Discord 一样，不加就不联网），只报块数。
     读不成只是提醒，不算问题——日历那边抖一下不该挡住部署。
     """
     from .study import CalendarFetchError, HttpIcsSource, parse_ics
@@ -194,6 +194,9 @@ def _check_study(settings: Settings, persona: Persona) -> None:
         print(f"  {WARN} 人设里开着，但缺地址或 owner.timezone，她不会问")
         return
     print(f"  {OK} 开着，到 {cfg.until}（按他那边的日子）")
+    if not online:
+        print(f"  {OK} 加 --online 会真读一次日历")
+        return
     try:
         text = asyncio.run(HttpIcsSource(settings.study_calendar_ics_url).fetch())
         parsed = parse_ics(text, persona.owner_tz)
