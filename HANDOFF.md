@@ -14,9 +14,11 @@
 - 这是一个接在 Discord 上的虚拟人物「沈亦宁 / Chloe」，跟 Leo 一个人私聊。目标只有一个：**让她像人，不像程序**。
 - 代码在 GitHub `Forever666123/New_person`。**只有一个分支** `claude/discord-virtual-character-qzc8a1`，它就是默认分支，服务器也跟着它拉代码。没有 PR。
 - 跑在 Vultr 悉尼的一台小服务器上（systemd 服务名 `chloe`），从 9 月底一直在线。
-- 回复用 `claude-sonnet-5-5`，排日程、整理记忆用 `claude-haiku-5-5`。建议把回复换成 `claude-opus-5-5`，等 Leo 拍板。
+- 回复用 `claude-opus-5-5`（11-17 从 Sonnet 5.5 换过来），排日程、整理记忆用 `claude-haiku-5-5`。
 - 740 个测试全过，`ruff` 干净。
-- 服务器上的代码截至 11-17 在 `e6f665f`，落后仓库两个功能提交（`bbc87f5`、`6e71788`）和这份交接。要 Leo 在服务器上跑一次 `scripts/update.sh`。
+- 服务器 11-17 已经用 `update.sh` 更新到 `64bab55`（交接文档那次提交），`check` 和体检都过了，之后的提交只改文档。
+- 11-03 到 11-17 两周里几乎没有聊天（消息总数 527，比 10-08 只多 2 条），所以体检里回复间隔样本是 0、她也没主动开过口。
+  这不是坏了：之前两次主动没被回，她的主动概率掉到了 5%。`6e71788` 部署后按时间原谅，应该从 11-17 她醒来排日程起回到每天 40% 左右。
 - 从 10-08 到 11-17，日志里模型拒答（"被拒了"）一共 0 次。
 - 照片库是空的，所以她现在不会发照片。
 
@@ -313,7 +315,7 @@ python -m pytest -q && ruff check newperson tests
 |---|---|
 | 供应商 / 地区 | Vultr，悉尼 |
 | 配置 | 1 vCPU / 1 GB 内存，磁盘约 23 GB（她实际只用 70–80 MB 内存） |
-| 系统 | Ubuntu 24.04.5 LTS |
+| 系统 | Ubuntu 24.04.5 LTS。11-17 登录时提示 *System restart required*、有 22 个更新没装，还提示有 26.04 可升。**别 `do-release-upgrade`**：Python 大版本会变，`.venv` 得重建，24.04 本来就支持到 2029 年 |
 | 主机名 | `chloe` |
 | 登录 | root，用 SSH 密钥。当时按步骤关了密码登录，要确认就跑 `sshd -T \| grep passwordauthentication`。Leo 的 Windows 电脑上 `~/.ssh/config` 里配了别名 `chloe`，所以 `ssh chloe` 直接进。IP 在那个 config 里，这里不写 |
 | 代码 | `/opt/New_person`（跟着 `claude/discord-virtual-character-qzc8a1` 分支） |
@@ -373,10 +375,10 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 | 用途 | 变量（`.env`） | 服务器上现在的值 | 代码默认值（`config.py`） |
 |---|---|---|---|
-| 回复、主动消息 | `NEWPERSON_MODEL` | `claude-sonnet-5-5`（10-08 确认） | `claude-opus-5-5` |
-| 回复被拒时的备用 | `NEWPERSON_FALLBACK_MODEL` | 没设，部署 `6e71788` 后用默认值。写 `none` 关掉；跟主模型一样等于没有 | `claude-opus-5-5` |
-| 日程、记忆整理 | `NEWPERSON_UTILITY_MODEL` | `claude-haiku-5-5`（10-08 确认） | 留空 = 跟主模型一样 |
-| 思考强度 | `NEWPERSON_EFFORT` | 不确定（`.env.example` 写的是 `low`） | `medium` |
+| 回复、主动消息 | `NEWPERSON_MODEL` | `claude-opus-5-5`（11-17 确认） | `claude-opus-5-5` |
+| 回复被拒时的备用 | `NEWPERSON_FALLBACK_MODEL` | 没设。默认值跟现在的主模型一样，所以等于没有备用（Opus 5.5 的过滤类别本来就少）。写 `none` 关掉 | `claude-opus-5-5` |
+| 日程、记忆整理 | `NEWPERSON_UTILITY_MODEL` | `claude-haiku-5-5`（11-17 确认） | 留空 = 跟主模型一样 |
+| 思考强度 | `NEWPERSON_EFFORT` | 没确认。换 Opus 时给的命令会把它改成 `medium`（`.env.example` 里原来是 `low`） | `medium` |
 | 输出上限 | `NEWPERSON_MAX_TOKENS` | 应该没设（模板里没有这行），用默认 | `8000` |
 | 每天最多调几次 | `MAX_CALLS_PER_DAY` | 模板里是 `200` | `200`，超了就当今天没怎么看手机，任务顺延 |
 
@@ -385,7 +387,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 - **花多少钱**：
   - 服务器：$5 + 10% GST，约 $5.50/月，按小时计费，每月 1 号扣卡。
   - API：上线头一个月（Sonnet 5 回复 + Haiku 4.5 打杂）实际每月约 $3–4，聊得多按比例涨。现在的 Sonnet 5.5 同价；Haiku 5.5 打杂是 4.5 的十分之一，几乎可以忽略。
-  - 换成 Opus 5.5 的话，回复这块大约翻倍，估计每月 $6–8。
+  - 11-17 起回复用 Opus 5.5，回复这块大约是 Sonnet 的两倍，估计每月 $6–8。
   - 实际数以 `usage` 表为准：`sqlite3 -readonly data/newperson.db "SELECT day, calls, round(estimated_usd,3) FROM usage ORDER BY day"`，或者 `!np status`。
 - Leo 说他的 Claude Max 每月带 $100 API 额度。**还没确认这笔额度是不是加在 bot 那把 API key 所在的组织上**，见第 11 节。
 - API 是预充值，每笔一年过期。余额用完她会整个哑掉，`!np status` 和体检会直接说"多半是 API 余额用完了"。
@@ -438,16 +440,10 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ### 8.2 做到一半 / 等着做
 
-1. **服务器还没部署最新代码**：截至 11-17 在 `e6f665f`，差 `bbc87f5`、`6e71788` 和这次交接。要 Leo 跑 `cd /opt/New_person && ./scripts/update.sh`。
-2. **回复要不要换成 Opus 5.5**：已经建议，理由见第 9 节，等 Leo 决定。换的话：
-
-   ```bash
-   sed -i 's/^NEWPERSON_MODEL=.*/NEWPERSON_MODEL=claude-opus-5-5/' .env
-   sed -i 's/^NEWPERSON_EFFORT=.*/NEWPERSON_EFFORT=medium/' .env
-   ./scripts/update.sh
-   ```
-
-   最后看到"回复用 claude-opus-5-5"就成了。主模型是 Opus 5.5 时，默认的备用模型跟它一样，等于没有备用。这没问题：它的过滤类别本来就少。
+1. ~~服务器部署最新代码~~、~~回复换成 Opus 5.5~~：11-17 都做完了，服务器在 `64bab55`。
+2. **服务器系统更新和重启**：登录提示 *System restart required*，有 22 个更新。挑她睡着的时候跑
+   `apt update && apt upgrade -y && reboot`。她的服务是 enable 的，开机会自己起来，停机那一两分钟的消息启动时会补抓。
+   **别升 26.04**，见 5.1。
 3. **照片库**：现在是空的，所以 `window_photo` 永远抽不到，回复里也发不了图。计划是：
    - 在 Leo 本地用 Claude in Chrome 打开他已登录的 Gemini 网页版，批量生成"她手机里的照片"；
    - 自己审、下载、写 `index.yaml`，传到服务器 `persona/photos/`，然后重启。
@@ -465,8 +461,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ### 8.4 下一步（按优先级）
 
-1. 请 Leo 在服务器上跑 `update.sh`，部署到最新。顺便确认 `NEWPERSON_EFFORT` 的值，以及 `.venv/bin/pip show anthropic` 的版本。
-2. 等 Leo 定要不要换 Opus 5.5（命令见 8.2）。
+1. 确认 `NEWPERSON_EFFORT` 的值和服务器上 anthropic SDK 的版本：`grep -E '^NEWPERSON_' /opt/New_person/.env` 和 `/opt/New_person/.venv/bin/pip show anthropic`。这两行都不会打出密钥。
+2. 服务器系统更新和重启（见 8.2）。
 3. 照片库（附录 A）。做完确认 `python -m newperson check` 里照片那一项不再说空，`window_photo` 能抽到。
 4. 每周看一眼体检，尤其是主动消息的组成、被拒的计数、`办事型` 占比。
 5. 想把服务器的 SDK 升到 2.x 的话，先真调一次。
@@ -488,7 +484,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 - **国内的节日在美国照常过**（`Holiday.local`）：国庆那天她说自己放一天假，就是这么穿帮的。
 - **回复别省**：人物的核心是分寸，小模型容易滑向两个极端。打杂的活（日程、记忆）用便宜的。
 - **换到 5.5 这代模型**（10 月）：同价或更便宜，而且 Sonnet 5.5 守角色更稳。
-- **建议回复换 Opus 5.5**（11 月，待定），三个原因：
+- **回复换成 Opus 5.5**（11-17 换的），三个原因：
   - Leo 有每月 $100 的额度，钱不是问题；
   - Opus 5.5 文字更自然；
   - **它的安全过滤没有 Sonnet 5.5 和 Haiku 5.5 都有的那一类 `general_harms`**（官方说正常内容也可能撞上），亲昵一点的聊天被误拦的可能更小。
@@ -521,8 +517,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ## 11. 还没解决、要问 Leo 的问题
 
-1. 服务器上跑过 `update.sh` 了吗？现在在哪个提交？
-2. 回复要不要换成 `claude-opus-5-5`？换的话 `NEWPERSON_EFFORT` 用 `medium`，现在服务器上是什么值？
+1. ~~服务器跑过 `update.sh` 没有~~、~~要不要换 Opus 5.5~~：11-17 都做了。还没确认的是 `NEWPERSON_EFFORT` 现在是不是 `medium`。
+2. 什么时候方便做服务器的系统更新和重启（见 8.2）？
 3. 每月 $100 的 API 额度，是不是加在 bot 那把 API key 所在的 Console 组织上？去 platform.claude.com 的 Billing 页能看到。
 4. 照片库：本地有没有 Claude 桌面版和 Claude in Chrome 扩展？要不要现在按附录 A 做？他说过不想看这些图，全程交给 Claude。
 5. 主动消息里"追问做没做"占比偏高（73%）：要不要调，还是继续观察？
