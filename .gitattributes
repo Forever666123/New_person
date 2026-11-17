@@ -1,0 +1,5 @@
+# 服务器是 Linux。Windows 上的 git 默认把检出的文本换成 CRLF，
+# 带 CRLF 的脚本在 bash 里跑不起来（`bash\r: No such file`），
+# 从 Windows 这份直接 scp 上去、或者在 WSL 里跑测试时就会撞上。
+# 所以脚本不管在哪台机器上检出，一律是 LF。
+*.sh text eol=lf
