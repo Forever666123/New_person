@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
 def _split_ids(raw: str | None) -> list[int]:
@@ -64,6 +64,16 @@ class Settings(BaseModel):
     log_level: str = "INFO"
     image_gen_command: str | None = None
     """外部图片生成命令模板，含 {prompt} 与 {out} 占位符。留空就只用本地照片库。"""
+    study_calendar_ics_url: SecretStr | None = None
+    """他学习日历的私密 iCal 地址。**这是密钥**：谁拿到都能看他的日历。
+
+    用 SecretStr 包着：打印 Settings、异常里带出配置的时候只会显示星号。
+    没配就整个催学不动。
+    """
+
+    @property
+    def has_study_calendar(self) -> bool:
+        return bool(self.study_calendar_ics_url and self.study_calendar_ics_url.get_secret_value().strip())
 
     @field_validator("effort")
     @classmethod
@@ -136,4 +146,7 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         force_awake=env.get("DEBUG_FORCE_AWAKE", "").strip().lower() in {"1", "true", "yes"},
         log_level=env.get("LOG_LEVEL", "INFO"),
         image_gen_command=env.get("IMAGE_GEN_COMMAND") or None,
+        study_calendar_ics_url=SecretStr(env["STUDY_CALENDAR_ICS_URL"].strip())
+        if env.get("STUDY_CALENDAR_ICS_URL", "").strip()
+        else None,
     )

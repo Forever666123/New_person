@@ -52,6 +52,9 @@ STALE_AFTER = {
     "proactive": timedelta(hours=2),
     "follow_up": timedelta(hours=6),
     "sign_off": timedelta(minutes=30),
+    # 催学错过就丢：到点时晚了多少才算错过由人设定（study_watch.max_late_minutes），
+    # 这里只兜一个更宽的底，停机一整晚的那些开机就清掉
+    "study_check": timedelta(hours=1),
 }
 """过期这么久就作废。半夜想说的话，第二天中午再发出来会很怪。"""
 

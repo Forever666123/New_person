@@ -7,6 +7,8 @@
 
 **这份文件里没有任何密钥的值**，只有变量名和它们放在哪。也不要往仓库里加任何聊天内容。
 
+**11-18 晚加了「催学」（`study-watch` 分支，还没合并、没上服务器）**，见 8.2 第 4 条。
+
 **2026-11-18 本地接手后更新过。** 本地仓库在 Leo 的 Windows 电脑 `%USERPROFILE%\New_person`。
 云端那边不再往这个分支提交，**只有本地这边推代码**，开工前先 `git pull --ff-only`。
 下面标了「11-18」的，是接手后登上服务器实际查到的。
@@ -178,6 +180,7 @@
 | `newperson/owner.py` | `!np` 命令（`HANDLERS` 字典） |
 | `newperson/doctor.py` | 体检：**只读元数据，绝不碰聊天内容** |
 | `newperson/backup.py` | SQLite 在线备份接口取一致快照、完整性校验 |
+| `newperson/study.py` | 催学：自己解析 iCal、按她的作息分白天/晚上的块、排期、到点过闸、`study_log` 记账 |
 | `newperson/discord_bot.py` | Discord 适配和组合根：收消息、补抓停机期间的消息、各类任务的 handler、在线状态 |
 | `newperson/persona.py` / `models.py` / `config.py` / `clock.py` | 人设的数据模型 / 各种数据结构 / `.env` 配置 / 时钟（测试用 `FakeClock`） |
 | `newperson/__main__.py` | 命令行：`run`、`check`、`simulate`、`plan`、`photos`、`ledger`、`backup`、`verify`、`doctor`、`export` |
@@ -234,6 +237,7 @@
 | `proactive` / `follow_up` | `handle_proactive_job` | 到点用主模型想要不要说、说什么（`generate_proactive`），可以不发 |
 | `sign_off` | `handle_sign_off_job` | 睡前那一句 |
 | `memory_update` | `handle_memory_update_job` | 整理记忆。被拒有一整套兜底：换模型、对半切、只跳过拒的那条、拒的是摘要就停一周 |
+| `study_check` | `handle_study_check_job` | 催学：到点问他一句学习的事（`study.py` 排期，见 8.2 第 4 条） |
 
 **启动**：`on_ready` → `App.start`：
 1. 注册 handler，`scheduler.recover()` 收回崩溃时的租约；
@@ -245,7 +249,7 @@
 
 ### 3.4 数据库表（`data/newperson.db`）
 
-`messages`、`conversations`（含摘要、摘要游标、被晾次数）、`facts`、`ledger`、`diary`、`jobs`、`photo_usage`、`usage`（每天调用次数和估算美元）、`kv`（各种标记）。
+`messages`、`conversations`（含摘要、摘要游标、被晾次数）、`facts`、`ledger`、`diary`、`jobs`、`photo_usage`、`usage`（每天调用次数和估算美元）、`kv`（各种标记）、`study_log`（催学每块每步一行：标识、计划时刻、发没发、为什么没发、他几点回的；没有标题和聊天内容）。
 
 **这个文件就是她的全部记忆**，删了她就不认识他了。
 
@@ -318,6 +322,7 @@ python -m pytest -q && ruff check newperson tests
 | `test_backup.py` | 19 | 备份和恢复脚本：一致快照、加密、空备份不顶掉旧的、保留策略（需要 bash，部分要 gpg） |
 | `test_calendar.py` | 13 | 学期日历、假期、出行跨时区 |
 | `test_opener.py` | 11 | 第一次上线那一句 |
+| `test_study.py` | 28 | 催学：iCal 解析、时刻在区间里且不成周期、该闭嘴时闭嘴、不重复问、地址不外泄、不占主动额度、体检计数跟真实一致 |
 | `test_alert.py` | 3 | `scripts/alert.sh`：没配 URL 不出声也不失败、只发一条不 @ 任何人、systemd 放弃她时会报警 |
 
 有些测试是参数化的，所以上表加起来少于 740。`CLAUDE.md` 列了每条不变量对应的测试名，改相关代码前先看它们的 docstring。
@@ -384,7 +389,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 ### 5.4 日常控制（Leo 在私聊里发，她看不到）
 
-`!np status`（状态、下一条回复排在几点、今天调用次数和花费、上次备份时间）、`!np now`、`!np retry`、`!np pause` / `resume`、`!np away 出差 5` / `back`、`!np chatty 0.5`、`!np ledger [类别]`、`!np plan`、`!np help`。
+`!np status`（状态、下一条回复排在几点、今天调用次数和花费、上次备份时间）、`!np now`、`!np retry`、`!np pause` / `resume`、`!np away 出差 5` / `back`、`!np chatty 0.5`、`!np ledger [类别]`、`!np plan`、`!np study on|off`（催学开关）、`!np help`。
 
 ---
 
@@ -417,6 +422,7 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
 
 - 必填：`DISCORD_BOT_TOKEN`、`ANTHROPIC_API_KEY`、`OWNER_DISCORD_USER_ID`
 - 可选：`ALLOWED_USER_IDS`、`PROACTIVE_CHANNEL_ID`、`NEWPERSON_MODEL`、`NEWPERSON_FALLBACK_MODEL`、`NEWPERSON_UTILITY_MODEL`、`NEWPERSON_EFFORT`、`NEWPERSON_MAX_TOKENS`、`MAX_CALLS_PER_DAY`、`PERSONA_PATH`、`PHOTOS_INDEX`、`DB_PATH`、`DOWNLOADS_DIR`、`GENERATED_DIR`、`LOG_LEVEL`、`IMAGE_GEN_COMMAND`
+- 催学：`STUDY_CALENDAR_ICS_URL`（Leo 学习日历的私密 iCal 地址，**是密钥**）。11-18 还没写进服务器；怎么写才不进 shell 历史见 `DEPLOY.md`「催学的日历地址」
 - 调试用，**线上必须是正式值**：`DELAY_SCALE=1.0`、`DEBUG_FORCE_AWAKE=0`。开着的话她会秒回或者不睡觉，整个项目就白做了。
 
 **服务器上的其他密钥文件**（都不进 git）：
@@ -474,6 +480,21 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
    - 在 Leo 本地用 Claude in Chrome 打开他已登录的 Gemini 网页版，批量生成"她手机里的照片"；
    - 自己审、下载、写 `index.yaml`，传到服务器 `persona/photos/`，然后重启。
    - **Leo 明确说不想自己看这些图，全程交给你**。任务说明见附录 A。
+4. **催学（study_watch）**：11-18 做完，在分支 `study-watch`，**没合并、没推、没上服务器**。Leo 考前（到 12/10）
+   把学习安排放在一个单独的 Google 日历里，每个事件是一个学习块，她到点问一句。行为是 Leo 定过的，别加码减码：
+   - 白天的块（块开始时她醒着）：开始后 2–12 分钟问开始了没；他没回再过 20–35 分钟追问一次（他回过任何一句就不追）；结束后 3–20 分钟问学到哪了。
+   - 晚上的块（块开始时她在睡）：她睡前 30–90 分钟问一句今晚打算学到哪（一晚一次）；第二天他那边 8 点后、她醒着时问昨晚学到哪了，
+     前后 45 分钟有"开始了没"就并成一条。
+   - 不发：她在睡、他那边 23:30–08:00、他触发 `低气压` 后 18 小时、过了 12/10、yaml 关了、`!np study off`、`pause`、`away`、块取消或改期。错过就丢，不补。
+   - **不占主动额度、不算被晾**：不调 `mark_proactive_sent`；体检按 `study_log.sent_stamp` 把它从"主动开口"里剔出去。
+   - 上线步骤：合并 → `update.sh` → 按 `DEPLOY.md`「催学的日历地址」把地址写进 `.env` → 重启 → `check` 里看"日历读到了" → `!np status` 看下一个学习块。
+   - 注意点：
+     - 日历地址是密钥：`SecretStr`、日志只记异常类型名、`from None`。改 `study.py` 里取日历那段时别把 `str(exc)` 打进日志。
+     - 去重靠 `study_log` 的 (target, step) 唯一，**先抢再发**；发到一半崩了那一步停在 `sending`，不会再问。别改成"发完再记"。
+     - 计划是纯函数（`StudyWatch.plan`），每次读日历重算；排着的任务对不上新计划就作废、让出去重键。追问（`dynamic`）不在计划里，到点自己判断。
+     - 日历只放内存，重启后 `App.start` 先读一次再起调度；读不成就当没有块，排着的到点会以 `calendar_stale` 跳过。
+     - 带 RRULE 的重复事件不展开，只计数（体检和 `check` 提醒）。真要支持得自己展开规则，别引第三方库。
+     - `persona.yaml` 的 `owner.knows` 加了一句"他把学习安排共享给你了"，system prompt 因此变了一次（缓存会冷一次，正常）。12/10 之后可以删掉这句、把 `study_watch.enabled` 关掉。
 
 ### 8.3 已知的问题和限制
 

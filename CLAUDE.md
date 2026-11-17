@@ -101,6 +101,7 @@ python -m newperson check                # 检查配置和人设
 | `owner.py` | `!np` 命令 |
 | `discord_bot.py` | Discord 适配与组合根（含停机后补抓漏掉的消息）|
 | `backup.py` | 一致快照、完整性校验、上次备份的时间 |
+| `study.py` | 催学：读他的学习日历（iCal 自己解析）、到点问一句；地址是密钥，标题只进 user 消息 |
 | `doctor.py` | 体检：**只读元数据，绝不碰聊天内容**，盯的是她变得有规律 |
 
 ## 加新东西的位置

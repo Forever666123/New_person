@@ -58,6 +58,7 @@ from .persona import Persona
 from .prompts import build_situation
 from .rhythm import Rhythm
 from .scheduler import Scheduler
+from .study import HttpIcsSource, StudyWatch
 
 log = logging.getLogger(__name__)
 
@@ -179,6 +180,7 @@ class App:
         life: LifeEngine,
         deliverer: Deliverer,
         rng: random.Random,
+        study: StudyWatch | None = None,
     ) -> None:
         self.settings = settings
         self.persona = persona
@@ -208,6 +210,18 @@ class App:
         self.life.has_photos = self._has_photos
         self.on_phone: Callable[[], Awaitable[None]] | None = None
         """她拿起手机了（在线状态马上亮，亮几分钟）。连上 Discord 之后由 client 接上。"""
+        self.study = study or StudyWatch(
+            persona,
+            rhythm,
+            memory,
+            scheduler,
+            clock,
+            HttpIcsSource(settings.study_calendar_ics_url)
+            if settings.study_calendar_ics_url and settings.has_study_calendar
+            else None,
+            CONVERSATION_ID,
+        )
+        """催学。没配日历地址、人设里关着的时候它什么都不做。"""
 
     # -- 启动 ---------------------------------------------------------------
 
@@ -230,6 +244,7 @@ class App:
         self.scheduler.register("sign_off", self.handle_sign_off_job)
         self.scheduler.register("day_plan", self.handle_day_plan_job)
         self.scheduler.register("memory_update", self.handle_memory_update_job)
+        self.scheduler.register("study_check", self.handle_study_check_job)
 
         await self.scheduler.recover()
         self._prune_downloads()
@@ -249,6 +264,11 @@ class App:
         # 她永远不回你，而重连时 _started 已经是真，直接早返回，永远修不好。
         # 唯一的症状就是她不说话，而那正是她的正常状态。
         self._started = True
+        if self.study.configured:
+            # 先读一次再起调度：重启前排下的催学到点要拿最新的日历核对，
+            # 没读过的话会被当成"日历上没有了"。读不成也不拦着启动
+            await self.study.sync_once()
+            self.spawn(self.study.run_forever(), "study")
         self.spawn(self.scheduler.run_forever(), "scheduler")
 
         now = self.clock.now()
@@ -794,6 +814,7 @@ class App:
                     conversation_id=CONVERSATION_ID,
                     max_calls_per_day=self.settings.max_calls_per_day,
                     now=self.clock.now(),
+                    study=self.study,
                 ),
             )
             sent = await message.channel.send(reply)
@@ -884,6 +905,10 @@ class App:
             self.persona,
             has_image=any(m.attachments for m in unread),
         )
+        low_mood = self.persona.study_watch.low_mood_mode
+        if low_mood and features.mode == low_mood:
+            # 他说了自己难受：接下来一段时间她不提任何学习的事。只记时间
+            await self.study.note_low_mood(unread[-1].created_at)
 
         pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
         if pending:
@@ -2228,6 +2253,120 @@ class App:
         if result.sent_texts:
             await self._mark_signed_off(bedtime)
             await self.memory.add_diary_note(day, plan.inner_note or "睡前跟他说了一声", now)
+
+    # -- 催学 ---------------------------------------------------------------
+
+    async def handle_study_check_job(self, job: Job) -> None:
+        """到点问他一句学习的事。
+
+        跟主动消息共用模型和投递，但**不走主动的那几道关**：不占当天的名额、
+        不算"开了个话头"，他没回也不会让她以后更少开口。不然催学几天之后，
+        被晾的计数就把她平时的主动压没了。
+        """
+        now = self.clock.now()
+        study = self.study
+        unread = await self.memory.unread_messages(CONVERSATION_ID)
+        pending = await self.memory.pending_jobs("reply", CONVERSATION_ID)
+        busy = bool(unread or pending)
+        if busy and (retry := study.busy_retry_at(job, now)) is not None:
+            # 他有话还没回完：她只有一部手机，先回他，过几分钟再看
+            await self.scheduler.defer(job.id or 0, retry)
+            return
+
+        conv = await self.memory.get_conversation(CONVERSATION_ID)
+        day = self.rhythm.local_date(now)
+
+        async def he_spoke_since(after: datetime) -> bool:
+            last = conv.last_user_message_at
+            return bool(last and last.astimezone(UTC) > after.astimezone(UTC))
+
+        prepared = await study.prepare(
+            job,
+            now,
+            gates=[
+                ("paused", await owner_cmds.is_paused(self.memory)),
+                ("away", bool(await owner_cmds.away_state(self.memory, day))),
+                ("she_said_bye", await self._signed_off_until(now) is not None),
+                ("undeliverable", not conv.deliverable),
+                ("busy_replying", busy),
+            ],
+            he_spoke_since=he_spoke_since,
+        )
+        if prepared is None:
+            return
+
+        owner_facts, self_facts = await self._recall(now)
+        last = max(
+            [t for t in (conv.last_user_message_at, conv.last_bot_message_at) if t],
+            default=None,
+        )
+        try:
+            plan = await self.brain.generate_proactive(
+                ProactiveRequest(
+                    situation=await self._build_situation(now),
+                    trigger_note=prepared.note,
+                    summary=conv.summary,
+                    owner_facts=owner_facts,
+                    self_facts=self_facts,
+                    recent=self._local_stamps(
+                        await self.memory.recent_messages(CONVERSATION_ID, 20), now
+                    ),
+                    hours_since_last_exchange=(now - last).total_seconds() / 3600 if last else None,
+                    # 不带"上次主动他没回"：那句提示会让她连该问的也不问了
+                    unanswered_initiations=0,
+                    photos=[],
+                    not_yet=await self.memory.pending_timed(now),
+                ),
+                day,
+            )
+        except BaseException:
+            await study.release(prepared)
+            raise
+        if plan is None:
+            if await self.brain.over_budget(day):
+                await study.skipped(prepared, "budget")
+                return
+            await study.release(prepared)
+            raise RuntimeError("催学那句没生成出来")
+        if not plan.send or not plan.parts:
+            await study.skipped(prepared, "model_declined")
+            return
+        plan.photo_request = None
+
+        await self._on_phone()
+        try:
+            result = await self.deliverer.deliver_proactive(await self.resolve_channel(), plan, None)
+        except DeliveryBlocked as blocked:
+            log.error("[delivery] 发不出去：%s", blocked.hint)
+            await self.memory.update_conversation(CONVERSATION_ID, deliverable=False)
+            await self._record_sent(blocked.result, now)
+            if blocked.result.sent_texts:
+                await study.sent(prepared, now)
+            else:
+                await study.skipped(prepared, "undeliverable")
+            return
+        except asyncio.CancelledError as exc:
+            partial = _spoken_part(exc)
+            if partial is not None:
+                await asyncio.shield(self._record_sent(partial, now))
+                await asyncio.shield(study.sent(prepared, now))
+            else:
+                await asyncio.shield(study.release(prepared))
+            raise
+        except Exception as exc:
+            partial = _spoken_part(exc)
+            if partial is None:
+                await study.release(prepared)
+                raise
+            # 说出口的算数，剩下的不补：同一句问两遍比少半句糟得多
+            log.warning("[delivery] 催学那句发到一半断了，说出口的算数：%s", type(exc).__name__)
+            result = partial
+        await self._record_sent(result, now)
+        if result.sent_texts:
+            await study.sent(prepared, now)
+            await self.memory.add_diary_note(day, plan.inner_note or "问了他一句学习的事", now)
+        else:
+            await study.skipped(prepared, "nothing_sent")
 
     # -- 记忆整理 -----------------------------------------------------------
 

@@ -355,7 +355,9 @@ class MemoryUpdate(BaseModel):
 # 任务队列
 # ---------------------------------------------------------------------------
 
-JobKind = Literal["reply", "proactive", "follow_up", "day_plan", "memory_update", "sign_off"]
+JobKind = Literal[
+    "reply", "proactive", "follow_up", "day_plan", "memory_update", "sign_off", "study_check"
+]
 JobStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 
 

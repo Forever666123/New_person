@@ -603,6 +603,77 @@ class MemoryConfig(BaseModel):
     """
 
 
+class StudyNotes(BaseModel):
+    """催学每一步给模型的说明。只进 user 消息，system prompt 里没有它们。"""
+
+    start: str = "他日历上排的这段学习刚开始。问他一句开始了没。"
+    nudge: str = "你刚才问他开始了没，他没回。再问一次，更短。"
+    end: str = "他日历上排的这段学习刚结束。问他学到哪了。"
+    evening: str = "你快睡了，他今晚排了学习。问一句他今晚打算学到哪。"
+    morning: str = "他昨晚排了学习，你那时在睡。问一句他昨晚学到哪了。"
+    merged: str = "下面两件事并成一句问，别分两条发。"
+
+
+class StudyWatchConfig(BaseModel):
+    """催学：他把学习安排放在一个单独的日历里，到点她问一句。
+
+    **代码里只有机制**，几点问、问几次、什么时候闭嘴全在这里。
+    日历地址是密钥，不在人设里，在 ``.env`` 的 ``STUDY_CALENDAR_ICS_URL``。
+    """
+
+    enabled: bool = False
+    until: date = date(2026, 12, 10)
+    """过了这天（按他那边的日子）整个功能停掉。考完了还问，那是闹钟。"""
+    poll_minutes: float = 30.0
+    """多久读一次日历。"""
+    stale_after_hours: float = 4.0
+    """日历连续读不成这么久，就当没有学习块，体检里报出来。"""
+    horizon_hours: float = 48.0
+    """往后看多远的学习块。"""
+    start_delay_minutes: tuple[float, float] = (2.0, 12.0)
+    """白天的块开始后多久问开始了没。"""
+    nudge_delay_minutes: tuple[float, float] = (20.0, 35.0)
+    """问了开始了没、他一直没回，再过多久追问。"""
+    max_nudges: int = 1
+    """每块最多追问几次。"""
+    end_delay_minutes: tuple[float, float] = (3.0, 20.0)
+    """白天的块结束后多久问学到哪了。"""
+    evening_lead_minutes: tuple[float, float] = (30.0, 90.0)
+    """晚上的块：她睡前多久问一句今晚打算学到哪。"""
+    morning_after: str = "08:00"
+    """晚上的块：第二天他那边几点以后才问昨晚学到哪了。"""
+    morning_delay_minutes: tuple[float, float] = (10.0, 120.0)
+    """那个时刻（和她起床）之后再等多久。"""
+    merge_window_minutes: float = 45.0
+    """第二天那句前后这么久里正好有一个"开始了没"，就并成一条。"""
+    max_late_minutes: float = 20.0
+    """到点时晚了这么久（停机、在等回复）就不问了。错过就丢掉，不顺延。"""
+    his_quiet_hours: str = "23:30-08:00"
+    """他那边这段时间一律不问。"""
+    low_mood_mode: str = "低气压"
+    """哪个话题模式算"他说过自己难受"。"""
+    low_mood_hours: float = 18.0
+    """那之后多久不提任何学习的事。"""
+    notes: StudyNotes = Field(default_factory=StudyNotes)
+
+    @field_validator("morning_after")
+    @classmethod
+    def _check_morning(cls, v: str) -> str:
+        parse_hhmm(v)
+        return v
+
+    @field_validator("his_quiet_hours")
+    @classmethod
+    def _check_quiet(cls, v: str) -> str:
+        if v.strip():
+            start, sep, end = v.partition("-")
+            if not sep:
+                raise ValueError(f"his_quiet_hours 要写成 HH:MM-HH:MM，收到 {v!r}")
+            parse_hhmm(start)
+            parse_hhmm(end)
+        return v
+
+
 class OwnerInfo(BaseModel):
     name: str = ""
     nickname: str = ""
@@ -647,6 +718,7 @@ class Persona(BaseModel):
     timing: TimingConfig = Field(default_factory=TimingConfig)
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    study_watch: StudyWatchConfig = Field(default_factory=StudyWatchConfig)
 
     seed: int = 0
     """人物的随机种子，影响每日抽签。改这个数会得到一整套不同的作息序列。"""
@@ -756,6 +828,21 @@ def validate_persona(persona: Persona) -> list[tuple[Severity, str]]:
                 "远一点的事还没到时间，就先被当成太老丢掉了",
             )
         )
+    study = persona.study_watch
+    if study.enabled:
+        if not persona.owner.timezone:
+            issues.append(("error", "study_watch 开着但 owner.timezone 没填：算不出他那边几点"))
+        if study.low_mood_mode and not any(m.name == study.low_mood_mode for m in persona.modes):
+            issues.append(
+                ("warning", f"study_watch.low_mood_mode 写的是 {study.low_mood_mode}，modes 里没有这个：他说难受时她照样问")
+            )
+        for name in (
+            "start_delay_minutes", "nudge_delay_minutes", "end_delay_minutes",
+            "evening_lead_minutes", "morning_delay_minutes",
+        ):
+            lo, hi = getattr(study, name)
+            if hi < lo or lo < 0:
+                issues.append(("error", f"study_watch.{name} 要写成 [下限, 上限]"))
     seen: dict[str, str] = {}
     for mode in persona.modes:
         for trigger in mode.triggers:

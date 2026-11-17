@@ -108,6 +108,7 @@ def _parse(raw: str | None) -> datetime | None:
 SAFE_REASONS = {
     "opener", "own_life", "callback", "ledger_check", "travel_note", "window_photo",
     "follow_up", "sign_off", "day_plan", "memory_update", "reply", "proactive",
+    "study_check",
 }
 """内置的种类名。**人设里新加的种类由 run() 传进来并进这个集合。**
 
@@ -266,8 +267,19 @@ def _batches_and_runs(
         " AND reply_batch IS NULL AND created_at >= ? AND deleted = 0",
         (floor.isoformat(),),
     )
-    opened = len({r["created_at"] for r in rows})
+    # 催学也没有批次，但它不是"她想起他了"：不占主动的额度，也不该算进主动的频率。
+    # 按发出那一刻对上——催学记下的 sent_stamp 跟她那条消息的 created_at 一字不差
+    opened = len({r["created_at"] for r in rows} - _study_stamps(conn))
     return batches, opened, floor
+
+
+def _study_stamps(conn: sqlite3.Connection) -> set[str]:
+    """催学问出口的那些时刻。老库没有这张表就是空的。"""
+    try:
+        rows = _rows(conn, "SELECT sent_stamp FROM study_log WHERE sent_stamp IS NOT NULL")
+    except sqlite3.OperationalError:
+        return set()
+    return {r["sent_stamp"] for r in rows}
 
 
 def _answered(conn: sqlite3.Connection, batches: list[datetime]) -> int:
@@ -443,7 +455,7 @@ def check_bursts(report: Report, conn: sqlite3.Connection, since: datetime) -> N
     rows = _rows(
         conn,
         "SELECT finished_at, COALESCE(original_run_at, run_at) AS due FROM jobs"
-        " WHERE kind IN ('reply', 'proactive', 'follow_up', 'sign_off')"
+        " WHERE kind IN ('reply', 'proactive', 'follow_up', 'sign_off', 'study_check')"
         " AND status = 'done' AND finished_at IS NOT NULL AND finished_at >= ?",
         (since.isoformat(),),
     )
@@ -731,6 +743,111 @@ def check_memory(
         )
 
 
+STUDY_OUTCOMES = {
+    "missed": "错过了（停机或日历晚到）",
+    "too_late": "到点时已经晚了",
+    "she_sleeps": "她在睡",
+    "his_quiet": "你那边太晚或太早",
+    "low_mood": "你说过难受",
+    "past_deadline": "过了截止日",
+    "owner_off": "你关了",
+    "off": "功能没开",
+    "paused": "暂停中",
+    "away": "请假中",
+    "she_said_bye": "她说过要睡了",
+    "undeliverable": "发不出去",
+    "busy_replying": "在回你别的话",
+    "calendar_stale": "日历太久没读成",
+    "block_gone": "块取消或改期了",
+    "he_replied": "你回过了，不追问",
+    "block_over": "块已经结束",
+    "model_declined": "她想了想没问",
+    "budget": "模型额度用完",
+    "nothing_sent": "没发出去",
+}
+"""跳过的原因。**只认这些词**，别的压成"其它"——跟 SAFE_REASONS 同一个道理。"""
+
+
+def check_study(
+    report: Report, conn: sqlite3.Connection, since: datetime, now: datetime,
+    stale_after_hours: float = 4.0,
+) -> None:
+    """催学：这段时间多少个学习块、问了几次、几次他回了；日历多久没读成；跳过的重复事件。
+
+    只读 study_log 和 kv 里的时间、标识、次数。块的标题从来不进库，这里也就碰不到。
+    """
+    try:
+        rows = _rows(conn, "SELECT step, status, outcome, planned_at, sent_at, replied_at FROM study_log")
+    except sqlite3.OperationalError:
+        return
+    kv = {
+        r["key"]: str(r["value"])
+        for r in _rows(
+            conn,
+            "SELECT key, value FROM kv WHERE key IN ('study_cal_ok_at', 'study_cal_fail_since',"
+            " 'study_cal_fail_kind', 'study_cal_recurring_skipped')",
+        )
+    }
+    if not rows and not kv:
+        return  # 从来没开过
+
+    def in_window(raw: str | None) -> bool:
+        when = _parse(raw)
+        return when is not None and when >= since
+
+    blocks = sum(1 for r in rows if r["step"] == "seen" and in_window(r["planned_at"]))
+    sent = [r for r in rows if r["status"] == "sent" and in_window(r["sent_at"])]
+    replied = [r for r in sent if r["replied_at"]]
+    waits = sorted(
+        (_parse(r["replied_at"]) - _parse(r["sent_at"])).total_seconds() / 60  # type: ignore[operator]
+        for r in replied
+        if _parse(r["replied_at"]) and _parse(r["sent_at"])
+    )
+    skipped: dict[str, int] = {}
+    for r in rows:
+        if r["status"] == "skipped" and in_window(r["planned_at"] or r["sent_at"]):
+            name = STUDY_OUTCOMES.get(r["outcome"] or "", "其它")
+            skipped[name] = skipped.get(name, 0) + 1
+    line = f"催学：{blocks} 个学习块，问了 {len(sent)} 次，你回了 {len(replied)} 次"
+    detail = []
+    if waits:
+        detail.append(f"回的那几次，中位 {_span(statistics.median(waits))} 后回的")
+    if skipped:
+        detail.append(
+            "没问的：" + "　".join(f"{k} {v}" for k, v in sorted(skipped.items(), key=lambda kv: -kv[1]))
+        )
+    report.add(OK, line, "\n".join(detail))
+
+    ok_at = _parse(kv.get("study_cal_ok_at"))
+    fail_since = _parse(kv.get("study_cal_fail_since"))
+    kind = _safe_detail(kv.get("study_cal_fail_kind", ""))
+    if ok_at is None:
+        report.add(WARN, "学习日历一次都没读成功过", f"最近一次的错：{kind}" if kind else "")
+    else:
+        hours = (now - ok_at).total_seconds() / 3600
+        if hours > stale_after_hours:
+            report.add(
+                WARN,
+                f"学习日历 {_span(hours * 60)}没读成功了，这段时间她当作没有学习块",
+                (f"最近一次的错：{kind}。" if kind else "")
+                + "看看 .env 里的 STUDY_CALENDAR_ICS_URL 是不是被重置了（Google 日历设置里重置私密地址会让旧的失效）。",
+            )
+        elif fail_since is not None:
+            report.add(OK, f"学习日历上次读成功是 {_span(hours * 60)}前，之后读失败过（{kind or '原因不明'}）")
+        else:
+            report.add(OK, f"学习日历上次读成功是 {_span(hours * 60)}前")
+    try:
+        recurring = int(kv.get("study_cal_recurring_skipped") or 0)
+    except ValueError:
+        recurring = 0
+    if recurring:
+        report.add(
+            WARN,
+            f"学习日历里有 {recurring} 个重复事件被跳过了",
+            "带「重复」的事件她不认。要她问的话，在日历里把它拆成一次一次的。",
+        )
+
+
 def run(
     db_path: Path,
     now: datetime,
@@ -739,6 +856,7 @@ def run(
     kinds_known: frozenset[str] = frozenset(),
     summarize_after: int = 60,
     summary_max_chars: int = 0,
+    study_stale_hours: float = 4.0,
 ) -> Report:
     """跑一遍体检。**全程只读，不改任何东西。**
 
@@ -789,6 +907,7 @@ def run(
             "记忆和台账",
             lambda: check_memory(report, conn, summarize_after, since, summary_max_chars),
         ),
+        ("催学", lambda: check_study(report, conn, since, now, study_stale_hours)),
     ]
     try:
         for name, check in checks:

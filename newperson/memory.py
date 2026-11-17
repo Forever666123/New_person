@@ -147,6 +147,22 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- 催学：每一块的每一步一行。只有标识和时间，没有块的标题、没有聊天内容。
+-- (target, step) 唯一，于是同一块的同一步一辈子只问一次，重启、崩溃都一样。
+CREATE TABLE IF NOT EXISTS study_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT NOT NULL,
+    step TEXT NOT NULL,
+    planned_at TEXT,
+    status TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT '',
+    sent_at TEXT,
+    sent_stamp TEXT,
+    replied_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(target, step)
+);
 """
 
 
@@ -328,6 +344,15 @@ class Memory:
             " unanswered_initiations = 0 WHERE id = ?",
             (msg.created_at.isoformat(), msg.conversation_id),
         )
+        # 催学之后他第一次开口的时刻。体检拿它算"问了几次、几次他回了"，
+        # 只记时间，不看他说了什么——他回的可能根本不是学习的事，那也算回了。
+        # 一天以前问的不算：隔了一天才说话，那不是在回那一句。
+        said = utc_text(msg.created_at)
+        await self.db.execute(
+            "UPDATE study_log SET replied_at = ? WHERE status = 'sent' AND replied_at IS NULL"
+            " AND sent_at <= ? AND sent_at >= ?",
+            (said, said, utc_text(msg.created_at - timedelta(days=1))),
+        )
         await self.db.commit()
         return int(cur.lastrowid or 0)
 
@@ -496,7 +521,7 @@ class Memory:
         """把排期不晚于 ``moment`` 的主动消息和 follow_up 作废。从备份恢复之后用。"""
         cur = await self.db.execute(
             "UPDATE jobs SET status = 'cancelled' WHERE status = 'pending'"
-            " AND kind IN ('proactive', 'follow_up')"
+            " AND kind IN ('proactive', 'follow_up', 'study_check')"
             " AND julianday(COALESCE(original_run_at, run_at)) <= julianday(?)",
             (moment.isoformat(),),
         )
@@ -1341,6 +1366,74 @@ class Memory:
         if row is None:
             return {"calls": 0, "estimated_usd": 0.0}
         return dict(row)
+
+    # ---- 催学 -------------------------------------------------------------
+
+    async def study_note_seen(self, target: str, planned_at: datetime, at: datetime) -> None:
+        """日历上第一次看到这一块。体检数"这段时间多少个学习块"用，只有标识和开始时刻。"""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO study_log (target, step, planned_at, status, created_at)"
+            " VALUES (?, 'seen', ?, 'seen', ?)",
+            (target, utc_text(planned_at), utc_text(at)),
+        )
+        await self.db.commit()
+
+    async def study_claim(
+        self, target: str, step: str, planned_at: datetime | None, at: datetime
+    ) -> bool:
+        """抢下"这一块的这一步由我来问"。抢到返回 True。
+
+        **先落库再发。** 发到一半进程死了，这一行停在 sending，重启之后谁也抢不到它——
+        宁可少问一句，也不能同一句问两遍。
+        """
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO study_log (target, step, planned_at, status, created_at)"
+            " VALUES (?, ?, ?, 'sending', ?)",
+            (target, step, utc_text(planned_at) if planned_at else None, utc_text(at)),
+        )
+        await self.db.commit()
+        return bool(cur.rowcount)
+
+    async def study_release(self, target: str, step: str) -> None:
+        """一个字都没发出去（模型失败、发送失败）：把抢下的放回去，重试时还能再抢。"""
+        await self.db.execute(
+            "DELETE FROM study_log WHERE target = ? AND step = ? AND status = 'sending'",
+            (target, step),
+        )
+        await self.db.commit()
+
+    async def study_mark_sent(self, target: str, step: str, sent_at: datetime) -> None:
+        """记下真的问出口了。``sent_stamp`` 跟她那条消息的 created_at 一字不差，
+        体检靠它把催学从"她主动开口"里剔出去。"""
+        await self.db.execute(
+            "UPDATE study_log SET status = 'sent', sent_at = ?, sent_stamp = ?"
+            " WHERE target = ? AND step = ?",
+            (utc_text(sent_at), sent_at.isoformat(), target, step),
+        )
+        await self.db.commit()
+
+    async def study_mark_skipped(
+        self, target: str, step: str, outcome: str, planned_at: datetime | None, at: datetime
+    ) -> None:
+        """这一步不问了，记下为什么。抢过的改状态，没抢过的新写一行；已经问过的不动。"""
+        await self.db.execute(
+            "INSERT OR IGNORE INTO study_log (target, step, planned_at, status, created_at)"
+            " VALUES (?, ?, ?, 'skipped', ?)",
+            (target, step, utc_text(planned_at) if planned_at else None, utc_text(at)),
+        )
+        await self.db.execute(
+            "UPDATE study_log SET status = 'skipped', outcome = ?"
+            " WHERE target = ? AND step = ? AND status IN ('sending', 'skipped')",
+            (outcome, target, step),
+        )
+        await self.db.commit()
+
+    async def study_logged(self, target: str, step: str) -> str | None:
+        """这一步的状态（sending / sent / skipped），没碰过就是 None。"""
+        row = await self._fetch_one(
+            "SELECT status FROM study_log WHERE target = ? AND step = ?", (target, step)
+        )
+        return row["status"] if row else None
 
     # ---- KV ---------------------------------------------------------------
 

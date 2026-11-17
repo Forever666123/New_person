@@ -77,7 +77,7 @@ def load_all(args: argparse.Namespace) -> tuple[Settings, Persona] | None:
 
 
 RUNTIME_MODULES = (
-    "discord_bot", "life", "scheduler", "delivery", "owner", "memory", "doctor", "backup",
+    "discord_bot", "life", "scheduler", "delivery", "owner", "memory", "doctor", "backup", "study",
 )
 """她跑起来要用、而 check 自己平时不碰的模块。"""
 
@@ -160,6 +160,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     else:
         print(f"  {WARN} 照片库是空的，她不会发照片（往 {settings.photos_index.parent} 放图再跑 photos）")
 
+    _check_study(settings, persona)
+
     if args.online:
         problems += _check_online(settings)
 
@@ -170,6 +172,47 @@ def cmd_check(args: argparse.Namespace) -> int:
     print(f"{OK} 配置没问题。")
     print("  注意：check 只是检查，她现在**没在跑**。启动是 python -m newperson run")
     return 0
+
+
+def _check_study(settings: Settings, persona: Persona) -> None:
+    """催学的配置。**地址只说有没有**，绝不打出来。
+
+    配了就真读一次：刚把地址写进 .env 的时候，这是唯一能确认它能用的地方。
+    读不成只是提醒，不算问题——日历那边抖一下不该挡住部署。
+    """
+    from .study import CalendarFetchError, HttpIcsSource, parse_ics
+
+    cfg = persona.study_watch
+    print("催学")
+    has_url = bool(settings.study_calendar_ics_url and settings.has_study_calendar)
+    mark = OK if has_url or not cfg.enabled else WARN
+    print(f"  {mark} STUDY_CALENDAR_ICS_URL：{'有' if has_url else '没有'}")
+    if not cfg.enabled:
+        print(f"  {OK} 人设里关着（study_watch.enabled）")
+        return
+    if not has_url or persona.owner_tz is None or settings.study_calendar_ics_url is None:
+        print(f"  {WARN} 人设里开着，但缺地址或 owner.timezone，她不会问")
+        return
+    print(f"  {OK} 开着，到 {cfg.until}（按他那边的日子）")
+    try:
+        text = asyncio.run(HttpIcsSource(settings.study_calendar_ics_url).fetch())
+        parsed = parse_ics(text, persona.owner_tz)
+    except CalendarFetchError as exc:
+        print(f"  {WARN} 日历读不了（{exc}）")
+        return
+    except Exception as exc:  # noqa: BLE001 - 只打类型名，异常文本里可能带地址
+        print(f"  {WARN} 日历读不了（{type(exc).__name__}）")
+        return
+    now = datetime.now(tz=UTC)
+    soon = [b for b in parsed.blocks if now <= b.end and b.start <= now + timedelta(days=7)]
+    print(f"  {OK} 日历读到了：之后 7 天有 {len(soon)} 个学习块")
+    if parsed.recurring_skipped:
+        print(
+            f"  {WARN} 有 {parsed.recurring_skipped} 个重复事件被跳过了。"
+            "要她问的话，在日历里拆成一次一次的"
+        )
+    if parsed.all_day_skipped:
+        print(f"  {OK} {parsed.all_day_skipped} 个全天事件不算学习块")
 
 
 def _check_online(settings: Settings) -> int:
@@ -651,6 +694,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         kinds_known=frozenset(k.name for k in persona.proactive.kinds) if persona else frozenset(),
         summarize_after=persona.memory.summarize_after if persona else 60,
         summary_max_chars=persona.memory.summary_max_chars if persona else 0,
+        study_stale_hours=persona.study_watch.stale_after_hours if persona else 4.0,
     )
     if persona is None:
         # **不能不吭声。** 读不到人设就退回 UTC，而窗口的两端会整体挪一个时区偏移

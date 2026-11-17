@@ -172,6 +172,35 @@ proactive:
       text_optional: true
       note: 发一张你刚拍的照片。
 
+# ---- 催学（可选，默认关着）----
+# 对方把学习安排放进一个单独的日历，到点她问一句。日历的私密 iCal 地址放 .env 的
+# STUDY_CALENDAR_ICS_URL（是密钥，别写在这里）。开之前在 owner.knows 里写一句
+# "他把学习安排共享给你了"，不然她会凭空知道他的安排。
+study_watch:
+  enabled: false
+  until: 2026-12-10
+  poll_minutes: 30
+  stale_after_hours: 4
+  start_delay_minutes: [2, 12]
+  nudge_delay_minutes: [20, 35]
+  max_nudges: 1
+  end_delay_minutes: [3, 20]
+  evening_lead_minutes: [30, 90]
+  morning_after: "08:00"
+  morning_delay_minutes: [10, 120]
+  merge_window_minutes: 45
+  max_late_minutes: 20
+  his_quiet_hours: "23:30-08:00"
+  low_mood_mode: ""
+  low_mood_hours: 18
+  notes:
+    start: 他排的学习刚开始。问一句开始了没。只问，不催。
+    nudge: 你刚才问他开始了没，他没回。再问一次，更短。
+    end: 他排的学习刚结束。问一句学到哪了。
+    evening: 你快睡了，他今晚排了学习。问一句他今晚打算学到哪。
+    morning: 他昨晚排了学习，那时你在睡。问一句昨晚学到哪了。
+    merged: 下面两件事并成一句话问，别分两条发。
+
 timing:
   max_delay_hours: 14
   urgent_multiplier: 0.7

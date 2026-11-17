@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .life import LifeEngine
     from .rhythm import Rhythm
     from .scheduler import Scheduler
+    from .study import StudyWatch
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ HELP = """\
 `!np ledger [类别]` 她记下的、你说过要做的事
 　　　类别：trading（默认）/ study / shift / project / english / sleep
 `!np plan` 看今天她给自己编的日程
+`!np study on` / `!np study off` 催学开关（到点问你一句学习的事）
 `!np help` 这些"""
 
 
@@ -50,6 +52,7 @@ class OwnerContext:
     conversation_id: str
     now: datetime
     max_calls_per_day: int = 0
+    study: StudyWatch | None = None
 
 
 def is_command(text: str) -> bool:
@@ -161,6 +164,8 @@ async def _status(_args: list[str], ctx: OwnerContext) -> str:
             lines.append(f"接口出错（{ago}）：{detail or stamp}")
         except ValueError:
             lines.append(f"最近一次接口出错：{err}")
+    if ctx.study is not None:
+        lines += await ctx.study.status_lines(ctx.now)
     if await ctx.memory.kv_get("paused"):
         lines.append("**已暂停**")
     if note := await ctx.memory.kv_get("away_note"):
@@ -288,6 +293,25 @@ async def _plan(_args: list[str], ctx: OwnerContext) -> str:
     return "\n".join(lines)
 
 
+async def _study(args: list[str], ctx: OwnerContext) -> str:
+    """催学开关。关掉只是她不再问，日历照读，开回来接着从下一块问起。"""
+    from .study import OFF_KEY
+
+    action = args[0].lower() if args else ""
+    if action == "off":
+        await ctx.memory.kv_set(OFF_KEY, "1")
+        return "催学关了。她不再到点问你学习的事"
+    if action == "on":
+        await ctx.memory.kv_delete(OFF_KEY)
+        if ctx.study is None or not ctx.study.cfg.enabled:
+            return "开关打开了，但人设里 study_watch.enabled 是关着的，她还是不会问"
+        if ctx.study.source is None:
+            return "开关打开了，但 .env 里没配 STUDY_CALENDAR_ICS_URL，她还是不会问"
+        return "催学开了。从下一个学习块开始问"
+    state = "关着" if await ctx.memory.kv_get(OFF_KEY) else "开着"
+    return f"催学现在{state}。用法：`!np study on` / `!np study off`"
+
+
 async def away_state(memory: Memory, today: date) -> str | None:
     """请假还在生效吗。到期自动清掉，免得忘了取消。"""
     note = await memory.kv_get("away_note")
@@ -320,6 +344,7 @@ HANDLERS: dict[str, Callable[[list[str], OwnerContext], Awaitable[str]]] = {
     "chatty": _chatty,
     "ledger": _ledger,
     "plan": _plan,
+    "study": _study,
     "help": _help,
 }
 """所有 `!np` 命令。**加新命令就在这儿加一行**（CLAUDE.md 里指的就是它）。
