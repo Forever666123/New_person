@@ -6,6 +6,7 @@
    过一阵重试。绝不发"出错了""我遇到了一点问题"这种话出去。
 2. **稳定层缓存。** system 是固定的一段，加 ``cache_control``，
    易变内容全部放 user 消息。缓存命中率可以从 ``usage`` 表里看出来。
+   回复的缓存留一小时，别的调用用默认的 5 分钟，理由写在 ``_call`` 里。
 3. **有花钱的上限。** 每天调用数超过 ``max_calls_per_day`` 就一律当失败处理，
    任务顺延，人物表现为话变少，而不是程序崩掉。
 """
@@ -67,8 +68,8 @@ CACHE_READ_FRACTION = {
 }
 """缓存命中按输入价的几成算，没列的都是一成。
 
-5.5 这一代降了。一律按一成算的话，Sonnet 5.5 命中缓存的那部分多估一倍——
-不过她多数回复隔得久、缓存已经过期，付的是写缓存的钱，总数偏得没那么多。
+5.5 这一代降了。一律按一成算的话，Sonnet 5.5 命中缓存的那部分多估一倍。
+回复的缓存从 11-18 起留一小时（见 ``_call``），一段聊天里第二条起多半是命中，这个数要算对。
 """
 
 LONG_PROMPT_TIER = {"claude-haiku-5-5": (100_000, 5.0)}
@@ -102,14 +103,28 @@ def price_of(model: str) -> tuple[float, float]:
     return (5.0, 25.0)
 
 
-def cost_of(model: str, inp: int, cached: int, written: int, out: int) -> float:
-    """一次调用大概花了多少美元。只给 `!np status` 和日志看，不拿来做决定。"""
+def cost_of(
+    model: str, inp: int, cached: int, written: int, out: int, written_1h: int = 0
+) -> float:
+    """一次调用大概花了多少美元。只给 `!np status` 和日志看，不拿来做决定。
+
+    ``written`` 是写缓存的总数，其中 ``written_1h`` 是按一小时留的那部分：
+    一小时的写入按输入价 2 倍，5 分钟的 1.25 倍。
+    """
     in_price, out_price = price_of(model)
     threshold, factor = LONG_PROMPT_TIER.get(model, (0, 1.0))
     if threshold and inp + cached + written > threshold:
         in_price, out_price = in_price * factor, out_price * factor
     read = CACHE_READ_FRACTION.get(model, 0.1)
-    return (inp * in_price + cached * in_price * read + written * in_price * 1.25 + out * out_price) / 1_000_000
+    long_part = min(max(written_1h, 0), written)
+    short_part = written - long_part
+    return (
+        inp * in_price
+        + cached * in_price * read
+        + short_part * in_price * 1.25
+        + long_part * in_price * 2.0
+        + out * out_price
+    ) / 1_000_000
 
 
 def _money_trouble(exc: Exception) -> str:
@@ -325,13 +340,20 @@ class Brain:
 
     # -- 稳定层 -------------------------------------------------------------
 
-    def system_blocks(self) -> list[dict[str, Any]]:
-        """带缓存标记的 system。这一段字节级固定，所以每次都能命中。"""
+    def system_blocks(self, ttl: str | None = None) -> list[dict[str, Any]]:
+        """带缓存标记的 system。这一段字节级固定，所以每次都能命中。
+
+        ``ttl="1h"`` 让缓存留一小时（写入按输入价 2 倍，默认 5 分钟的是 1.25 倍）。
+        只改缓存留多久，system 的字节一个不变。
+        """
+        cache: dict[str, str] = {"type": "ephemeral"}
+        if ttl:
+            cache["ttl"] = ttl
         return [
             {
                 "type": "text",
                 "text": self._system,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": cache,
             }
         ]
 
@@ -365,15 +387,18 @@ class Brain:
         cached = getattr(usage, "cache_read_input_tokens", 0) or 0
         written = getattr(usage, "cache_creation_input_tokens", 0) or 0
         out = getattr(usage, "output_tokens", 0) or 0
+        # 写缓存按留多久分开报：usage.cache_creation.ephemeral_1h_input_tokens
+        written_1h = getattr(getattr(usage, "cache_creation", None), "ephemeral_1h_input_tokens", 0) or 0
 
-        cost = cost_of(model_used or self.settings.model, inp, cached, written, out)
+        cost = cost_of(model_used or self.settings.model, inp, cached, written, out, written_1h)
 
         log.info(
-            "[brain] %s in=%d cached=%d 写缓存=%d out=%d 约 $%.4f",
+            "[brain] %s in=%d cached=%d 写缓存=%d(1h %d) out=%d 约 $%.4f",
             purpose,
             inp,
             cached,
             written,
+            written_1h,
             out,
             cost,
         )
@@ -403,10 +428,17 @@ class Brain:
             return None
 
         chosen = model or self.settings.model
+        # **回复用一小时的缓存。** 她故意不秒回，两条回复之间常隔五分钟以上，
+        # 默认的 5 分钟缓存几乎次次过期：11-18 实测每条回复都把七千多 token 的
+        # 人设重新写一遍（cached=0），写缓存的钱占了一半多。一小时的写入贵一些，
+        # 但一段聊天里第二条起就按命中算，聊三条以上就省。
+        # 主动消息、日程、记忆一天才一两次，下一次早过了一小时，留默认的 5 分钟更便宜。
+        # 缓存按"输出格式 + system"认，回复、追问、重写都是 ReplyPlan，共用这一份。
+        ttl = "1h" if output_format is ReplyPlan else None
         kwargs: dict[str, Any] = {
             "model": chosen,
             "max_tokens": self.settings.max_tokens,
-            "system": self.system_blocks(),
+            "system": self.system_blocks(ttl),
             "messages": [{"role": "user", "content": user_content}],
             "output_format": output_format,
         }

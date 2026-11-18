@@ -503,7 +503,8 @@ async def test_the_system_prompt_is_cached_across_calls(
     await drain(app, clock)
     assert len(llm.calls) == 2
     assert llm.calls[0]["system"] == llm.calls[1]["system"]
-    assert llm.calls[0]["system"][0]["cache_control"] == {"type": "ephemeral"}
+    # 回复的缓存留一小时：她不秒回，5 分钟的缓存几乎次次过期
+    assert llm.calls[0]["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 async def test_usage_is_tracked(tmp_path: Path, persona: Persona) -> None:

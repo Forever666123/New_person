@@ -160,6 +160,32 @@ def test_the_system_prompt_is_marked_for_caching(persona: Persona, tmp_path: Pat
     brain = Brain(fake_client(), settings(tmp_path), persona)
     blocks = brain.system_blocks()
     assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    long = brain.system_blocks("1h")
+    assert long[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    # 留多久不碰 system 的字节，不然两种调用之间缓存互相打架
+    assert long[0]["text"] == blocks[0]["text"]
+
+
+async def test_replies_keep_the_cache_for_an_hour(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """她不秒回，两条回复常隔五分钟以上，回复（含追问、重写）用一小时的缓存。
+
+    主动消息一天一两次，留默认的 5 分钟：一小时的写入贵，下一次用不上。
+    """
+    client = fake_client(
+        ReplyPlan(parts=[]),  # 他问了具体的事却给了空 → 追问一次
+        ReplyPlan(parts=[ReplyPart(text="嗯 在")]),
+        ProactivePlan(send=True, parts=[ReplyPart(text="今天下雪了")]),
+    )
+    brain = Brain(client, settings(tmp_path), persona, memory)
+    await brain.generate_reply(reply_request(must_reply=True), TODAY)
+    await brain.generate_proactive(proactive_request(), TODAY)
+    calls = client.messages.calls
+    assert len(calls) == 3
+    for call in calls[:2]:
+        assert call["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert calls[2]["system"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_who_she_is_reaches_the_model(persona: Persona) -> None:
@@ -1093,6 +1119,40 @@ def test_the_cost_follows_each_models_cache_and_length_pricing() -> None:
         (50_000 * 0.50 + 60_000 * 0.05) / million
     )
     assert cost_of("claude-haiku-4-5", 200_000, 0, million, 0) == pytest.approx(0.20 + 1.25)
+
+
+def test_an_hour_long_cache_write_costs_double_the_input_price() -> None:
+    """一小时的写缓存按输入价 2 倍，5 分钟的 1.25 倍；同一次里两种都有就分开算。"""
+    from newperson.brain import cost_of
+
+    million = 1_000_000
+    # Opus 5.5 输入 $4
+    assert cost_of("claude-opus-5-5", 0, 0, million, 0) == pytest.approx(5.0)
+    assert cost_of("claude-opus-5-5", 0, 0, million, 0, written_1h=million) == pytest.approx(8.0)
+    assert cost_of("claude-opus-5-5", 0, 0, million, 0, written_1h=million // 4) == pytest.approx(
+        (750_000 * 4 * 1.25 + 250_000 * 4 * 2.0) / million
+    )
+    # 报上来的一小时部分比总数还多（不该发生）：按总数封顶，不多算
+    assert cost_of("claude-opus-5-5", 0, 0, 100, 0, written_1h=500) == pytest.approx(100 * 4 * 2.0 / million)
+
+
+async def test_the_hour_long_part_of_a_cache_write_is_priced_from_usage(
+    persona: Persona, tmp_path: Path, memory: Memory
+) -> None:
+    """接口在 usage.cache_creation 里分开报两种写入，花费按它算。"""
+    brain = Brain(fake_client(), settings(tmp_path, model="claude-opus-5-5"), persona, memory)
+    response = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=0,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=1000,
+            cache_creation=SimpleNamespace(ephemeral_1h_input_tokens=1000, ephemeral_5m_input_tokens=0),
+            output_tokens=0,
+        )
+    )
+    await brain._record_usage(response, TODAY, "reply", "claude-opus-5-5")
+    used = await memory.usage_for(TODAY)
+    assert used["estimated_usd"] == pytest.approx(1000 * 4 * 2.0 / 1_000_000)
 
 
 async def test_a_rewrite_that_is_still_all_banned_does_not_wedge_the_message(
