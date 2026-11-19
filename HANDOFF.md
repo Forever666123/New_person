@@ -488,6 +488,8 @@ DEPLOY.md 里写的 cron（`crontab -e`，服务器时间是 UTC）：
    - 传服务器：在本地 `persona/photos/` 里 `scp *.jpg index.yaml chloe:/opt/New_person/persona/photos/`，再重启 `chloe`。
    - **华盛顿的 5 张已经做好、审过，放在本地 `data/photo-staging/travel/dc/`**（jpg 成品 + `index-entries.yaml` 要追加的条目，`location: 华盛顿`）。
      她感恩节 11/26–29 在华盛顿：出发那天把 jpg 拷进 `persona/photos/`、条目追加到 `index.yaml` 再传服务器重启；回波士顿后拿掉，重启。
+     **已经交给本机两个一次性定时任务**（Leo 11-19 同意）：`chloe-dc-photos-add` 悉尼 11/26 16:00、`chloe-dc-photos-remove` 悉尼 11/30 16:00，
+     都只跑本地 `data/photo-staging/travel/swap.py add|remove dc`（他在聊就等，最多约 1 小时）。这几天别重跑 `finalize.py`，它会把索引重写成不含 DC 的版本。
      冰岛（12/29 起）的图还没做。出行日期看 `python -m newperson simulate --start 日期 --days N` 里带 ✈ 的行。
    - 下一批补什么：离 80 张还差 13 张左右。早上偏少（11 张），家里和波士顿街景也可以再补；每批照旧最多 20 张。
    - **没解决的**：照片不看她人在哪。出行的图要是进了索引，她回波士顿后也可能当成刚拍的发出去；雪景到了夏天也一样。
